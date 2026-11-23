@@ -74,6 +74,7 @@ export const TitleBar: React.FC = () => {
     toggleGrayscaleMode,
     setHsvModalOpen,
     setExportModalOpen,
+    setShowWelcome,
     resetView,
     clearCurrentFrame,
     duplicateFrameToNext,
@@ -202,6 +203,10 @@ export const TitleBar: React.FC = () => {
             </button>
             {openMenu === 'file' && (
               <div className="dropdown-menu">
+                <button className="dropdown-item" onClick={() => { setShowWelcome(true); setOpenMenu(null); }}>
+                  <span>Tela Inicial (Home)</span>
+                </button>
+                <div className="dropdown-sep" />
                 <button className="dropdown-item" onClick={() => { newProject(); setOpenMenu(null); }}>
                   <span>New Scene</span><span style={{ color: '#888' }}>Ctrl+N</span>
                 </button>

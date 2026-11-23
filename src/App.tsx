@@ -7,12 +7,14 @@ import { NodeView } from './components/NodeView';
 import { RightPanel } from './components/RightPanel';
 import { TimelinePanel } from './components/TimelinePanel';
 import { DockablePanel } from './components/DockablePanel';
+import { WelcomeScreen } from './components/WelcomeScreen';
 import { HsvModal } from './components/HsvModal';
 import { ExportModal } from './components/ExportModal';
 import { useHarmonyStore } from './store/useHarmonyStore';
 
 export const App: React.FC = () => {
   const {
+    showWelcome,
     centerTab,
     setCenterTab,
     activeTool,
@@ -180,6 +182,10 @@ export const App: React.FC = () => {
   ]);
 
   const activeLayer = layers.find((l) => l.id === activeLayerId);
+
+  if (showWelcome) {
+    return <WelcomeScreen />;
+  }
 
   return (
     <div className="app-shell">

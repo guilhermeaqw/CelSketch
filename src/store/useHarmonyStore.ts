@@ -76,6 +76,7 @@ interface HarmonyState {
   bucketBehind: boolean;
 
   // View state
+  showWelcome: boolean;
   zoom: number;
   panX: number;
   panY: number;
@@ -123,6 +124,8 @@ interface HarmonyState {
   setBucketBehind: (behind: boolean) => void;
 
   setZoom: (zoom: number) => void;
+  setShowWelcome: (show: boolean) => void;
+  createNewScene: (name: string, width: number, height: number, fps: number) => void;
   setPan: (x: number, y: number) => void;
   setRotation: (deg: number) => void;
   resetRotation: () => void;
@@ -282,6 +285,7 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
   bucketExpand: 1,
   bucketBehind: true,
 
+  showWelcome: true,
   zoom: 0.55,
   panX: 0,
   panY: 0,
@@ -346,6 +350,28 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
   setBucketBehind: (bucketBehind) => set({ bucketBehind }),
 
   setZoom: (zoom) => set({ zoom: Math.max(0.1, Math.min(8, zoom)) }),
+  setShowWelcome: (showWelcome) => set({ showWelcome }),
+  createNewScene: (name, width, height, fps) =>
+    set({
+      projectName: name.trim() || 'Untitled_Scene',
+      projectPath: null,
+      canvasWidth: Math.max(64, Math.min(8192, Math.round(width))),
+      canvasHeight: Math.max(64, Math.min(8192, Math.round(height))),
+      fps: Math.max(1, Math.min(120, Math.round(fps))),
+      currentFrame: 1,
+      playStart: 1,
+      playEnd: 60,
+      totalFrames: 60,
+      isPlaying: false,
+      swatches: DEFAULT_SWATCHES,
+      activeSwatchId: 'sw-black',
+      activeColor: '#141414',
+      layers: createDefaultLayers(),
+      activeLayerId: 'layer-1',
+      undoStack: [],
+      redoStack: [],
+      showWelcome: false
+    }),
   setPan: (panX, panY) => set({ panX, panY }),
   setRotation: (rotation) => set({ rotation: ((rotation % 360) + 360) % 360 }),
   resetRotation: () => set({ rotation: 0 }),
