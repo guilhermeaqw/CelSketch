@@ -89,6 +89,13 @@ ipcMain.handle('file:saveProjectAs', async (_event, { content }: { content: stri
   return { canceled: false, filePath: result.filePath };
 });
 
+// Auto-Save (silent: updates currentPath or saves recovery backup in userData)
+ipcMain.handle('file:autoSave', async (_event, { content, currentPath }: { content: string; currentPath?: string | null }) => {
+  const targetPath = currentPath || path.join(app.getPath('userData'), 'autosave_recovery.celsketch');
+  fs.writeFileSync(targetPath, content, 'utf-8');
+  return { ok: true, filePath: targetPath };
+});
+
 // Open Project (.celsketch)
 ipcMain.handle('file:openProject', async () => {
   const result = await dialog.showOpenDialog(mainWindow!, {
@@ -100,6 +107,31 @@ ipcMain.handle('file:openProject', async () => {
   const filePath = result.filePaths[0];
   const content = fs.readFileSync(filePath, 'utf-8');
   return { canceled: false, filePath, content };
+});
+
+// Open Project by exact path (Recent Projects)
+ipcMain.handle('file:openProjectByPath', async (_event, { filePath }: { filePath: string }) => {
+  if (!filePath || !fs.existsSync(filePath)) return { canceled: true, error: 'File not found' };
+  const content = fs.readFileSync(filePath, 'utf-8');
+  return { canceled: false, filePath, content };
+});
+
+// Import external drawing/animation files (.psd, .kra, .clip, .png, .jpg, .webp, .svg)
+ipcMain.handle('file:importExternal', async () => {
+  const result = await dialog.showOpenDialog(mainWindow!, {
+    title: 'Import Artwork (.psd, .kra, .clip, .png, .jpg, .webp, .svg)',
+    filters: [
+      { name: 'All Supported Artwork', extensions: ['psd', 'kra', 'clip', 'png', 'jpg', 'jpeg', 'webp', 'bmp', 'svg'] },
+      { name: 'Layered Projects (PSD / KRA / CLIP)', extensions: ['psd', 'kra', 'clip'] },
+      { name: 'Images (PNG / JPG / WEBP / SVG)', extensions: ['png', 'jpg', 'jpeg', 'webp', 'bmp', 'svg'] }
+    ],
+    properties: ['openFile']
+  });
+  if (result.canceled || result.filePaths.length === 0) return { canceled: true };
+  const filePath = result.filePaths[0];
+  const ext = path.extname(filePath).toLowerCase().replace('.', '');
+  const bytes = fs.readFileSync(filePath);
+  return { canceled: false, filePath, ext, bytes: new Uint8Array(bytes) };
 });
 
 // Export Single PNG

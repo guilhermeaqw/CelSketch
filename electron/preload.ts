@@ -9,7 +9,11 @@ contextBridge.exposeInMainWorld('harmonyAPI', {
     ipcRenderer.invoke('file:saveProject', { content, currentPath }),
   saveProjectAs: (content: string) =>
     ipcRenderer.invoke('file:saveProjectAs', { content }),
+  autoSave: (content: string, currentPath?: string | null) =>
+    ipcRenderer.invoke('file:autoSave', { content, currentPath }),
   openProject: () => ipcRenderer.invoke('file:openProject'),
+  openProjectByPath: (filePath: string) => ipcRenderer.invoke('file:openProjectByPath', { filePath }),
+  importExternal: () => ipcRenderer.invoke('file:importExternal'),
   exportPng: (dataUrl: string, defaultName: string) =>
     ipcRenderer.invoke('file:exportPng', { dataUrl, defaultName }),
   pickDirectory: () => ipcRenderer.invoke('file:pickDirectory'),

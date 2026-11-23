@@ -1,5 +1,17 @@
 import { DrawingLayer, Point, Stroke } from '../types/harmony';
 
+const imageCache = new Map<string, HTMLImageElement>();
+
+function getCachedImage(dataUrl: string): HTMLImageElement {
+  let img = imageCache.get(dataUrl);
+  if (!img) {
+    img = new Image();
+    img.src = dataUrl;
+    imageCache.set(dataUrl, img);
+  }
+  return img;
+}
+
 export function getEffectiveFrameStrokes(layer: DrawingLayer, frame: number): Stroke[] {
   const direct = layer.frames[frame];
   if (direct && direct.length > 0) return direct;
@@ -275,6 +287,17 @@ export function renderStroke(
       ctx.fill();
     } else {
       ctx.stroke();
+    }
+  } else if (stroke.tool === 'image' && stroke.imageDataUrl) {
+    const img = getCachedImage(stroke.imageDataUrl);
+    if (img.complete && img.naturalWidth > 0) {
+      ctx.drawImage(
+        img,
+        stroke.imageX ?? 0,
+        stroke.imageY ?? 0,
+        stroke.imageW ?? img.naturalWidth,
+        stroke.imageH ?? img.naturalHeight
+      );
     }
   } else if (stroke.tool === 'fill' && pts.length >= 3) {
     ctx.beginPath();

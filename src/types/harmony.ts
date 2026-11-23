@@ -36,7 +36,7 @@ export interface Point {
 
 export interface Stroke {
   id: string;
-  tool: 'brush' | 'pencil' | 'eraser' | 'line' | 'rectangle' | 'ellipse' | 'fill';
+  tool: 'brush' | 'pencil' | 'eraser' | 'line' | 'rectangle' | 'ellipse' | 'fill' | 'image';
   preset?: BrushPresetId;
   artLayer: ArtLayerId;
   swatchId: string;
@@ -47,6 +47,11 @@ export interface Stroke {
   smoothing: number;
   points: Point[];
   filled?: boolean;
+  imageDataUrl?: string;
+  imageX?: number;
+  imageY?: number;
+  imageW?: number;
+  imageH?: number;
 }
 
 export interface ColourSwatch {
@@ -93,7 +98,10 @@ declare global {
       isMaximized: () => Promise<boolean>;
       saveProject: (content: string, currentPath?: string | null) => Promise<{ canceled: boolean; filePath?: string }>;
       saveProjectAs: (content: string) => Promise<{ canceled: boolean; filePath?: string }>;
+      autoSave: (content: string, currentPath?: string | null) => Promise<{ ok: boolean; filePath: string }>;
       openProject: () => Promise<{ canceled: boolean; filePath?: string; content?: string }>;
+      openProjectByPath: (filePath: string) => Promise<{ canceled: boolean; filePath?: string; content?: string; error?: string }>;
+      importExternal: () => Promise<{ canceled: boolean; filePath?: string; ext?: string; bytes?: Uint8Array }>;
       exportPng: (dataUrl: string, defaultName: string) => Promise<{ canceled: boolean; filePath?: string }>;
       pickDirectory: () => Promise<{ canceled: boolean; dirPath?: string }>;
       writeFrameToDir: (dirPath: string, name: string, dataUrl: string) => Promise<{ ok: boolean }>;

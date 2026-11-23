@@ -46,6 +46,9 @@ interface HarmonyState {
   // Project info
   projectName: string;
   projectPath: string | null;
+  autoSaveEnabled: boolean;
+  autoSaveIntervalSec: number;
+  lastAutoSaveTime: string | null;
   canvasWidth: number;
   canvasHeight: number;
   fps: number;
@@ -150,6 +153,7 @@ interface HarmonyState {
 
   // Layers & Drawing
   addLayer: (name?: string) => void;
+  importImageLayer: (name: string, dataUrl: string, x: number, y: number, w: number, h: number, opacity?: number) => void;
   deleteLayer: (id: string) => void;
   setActiveLayer: (id: string) => void;
   toggleLayerVisibility: (id: string) => void;
@@ -171,6 +175,9 @@ interface HarmonyState {
 
   // Project IO
   setProjectMeta: (name: string, path: string | null) => void;
+  setAutoSaveEnabled: (enabled: boolean) => void;
+  setAutoSaveIntervalSec: (sec: number) => void;
+  setLastAutoSaveTime: (time: string | null) => void;
   exportProjectData: () => HarmonyProjectData;
   loadProjectData: (data: HarmonyProjectData, filePath: string | null) => void;
   newProject: () => void;
@@ -238,6 +245,9 @@ const cloneLayers = (layers: DrawingLayer[]): DrawingLayer[] =>
 export const useHarmonyStore = create<HarmonyState>((set, get) => ({
   projectName: 'Untitled_Scene',
   projectPath: null,
+  autoSaveEnabled: true,
+  autoSaveIntervalSec: 60,
+  lastAutoSaveTime: null,
   canvasWidth: 1920,
   canvasHeight: 1080,
   fps: 24,
@@ -486,6 +496,48 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
       };
     }),
 
+  importImageLayer: (name, dataUrl, x, y, w, h, opacity = 1) =>
+    set((s) => {
+      const idx = s.layers.length + 1;
+      const colors = ['#4f9cf9', '#f59e0b', '#10b981', '#ec4899', '#8b5cf6', '#06b6d4'];
+      const imgStroke: Stroke = {
+        id: `st-img-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        tool: 'image',
+        artLayer: 'LA',
+        swatchId: 'sw-black',
+        color: '#ffffff',
+        size: 1,
+        opacity: 1,
+        smoothing: 0,
+        points: [{ x, y }],
+        imageDataUrl: dataUrl,
+        imageX: x,
+        imageY: y,
+        imageW: w,
+        imageH: h
+      };
+      const newLayer: DrawingLayer = {
+        id: `layer-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+        name: name || `Imported_${idx}`,
+        type: 'drawing',
+        visible: true,
+        locked: false,
+        solo: false,
+        holdFrames: true,
+        opacity,
+        tagColor: colors[idx % colors.length],
+        frames: { [s.currentFrame]: [imgStroke] },
+        nodeX: 120 + (idx - 1) * 160,
+        nodeY: 110
+      };
+      return {
+        undoStack: [...s.undoStack.slice(-39), { layers: cloneLayers(s.layers) }],
+        redoStack: [],
+        layers: [newLayer, ...s.layers],
+        activeLayerId: newLayer.id
+      };
+    }),
+
   deleteLayer: (id) =>
     set((s) => {
       if (s.layers.length <= 1) return s;
@@ -661,6 +713,9 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
     }),
 
   setProjectMeta: (projectName, projectPath) => set({ projectName, projectPath }),
+  setAutoSaveEnabled: (autoSaveEnabled) => set({ autoSaveEnabled }),
+  setAutoSaveIntervalSec: (sec) => set({ autoSaveIntervalSec: Math.max(5, Math.min(3600, Math.round(sec))) }),
+  setLastAutoSaveTime: (lastAutoSaveTime) => set({ lastAutoSaveTime }),
 
   exportProjectData: () => {
     const s = get();

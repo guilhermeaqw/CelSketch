@@ -22,9 +22,13 @@ export const App: React.FC = () => {
     currentFrame,
     projectName,
     projectPath,
+    autoSaveEnabled,
+    autoSaveIntervalSec,
+    lastAutoSaveTime,
     brushSize,
     setTool,
     setBrushSize,
+    setLastAutoSaveTime,
     undo,
     redo,
     togglePlay,
@@ -39,6 +43,26 @@ export const App: React.FC = () => {
     exportProjectData,
     setProjectMeta
   } = useHarmonyStore();
+
+  // Auto-Save timer every X seconds
+  useEffect(() => {
+    if (!autoSaveEnabled) return;
+    const ms = Math.max(5, autoSaveIntervalSec) * 1000;
+    const id = window.setInterval(async () => {
+      if (!window.harmonyAPI) return;
+      const state = useHarmonyStore.getState();
+      const data = JSON.stringify(state.exportProjectData(), null, 2);
+      const res = await window.harmonyAPI.autoSave(data, state.projectPath);
+      if (res?.ok) {
+        const now = new Date();
+        const hh = String(now.getHours()).padStart(2, '0');
+        const mm = String(now.getMinutes()).padStart(2, '0');
+        const ss = String(now.getSeconds()).padStart(2, '0');
+        setLastAutoSaveTime(`${hh}:${mm}:${ss}`);
+      }
+    }, ms);
+    return () => window.clearInterval(id);
+  }, [autoSaveEnabled, autoSaveIntervalSec, setLastAutoSaveTime]);
 
   // Global Keyboard Shortcuts
   useEffect(() => {
@@ -235,6 +259,9 @@ export const App: React.FC = () => {
           <strong>{activeLayer?.name || 'None'}</strong>
         </span>
         <span>
+          {lastAutoSaveTime && (
+            <span style={{ color: '#4ade80', marginRight: 10 }}>AutoSaved {lastAutoSaveTime}</span>
+          )}
           CelSketch (Windows x64) &nbsp;|&nbsp; {fps} FPS &nbsp;|&nbsp; Frame {currentFrame}
         </span>
       </div>

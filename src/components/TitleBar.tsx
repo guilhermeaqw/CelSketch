@@ -16,9 +16,33 @@ import {
   Camera
 } from 'lucide-react';
 import { useHarmonyStore } from '../store/useHarmonyStore';
+import { parseExternalArtwork } from '../utils/importer';
+
+const RECENT_KEY = 'celsketch_recent_projects';
+
+function loadRecentPaths(): string[] {
+  try {
+    const raw = localStorage.getItem(RECENT_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveRecentPath(filePath: string): string[] {
+  const existing = loadRecentPaths().filter((p) => p !== filePath);
+  const updated = [filePath, ...existing].slice(0, 8);
+  try {
+    localStorage.setItem(RECENT_KEY, JSON.stringify(updated));
+  } catch {
+    // ignore storage errors
+  }
+  return updated;
+}
 
 export const TitleBar: React.FC = () => {
   const [openMenu, setOpenMenu] = useState<string | null>(null);
+  const [recentProjects, setRecentProjects] = useState<string[]>(() => loadRecentPaths());
   const menuRef = useRef<HTMLDivElement>(null);
 
   const {
@@ -33,11 +57,15 @@ export const TitleBar: React.FC = () => {
     grayscaleMode,
     rotation,
     brushSmoothing,
+    autoSaveEnabled,
+    autoSaveIntervalSec,
     undoStack,
     redoStack,
     undo,
     redo,
     setBrushSmoothing,
+    setAutoSaveEnabled,
+    setAutoSaveIntervalSec,
     resetRotation,
     toggleGrid,
     toggleCameraFrame,
@@ -54,6 +82,7 @@ export const TitleBar: React.FC = () => {
     loadProjectData,
     setProjectMeta,
     addLayer,
+    importImageLayer,
     togglePlay
   } = useHarmonyStore();
 
@@ -73,8 +102,9 @@ export const TitleBar: React.FC = () => {
     if (window.harmonyAPI) {
       const res = await window.harmonyAPI.saveProject(data, projectPath);
       if (!res.canceled && res.filePath) {
-        const name = res.filePath.split(/[\\/]/).pop()?.replace(/\.(nexo|hrm)$/i, '') || projectName;
+        const name = res.filePath.split(/[\\/]/).pop()?.replace(/\.(celsketch|nexo|hrm)$/i, '') || projectName;
         setProjectMeta(name, res.filePath);
+        setRecentProjects(saveRecentPath(res.filePath));
       }
     }
   };
@@ -85,8 +115,9 @@ export const TitleBar: React.FC = () => {
     if (window.harmonyAPI) {
       const res = await window.harmonyAPI.saveProjectAs(data);
       if (!res.canceled && res.filePath) {
-        const name = res.filePath.split(/[\\/]/).pop()?.replace(/\.(nexo|hrm)$/i, '') || projectName;
+        const name = res.filePath.split(/[\\/]/).pop()?.replace(/\.(celsketch|nexo|hrm)$/i, '') || projectName;
         setProjectMeta(name, res.filePath);
+        setRecentProjects(saveRecentPath(res.filePath));
       }
     }
   };
@@ -99,9 +130,42 @@ export const TitleBar: React.FC = () => {
         try {
           const parsed = JSON.parse(res.content);
           loadProjectData(parsed, res.filePath || null);
+          if (res.filePath) setRecentProjects(saveRecentPath(res.filePath));
         } catch (err) {
           console.error('Failed to parse project file', err);
         }
+      }
+    }
+  };
+
+  const handleOpenRecent = async (filePath: string) => {
+    setOpenMenu(null);
+    if (!window.harmonyAPI) return;
+    const res = await window.harmonyAPI.openProjectByPath(filePath);
+    if (!res.canceled && res.content) {
+      try {
+        const parsed = JSON.parse(res.content);
+        loadProjectData(parsed, filePath);
+        setRecentProjects(saveRecentPath(filePath));
+      } catch (err) {
+        console.error('Failed to parse recent project', err);
+      }
+    }
+  };
+
+  const handleImportArtwork = async () => {
+    setOpenMenu(null);
+    if (!window.harmonyAPI) return;
+    const res = await window.harmonyAPI.importExternal();
+    if (!res.canceled && res.bytes && res.ext && res.filePath) {
+      const fileName = res.filePath.split(/[\\/]/).pop() || 'Imported';
+      try {
+        const items = await parseExternalArtwork(fileName, res.ext, res.bytes);
+        for (const item of items) {
+          importImageLayer(item.name, item.dataUrl, item.x, item.y, item.w, item.h, item.opacity);
+        }
+      } catch (err) {
+        console.error('Failed to import external artwork', err);
       }
     }
   };
@@ -144,6 +208,32 @@ export const TitleBar: React.FC = () => {
                 <button className="dropdown-item" onClick={handleOpen}>
                   <span>Open Project (.celsketch)...</span><span style={{ color: '#888' }}>Ctrl+O</span>
                 </button>
+                <button className="dropdown-item" onClick={handleImportArtwork}>
+                  <span>Import (.psd, .kra, .clip, .png)...</span>
+                </button>
+                {recentProjects.length > 0 && (
+                  <>
+                    <div className="dropdown-sep" />
+                    <div style={{ padding: '3px 14px', fontSize: 10, color: '#888', textTransform: 'uppercase' }}>
+                      Recent Projects
+                    </div>
+                    {recentProjects.map((fp) => {
+                      const label = fp.split(/[\\/]/).pop() || fp;
+                      return (
+                        <button
+                          key={fp}
+                          className="dropdown-item"
+                          onClick={() => handleOpenRecent(fp)}
+                          title={fp}
+                        >
+                          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 170 }}>
+                            {label}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </>
+                )}
                 <div className="dropdown-sep" />
                 <button className="dropdown-item" onClick={handleSave}>
                   <span>Save</span><span style={{ color: '#888' }}>Ctrl+S</span>
@@ -329,6 +419,33 @@ export const TitleBar: React.FC = () => {
           />
           <span style={{ width: 32, color: '#fff', fontWeight: 600 }}>{brushSmoothing}%</span>
         </label>
+
+        <div className="tb-sep" />
+
+        {/* Auto-Save Controls */}
+        <label
+          style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: '#ccc', cursor: 'pointer' }}
+          title="Ativar/Desativar Auto-Save automático"
+        >
+          <input
+            type="checkbox"
+            checked={autoSaveEnabled}
+            onChange={(e) => setAutoSaveEnabled(e.target.checked)}
+          />
+          <span>AutoSave:</span>
+        </label>
+        <input
+          type="number"
+          min={5}
+          max={3600}
+          value={autoSaveIntervalSec}
+          disabled={!autoSaveEnabled}
+          onChange={(e) => setAutoSaveIntervalSec(Number(e.target.value) || 60)}
+          className="harmony-input"
+          style={{ width: 46, opacity: autoSaveEnabled ? 1 : 0.45 }}
+          title="Intervalo do Auto-Save em segundos"
+        />
+        <span style={{ fontSize: 10.5, color: '#888' }}>s</span>
       </div>
     </>
   );

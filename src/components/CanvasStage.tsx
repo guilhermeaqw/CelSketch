@@ -400,7 +400,7 @@ export const CanvasStage: React.FC = () => {
       for (const layer of ordered) {
         const isCurrent = layer.id === activeLayerId;
 
-        if (isCurrent && onionSkin && layer.visible) {
+        if (onionSkin && layer.visible && !layer.holdFrames) {
           // Previous frames (reddish tint)
           for (let offset = onionPrev; offset >= 1; offset--) {
             const f = currentFrame - offset;
@@ -412,7 +412,7 @@ export const CanvasStage: React.FC = () => {
               renderStroke(lctx, st, '#e04848', 1);
             }
             ctx.save();
-            ctx.globalAlpha = 0.38 / offset;
+            ctx.globalAlpha = 0.45 / offset;
             ctx.drawImage(layerBuffer, 0, 0);
             ctx.restore();
           }
@@ -426,7 +426,7 @@ export const CanvasStage: React.FC = () => {
               renderStroke(lctx, st, '#32b85c', 1);
             }
             ctx.save();
-            ctx.globalAlpha = 0.38 / offset;
+            ctx.globalAlpha = 0.45 / offset;
             ctx.drawImage(layerBuffer, 0, 0);
             ctx.restore();
           }
