@@ -356,3 +356,109 @@ export function renderFrameToCanvas(
     ctx.restore();
   }
 }
+
+/**
+ * Fast pixel-accurate Scanline Flood Fill (Paint Bucket)
+ * Returns a transparent PNG dataUrl containing only the filled region.
+ */
+export function performFloodFill(
+  layers: DrawingLayer[],
+  frame: number,
+  width: number,
+  height: number,
+  startX: number,
+  startY: number,
+  fillHex: string,
+  tolerance = 40
+): string | null {
+  const sx = Math.round(startX);
+  const sy = Math.round(startY);
+  if (sx < 0 || sy < 0 || sx >= width || sy >= height) return null;
+
+  const srcCanvas = document.createElement('canvas');
+  renderFrameToCanvas(srcCanvas, layers, frame, width, height, '#ffffff');
+  const sctx = srcCanvas.getContext('2d', { willReadFrequently: true });
+  if (!sctx) return null;
+
+  const srcData = sctx.getImageData(0, 0, width, height).data;
+  const startIdx = (sy * width + sx) * 4;
+  const sr = srcData[startIdx];
+  const sg = srcData[startIdx + 1];
+  const sb = srcData[startIdx + 2];
+
+  const clean = fillHex.replace('#', '');
+  const fr = parseInt(clean.substring(0, 2) || '00', 16);
+  const fg = parseInt(clean.substring(2, 4) || '00', 16);
+  const fb = parseInt(clean.substring(4, 6) || '00', 16);
+
+  const outCanvas = document.createElement('canvas');
+  outCanvas.width = width;
+  outCanvas.height = height;
+  const octx = outCanvas.getContext('2d');
+  if (!octx) return null;
+  const outImg = octx.createImageData(width, height);
+  const outData = outImg.data;
+
+  const visited = new Uint8Array(width * height);
+  const stack: number[] = [sx, sy];
+
+  const matches = (idx: number) => {
+    const p = idx * 4;
+    return (
+      Math.abs(srcData[p] - sr) <= tolerance &&
+      Math.abs(srcData[p + 1] - sg) <= tolerance &&
+      Math.abs(srcData[p + 2] - sb) <= tolerance
+    );
+  };
+
+  while (stack.length > 0) {
+    const y = stack.pop()!;
+    const x = stack.pop()!;
+    let lx = x;
+    while (lx >= 0 && !visited[y * width + lx] && matches(y * width + lx)) {
+      lx--;
+    }
+    lx++;
+    let rx = x;
+    while (rx < width && !visited[y * width + rx] && matches(y * width + rx)) {
+      rx++;
+    }
+    rx--;
+
+    let spanAbove = false;
+    let spanBelow = false;
+    for (let cx = lx; cx <= rx; cx++) {
+      const idx = y * width + cx;
+      visited[idx] = 1;
+      const p = idx * 4;
+      outData[p] = fr;
+      outData[p + 1] = fg;
+      outData[p + 2] = fb;
+      outData[p + 3] = 255;
+
+      if (y > 0) {
+        const upIdx = (y - 1) * width + cx;
+        const upMatch = !visited[upIdx] && matches(upIdx);
+        if (!spanAbove && upMatch) {
+          stack.push(cx, y - 1);
+          spanAbove = true;
+        } else if (spanAbove && !upMatch) {
+          spanAbove = false;
+        }
+      }
+      if (y < height - 1) {
+        const dnIdx = (y + 1) * width + cx;
+        const dnMatch = !visited[dnIdx] && matches(dnIdx);
+        if (!spanBelow && dnMatch) {
+          stack.push(cx, y + 1);
+          spanBelow = true;
+        } else if (spanBelow && !dnMatch) {
+          spanBelow = false;
+        }
+      }
+    }
+  }
+
+  octx.putImageData(outImg, 0, 0);
+  return outCanvas.toDataURL('image/png');
+}

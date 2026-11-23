@@ -165,6 +165,7 @@ interface HarmonyState {
 
   addStroke: (stroke: Stroke) => void;
   moveStrokes: (strokeIds: string[], dx: number, dy: number) => void;
+  replaceStrokes: (updated: Stroke[]) => void;
   deleteStrokes: (strokeIds: string[]) => void;
   clearCurrentFrame: () => void;
   duplicateFrameToNext: () => void;
@@ -622,6 +623,29 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
         };
       });
       return { layers };
+    }),
+
+  replaceStrokes: (updated) =>
+    set((s) => {
+      if (updated.length === 0) return s;
+      const map = new Map(updated.map((st) => [st.id, st]));
+      const snapshot = { layers: cloneLayers(s.layers) };
+      const layers = s.layers.map((l) => {
+        if (l.id !== s.activeLayerId) return l;
+        const existing = l.frames[s.currentFrame] || [];
+        return {
+          ...l,
+          frames: {
+            ...l.frames,
+            [s.currentFrame]: existing.map((st) => map.get(st.id) || st)
+          }
+        };
+      });
+      return {
+        undoStack: [...s.undoStack.slice(-39), snapshot],
+        redoStack: [],
+        layers
+      };
     }),
 
   deleteStrokes: (strokeIds) =>

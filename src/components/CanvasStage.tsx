@@ -1,7 +1,7 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
 import { useHarmonyStore } from '../store/useHarmonyStore';
 import { ArtLayerId, Point, Stroke } from '../types/harmony';
-import { renderStroke, getEffectiveFrameStrokes } from '../utils/canvasRenderer';
+import { renderStroke, getEffectiveFrameStrokes, performFloodFill } from '../utils/canvasRenderer';
 
 const ART_LAYERS: { id: ArtLayerId; label: string }[] = [
   { id: 'OL', label: 'Overlay Art' },
@@ -51,12 +51,23 @@ export const CanvasStage: React.FC = () => {
   const [isDraggingSelection, setIsDraggingSelection] = useState(false);
   const [dragLastPt, setDragLastPt] = useState<Point | null>(null);
 
-  // Canvas Crop / Resize Tool (C key - Clip Studio style)
+  // Canvas Crop / Resize Tool (C key)
   type CropHandle = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w' | 'move';
   const [cropRect, setCropRect] = useState({ left: 0, top: 0, right: 1920, bottom: 1080 });
   const [activeCropHandle, setActiveCropHandle] = useState<CropHandle | null>(null);
   const [cropDragStart, setCropDragStart] = useState<{ pt: Point; rect: { left: number; top: number; right: number; bottom: number } } | null>(null);
   const [hoverCropHandle, setHoverCropHandle] = useState<CropHandle | null>(null);
+
+  // Free Transform / Perspective Tool (Ctrl+T)
+  type Quad = { tl: Point; tr: Point; br: Point; bl: Point };
+  type TransformHandle = 'tl' | 'tr' | 'br' | 'bl' | 'rot' | 'move';
+  const [transformActive, setTransformActive] = useState(false);
+  const [transformSubMode, setTransformSubMode] = useState<'scale' | 'perspective'>('scale');
+  const [transformOrigStrokes, setTransformOrigStrokes] = useState<Stroke[]>([]);
+  const [transformOrigBounds, setTransformOrigBounds] = useState<{ minX: number; minY: number; maxX: number; maxY: number } | null>(null);
+  const [transformQuad, setTransformQuad] = useState<Quad | null>(null);
+  const [activeTransformHandle, setActiveTransformHandle] = useState<TransformHandle | null>(null);
+  const [transformDragStart, setTransformDragStart] = useState<{ pt: Point; quad: Quad } | null>(null);
 
   const {
     canvasWidth,
@@ -97,11 +108,17 @@ export const CanvasStage: React.FC = () => {
     resizeCanvas,
     addStroke,
     moveStrokes,
+    replaceStrokes,
     deleteStrokes
   } = useHarmonyStore();
 
   // Initialize crop rectangle whenever Crop Mode (C) opens
   useEffect(() => {
+    if (transformActive) {
+      setActiveTransformHandle(null);
+      setTransformDragStart(null);
+      return;
+    }
     if (cropMode) {
       setCropRect({ left: 0, top: 0, right: canvasWidth, bottom: canvasHeight });
       setActiveCropHandle(null);
@@ -207,6 +224,103 @@ export const CanvasStage: React.FC = () => {
     }
     setSelectedStrokeIds([]);
   }, [lassoClosed, lassoPoints, selectedStrokeIds, deleteStrokes]);
+
+  const mapStrokesToQuad = useCallback(
+    (origStrokes: Stroke[], bounds: { minX: number; minY: number; maxX: number; maxY: number }, quad: Quad): Stroke[] => {
+      const bw = Math.max(1, bounds.maxX - bounds.minX);
+      const bh = Math.max(1, bounds.maxY - bounds.minY);
+      return origStrokes.map((st) => ({
+        ...st,
+        points: st.points.map((pt) => {
+          const u = (pt.x - bounds.minX) / bw;
+          const v = (pt.y - bounds.minY) / bh;
+          const x =
+            (1 - u) * (1 - v) * quad.tl.x +
+            u * (1 - v) * quad.tr.x +
+            u * v * quad.br.x +
+            (1 - u) * v * quad.bl.x;
+          const y =
+            (1 - u) * (1 - v) * quad.tl.y +
+            u * (1 - v) * quad.tr.y +
+            u * v * quad.br.y +
+            (1 - u) * v * quad.bl.y;
+          return { ...pt, x, y };
+        })
+      }));
+    },
+    []
+  );
+
+  const openTransform = useCallback(() => {
+    const activeLayer = layers.find((l) => l.id === activeLayerId);
+    const frameStrokes = activeLayer?.frames[currentFrame] || [];
+    const targetStrokes =
+      selectedStrokeIds.length > 0
+        ? frameStrokes.filter((s) => selectedStrokeIds.includes(s.id))
+        : frameStrokes;
+    if (targetStrokes.length === 0) return;
+
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const st of targetStrokes) {
+      for (const p of st.points) {
+        if (p.x < minX) minX = p.x;
+        if (p.y < minY) minY = p.y;
+        if (p.x > maxX) maxX = p.x;
+        if (p.y > maxY) maxY = p.y;
+      }
+    }
+    if (!isFinite(minX)) return;
+    if (maxX - minX < 10) { minX -= 5; maxX += 5; }
+    if (maxY - minY < 10) { minY -= 5; maxY += 5; }
+
+    setTransformOrigStrokes(JSON.parse(JSON.stringify(targetStrokes)));
+    setTransformOrigBounds({ minX, minY, maxX, maxY });
+    setTransformQuad({
+      tl: { x: minX, y: minY },
+      tr: { x: maxX, y: minY },
+      br: { x: maxX, y: maxY },
+      bl: { x: minX, y: maxY }
+    });
+    setTransformSubMode('scale');
+    setTransformActive(true);
+  }, [layers, activeLayerId, currentFrame, selectedStrokeIds]);
+
+  const commitTransform = useCallback(() => {
+    if (!transformActive || !transformOrigBounds || !transformQuad) return;
+    const mapped = mapStrokesToQuad(transformOrigStrokes, transformOrigBounds, transformQuad);
+    replaceStrokes(mapped);
+    setTransformActive(false);
+    setTransformQuad(null);
+    setTransformOrigBounds(null);
+    setTransformOrigStrokes([]);
+  }, [transformActive, transformOrigBounds, transformQuad, transformOrigStrokes, mapStrokesToQuad, replaceStrokes]);
+
+  const cancelTransform = useCallback(() => {
+    setTransformActive(false);
+    setTransformQuad(null);
+    setTransformOrigBounds(null);
+    setTransformOrigStrokes([]);
+  }, []);
+
+  // Ctrl+T to open Transform, Enter to commit, Escape to cancel
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 't') {
+        e.preventDefault();
+        if (transformActive) commitTransform();
+        else openTransform();
+      } else if (transformActive && e.key === 'Enter') {
+        e.preventDefault();
+        commitTransform();
+      } else if (transformActive && e.key === 'Escape') {
+        e.preventDefault();
+        cancelTransform();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [transformActive, openTransform, commitTransform, cancelTransform]);
 
   // Selection keyboard controls: Ctrl+A (Select All), Alt+Backspace (Fill), Delete/Backspace, Enter, Esc/Ctrl+D
   useEffect(() => {
@@ -438,8 +552,18 @@ export const CanvasStage: React.FC = () => {
         if (strokes.length === 0 && !(isCurrent && draftStroke)) continue;
 
         lctx.clearRect(0, 0, canvasWidth, canvasHeight);
+        const transformingIds =
+          isCurrent && transformActive ? new Set(transformOrigStrokes.map((s) => s.id)) : null;
+
         for (const st of strokes) {
+          if (transformingIds && transformingIds.has(st.id)) continue;
           renderStroke(lctx, st);
+        }
+        if (isCurrent && transformActive && transformOrigBounds && transformQuad) {
+          const previewStrokes = mapStrokesToQuad(transformOrigStrokes, transformOrigBounds, transformQuad);
+          for (const st of previewStrokes) {
+            renderStroke(lctx, st);
+          }
         }
         if (isCurrent && draftStroke) {
           renderStroke(lctx, draftStroke);
@@ -510,7 +634,57 @@ export const CanvasStage: React.FC = () => {
       ctx.restore();
     }
 
+    // Free Transform / Perspective Bounding Quad (Ctrl+T)
+    if (transformActive && transformQuad) {
+      const { tl, tr, br, bl } = transformQuad;
+      const topMidX = (tl.x + tr.x) / 2;
+      const topMidY = (tl.y + tr.y) / 2;
+      const rotHandleX = topMidX;
+      const rotHandleY = topMidY - 28 / zoom;
+
+      ctx.save();
+      ctx.strokeStyle = '#3a86ff';
+      ctx.lineWidth = 1.5 / zoom;
+      ctx.beginPath();
+      ctx.moveTo(tl.x, tl.y);
+      ctx.lineTo(tr.x, tr.y);
+      ctx.lineTo(br.x, br.y);
+      ctx.lineTo(bl.x, bl.y);
+      ctx.closePath();
+      ctx.stroke();
+
+      // Rotation stem & circle handle
+      ctx.beginPath();
+      ctx.moveTo(topMidX, topMidY);
+      ctx.lineTo(rotHandleX, rotHandleY);
+      ctx.stroke();
+
+      ctx.fillStyle = '#3a86ff';
+      ctx.beginPath();
+      ctx.arc(rotHandleX, rotHandleY, 5.5 / zoom, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 1.2 / zoom;
+      ctx.stroke();
+
+      // 4 Corner Handles
+      const hs = 9 / zoom;
+      for (const corner of [tl, tr, br, bl]) {
+        ctx.fillStyle = transformSubMode === 'perspective' ? '#f59e0b' : '#ffffff';
+        ctx.strokeStyle = '#1d4ed8';
+        ctx.lineWidth = 1.5 / zoom;
+        ctx.fillRect(corner.x - hs / 2, corner.y - hs / 2, hs, hs);
+        ctx.strokeRect(corner.x - hs / 2, corner.y - hs / 2, hs, hs);
+      }
+      ctx.restore();
+    }
+
     // Canvas Crop / Resize Overlay (C key — Clip Studio style)
+    if (transformActive) {
+      setActiveTransformHandle(null);
+      setTransformDragStart(null);
+      return;
+    }
     if (cropMode) {
       ctx.save();
       const cw = cropRect.right - cropRect.left;
@@ -605,7 +779,13 @@ export const CanvasStage: React.FC = () => {
     lassoCursor,
     activeTool,
     cropMode,
-    cropRect
+    cropRect,
+    transformActive,
+    transformQuad,
+    transformSubMode,
+    transformOrigStrokes,
+    transformOrigBounds,
+    mapStrokesToQuad
   ]);
 
   const getPointFromEvent = useCallback(
@@ -654,7 +834,34 @@ export const CanvasStage: React.FC = () => {
     const pt = getPointFromEvent(e);
     setPenStatus({ type: e.pointerType || 'mouse', pressure: pt.pressure ?? 1 });
 
+    // Free Transform Mode (Ctrl+T) pointer down
+    if (transformActive && transformQuad) {
+      const tol = 16 / zoom;
+      const { tl, tr, br, bl } = transformQuad;
+      const rotX = (tl.x + tr.x) / 2;
+      const rotY = (tl.y + tr.y) / 2 - 28 / zoom;
+
+      let hit: TransformHandle | null = null;
+      if (Math.hypot(pt.x - rotX, pt.y - rotY) <= tol) hit = 'rot';
+      else if (Math.hypot(pt.x - tl.x, pt.y - tl.y) <= tol) hit = 'tl';
+      else if (Math.hypot(pt.x - tr.x, pt.y - tr.y) <= tol) hit = 'tr';
+      else if (Math.hypot(pt.x - br.x, pt.y - br.y) <= tol) hit = 'br';
+      else if (Math.hypot(pt.x - bl.x, pt.y - bl.y) <= tol) hit = 'bl';
+      else if (isPointInPolygon(pt, [tl, tr, br, bl])) hit = 'move';
+
+      if (hit) {
+        setActiveTransformHandle(hit);
+        setTransformDragStart({ pt, quad: JSON.parse(JSON.stringify(transformQuad)) });
+      }
+      return;
+    }
+
     // Canvas Crop Mode pointer down
+    if (transformActive) {
+      setActiveTransformHandle(null);
+      setTransformDragStart(null);
+      return;
+    }
     if (cropMode) {
       const handle = hitTestCropHandle(pt);
       if (handle) {
@@ -709,19 +916,50 @@ export const CanvasStage: React.FC = () => {
     const isStylusEraser = e.pointerType === 'pen' && e.buttons === 32;
     const effectiveTool = isStylusEraser ? 'eraser' : activeTool;
 
+    // Real Scanline Flood-Fill Paint Bucket (G)
+    if (effectiveTool === 'paint') {
+      const fillUrl = performFloodFill(
+        layers,
+        currentFrame,
+        canvasWidth,
+        canvasHeight,
+        pt.x,
+        pt.y,
+        activeColor,
+        42
+      );
+      if (fillUrl) {
+        addStroke({
+          id: `st-bucket-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          tool: 'image',
+          artLayer: activeArtLayer,
+          swatchId: activeSwatch.id,
+          color: activeColor,
+          size: 1,
+          opacity: brushOpacity,
+          smoothing: 0,
+          points: [{ x: 0, y: 0 }],
+          imageDataUrl: fillUrl,
+          imageX: 0,
+          imageY: 0,
+          imageW: canvasWidth,
+          imageH: canvasHeight
+        });
+      }
+      return;
+    }
+
     if (
       effectiveTool === 'brush' ||
       effectiveTool === 'pencil' ||
       effectiveTool === 'eraser' ||
       effectiveTool === 'line' ||
       effectiveTool === 'rectangle' ||
-      effectiveTool === 'ellipse' ||
-      effectiveTool === 'paint'
+      effectiveTool === 'ellipse'
     ) {
-      const toolType = effectiveTool === 'paint' ? 'fill' : effectiveTool;
       const newStroke: Stroke = {
         id: `st-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-        tool: toolType,
+        tool: effectiveTool,
         preset: activeBrushPreset,
         artLayer: activeArtLayer,
         swatchId: activeSwatch.id,
@@ -759,7 +997,63 @@ export const CanvasStage: React.FC = () => {
 
     const pt = screenToCanvas(e.clientX, e.clientY);
 
+    // Free Transform Mode (Ctrl+T) pointer move
+    if (transformActive && activeTransformHandle && transformDragStart) {
+      const dx = pt.x - transformDragStart.pt.x;
+      const dy = pt.y - transformDragStart.pt.y;
+      const q = JSON.parse(JSON.stringify(transformDragStart.quad)) as Quad;
+
+      if (activeTransformHandle === 'move') {
+        q.tl.x += dx; q.tl.y += dy;
+        q.tr.x += dx; q.tr.y += dy;
+        q.br.x += dx; q.br.y += dy;
+        q.bl.x += dx; q.bl.y += dy;
+      } else if (activeTransformHandle === 'rot') {
+        const cx = (q.tl.x + q.tr.x + q.br.x + q.bl.x) / 4;
+        const cy = (q.tl.y + q.tr.y + q.br.y + q.bl.y) / 4;
+        const a0 = Math.atan2(transformDragStart.pt.y - cy, transformDragStart.pt.x - cx);
+        const a1 = Math.atan2(pt.y - cy, pt.x - cx);
+        const delta = a1 - a0;
+        const cos = Math.cos(delta);
+        const sin = Math.sin(delta);
+        const rotPt = (p: Point): Point => ({
+          x: cx + (p.x - cx) * cos - (p.y - cy) * sin,
+          y: cy + (p.x - cx) * sin + (p.y - cy) * cos
+        });
+        q.tl = rotPt(q.tl);
+        q.tr = rotPt(q.tr);
+        q.br = rotPt(q.br);
+        q.bl = rotPt(q.bl);
+      } else if (transformSubMode === 'perspective') {
+        // Free 4-corner perspective warp!
+        q[activeTransformHandle].x += dx;
+        q[activeTransformHandle].y += dy;
+      } else {
+        // Rectangular scale
+        if (activeTransformHandle === 'tl') {
+          q.tl.x += dx; q.tl.y += dy;
+          q.tr.y += dy; q.bl.x += dx;
+        } else if (activeTransformHandle === 'tr') {
+          q.tr.x += dx; q.tr.y += dy;
+          q.tl.y += dy; q.br.x += dx;
+        } else if (activeTransformHandle === 'br') {
+          q.br.x += dx; q.br.y += dy;
+          q.bl.y += dy; q.tr.x += dx;
+        } else if (activeTransformHandle === 'bl') {
+          q.bl.x += dx; q.bl.y += dy;
+          q.br.y += dy; q.tl.x += dx;
+        }
+      }
+      setTransformQuad(q);
+      return;
+    }
+
     // Canvas Crop Mode pointer move
+    if (transformActive) {
+      setActiveTransformHandle(null);
+      setTransformDragStart(null);
+      return;
+    }
     if (cropMode) {
       if (activeCropHandle && cropDragStart) {
         const dx = pt.x - cropDragStart.pt.x;
@@ -875,6 +1169,11 @@ export const CanvasStage: React.FC = () => {
       setIsPanning(false);
       return;
     }
+    if (transformActive) {
+      setActiveTransformHandle(null);
+      setTransformDragStart(null);
+      return;
+    }
     if (cropMode) {
       setActiveCropHandle(null);
       setCropDragStart(null);
@@ -921,6 +1220,7 @@ export const CanvasStage: React.FC = () => {
 
   const showBrushRing =
     !cropMode &&
+    !transformActive &&
     !spaceHeld &&
     !rHeld &&
     !isPanning &&
@@ -1006,6 +1306,65 @@ export const CanvasStage: React.FC = () => {
             zIndex: 60
           }}
         />
+      )}
+
+      {/* Floating Free Transform / Perspective Action Bar (Ctrl+T) */}
+      {transformActive && transformQuad && (
+        <div
+          style={{
+            position: 'absolute',
+            top: 10,
+            left: '50%',
+            transform: 'translateX(-50%)',
+            background: 'rgba(34, 34, 34, 0.96)',
+            border: '1px solid #4a4a4a',
+            borderRadius: 5,
+            padding: '5px 10px',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 6,
+            boxShadow: '0 6px 20px rgba(0,0,0,0.6)',
+            zIndex: 55
+          }}
+        >
+          <span style={{ fontSize: 11, color: '#bbb', fontWeight: 600, marginRight: 4 }}>Transform:</span>
+          <button
+            className={`icon-btn ${transformSubMode === 'scale' ? 'active' : ''}`}
+            onClick={() => setTransformSubMode('scale')}
+          >
+            Escala / Girar
+          </button>
+          <button
+            className={`icon-btn ${transformSubMode === 'perspective' ? 'active' : ''}`}
+            onClick={() => setTransformSubMode('perspective')}
+          >
+            Perspectiva
+          </button>
+          <div className="tb-sep" />
+          <button
+            className="icon-btn"
+            onClick={() =>
+              setTransformQuad((q) => (q ? { tl: q.tr, tr: q.tl, br: q.bl, bl: q.br } : q))
+            }
+          >
+            Flip H
+          </button>
+          <button
+            className="icon-btn"
+            onClick={() =>
+              setTransformQuad((q) => (q ? { tl: q.bl, tr: q.br, br: q.tr, bl: q.tl } : q))
+            }
+          >
+            Flip V
+          </button>
+          <div className="tb-sep" />
+          <button className="icon-btn active" onClick={commitTransform} style={{ fontWeight: 600 }}>
+            Aplicar (Enter)
+          </button>
+          <button className="icon-btn" onClick={cancelTransform}>
+            Cancelar (Esc)
+          </button>
+        </div>
       )}
 
       {/* Floating Selection Action Bar (Ctrl+A or Lasso) */}
