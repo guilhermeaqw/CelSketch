@@ -313,10 +313,10 @@ export const TitleBar: React.FC = () => {
 
         <div className="tb-sep" />
 
-        {/* Photoshop-style Smoothing / Stabilizer */}
+        {/* Brush Stabilizer */}
         <label
           style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: '#ccc' }}
-          title="Brush Stabilizer (Photoshop Smoothing / Pulled String)"
+          title="Brush Stabilizer (Pulled String)"
         >
           <span>Stabilizer:</span>
           <input

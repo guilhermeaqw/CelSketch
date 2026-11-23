@@ -1,7 +1,7 @@
 {
-  "name": "harmony-studio",
-  "version": "27.1.0",
-  "description": "Harmony Studio 27.1 - Professional 2D Animation & Drawing Software for Windows",
+  "name": "celsketch",
+  "version": "1.0.0",
+  "description": "CelSketch - Professional 2D Animation & Drawing Software",
   "main": "dist-electron/main.js",
   "author": "Guinogue",
   "license": "MIT",
@@ -47,6 +47,29 @@
       "target": [
         {
           "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "linux": {
+      "category": "Graphics",
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "deb",
           "arch": [
             "x64"
           ]
