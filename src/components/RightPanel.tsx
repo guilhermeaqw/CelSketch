@@ -80,6 +80,10 @@ export const RightPanel: React.FC = () => {
     brushOpacity,
     brushSmoothing,
     shapeFilled,
+    bucketReference,
+    bucketTolerance,
+    bucketExpand,
+    bucketBehind,
     onionPrev,
     onionNext,
     swatches,
@@ -92,6 +96,10 @@ export const RightPanel: React.FC = () => {
     setBrushOpacity,
     setBrushSmoothing,
     setShapeFilled,
+    setBucketReference,
+    setBucketTolerance,
+    setBucketExpand,
+    setBucketBehind,
     setOnionRange,
     setActiveSwatch,
     addSwatch
@@ -169,6 +177,69 @@ export const RightPanel: React.FC = () => {
       {/* TOOL PROPERTIES TAB */}
       {rightTab === 'properties' && (
         <div style={{ flex: 1, overflowY: 'auto' }}>
+          {activeTool === 'paint' && (
+            <div className="prop-group">
+              <div style={{ fontSize: 11, fontWeight: 600, color: '#eee', marginBottom: 8, textTransform: 'uppercase' }}>
+                Balde de Tinta (Paint Bucket)
+              </div>
+
+              <div className="prop-label">
+                <span>Referência de Contorno</span>
+              </div>
+              <div style={{ display: 'flex', gap: 4, marginBottom: 10 }}>
+                <button
+                  onClick={() => setBucketReference('all')}
+                  className={`icon-btn ${bucketReference === 'all' ? 'active' : ''}`}
+                  style={{ flex: 1, justifyContent: 'center' }}
+                >
+                  Todas as Layers
+                </button>
+                <button
+                  onClick={() => setBucketReference('active')}
+                  className={`icon-btn ${bucketReference === 'active' ? 'active' : ''}`}
+                  style={{ flex: 1, justifyContent: 'center' }}
+                >
+                  Layer Ativa
+                </button>
+              </div>
+
+              <div className="prop-label">
+                <span>Tolerância</span>
+                <span>{bucketTolerance}</span>
+              </div>
+              <input
+                type="range"
+                min={0}
+                max={150}
+                value={bucketTolerance}
+                onChange={(e) => setBucketTolerance(Number(e.target.value))}
+                className="harmony-slider"
+              />
+
+              <div className="prop-label" style={{ marginTop: 8 }}>
+                <span>Expandir Borda (Anti-Halo)</span>
+                <span>{bucketExpand} px</span>
+              </div>
+              <input
+                type="range"
+                min={0}
+                max={4}
+                value={bucketExpand}
+                onChange={(e) => setBucketExpand(Number(e.target.value))}
+                className="harmony-slider"
+              />
+
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 8 }}>
+                <span style={{ fontSize: 11, color: '#bbb' }}>Pintar Atrás do Traço</span>
+                <input
+                  type="checkbox"
+                  checked={bucketBehind}
+                  onChange={(e) => setBucketBehind(e.target.checked)}
+                />
+              </div>
+            </div>
+          )}
+
           <div className="prop-group">
             <div style={{ fontSize: 11, fontWeight: 600, color: '#eee', marginBottom: 8, textTransform: 'uppercase' }}>
               Active Tool: {activeTool}

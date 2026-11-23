@@ -6,6 +6,9 @@ function getCachedImage(dataUrl: string): HTMLImageElement {
   let img = imageCache.get(dataUrl);
   if (!img) {
     img = new Image();
+    img.onload = () => {
+      window.dispatchEvent(new Event('celsketch:image-loaded'));
+    };
     img.src = dataUrl;
     imageCache.set(dataUrl, img);
   }
@@ -359,58 +362,80 @@ export function renderFrameToCanvas(
 
 /**
  * Fast pixel-accurate Scanline Flood Fill (Paint Bucket)
- * Returns a transparent PNG dataUrl containing only the filled region.
+ * Supports active-layer-only OR all-layers reference, tolerance, and edge expansion (anti-halo).
  */
 export function performFloodFill(
   layers: DrawingLayer[],
+  activeLayerId: string,
+  reference: 'all' | 'active',
   frame: number,
   width: number,
   height: number,
   startX: number,
   startY: number,
   fillHex: string,
-  tolerance = 40
+  tolerance = 32,
+  expandPx = 1
 ): string | null {
   const sx = Math.round(startX);
   const sy = Math.round(startY);
   if (sx < 0 || sy < 0 || sx >= width || sy >= height) return null;
 
+  const targetLayers =
+    reference === 'active'
+      ? layers.filter((l) => l.id === activeLayerId)
+      : layers;
+
   const srcCanvas = document.createElement('canvas');
-  renderFrameToCanvas(srcCanvas, layers, frame, width, height, '#ffffff');
+  srcCanvas.width = width;
+  srcCanvas.height = height;
   const sctx = srcCanvas.getContext('2d', { willReadFrequently: true });
   if (!sctx) return null;
+
+  if (reference === 'all') {
+    renderFrameToCanvas(srcCanvas, targetLayers, frame, width, height, '#ffffff');
+  } else {
+    // Active layer only: transparent background so alpha distinguishes empty vs drawn
+    sctx.clearRect(0, 0, width, height);
+    const active = targetLayers[0];
+    if (active) {
+      const strokes = getEffectiveFrameStrokes(active, frame);
+      for (const st of strokes) {
+        renderStroke(sctx, st);
+      }
+    }
+  }
 
   const srcData = sctx.getImageData(0, 0, width, height).data;
   const startIdx = (sy * width + sx) * 4;
   const sr = srcData[startIdx];
   const sg = srcData[startIdx + 1];
   const sb = srcData[startIdx + 2];
+  const sa = srcData[startIdx + 3];
 
   const clean = fillHex.replace('#', '');
   const fr = parseInt(clean.substring(0, 2) || '00', 16);
   const fg = parseInt(clean.substring(2, 4) || '00', 16);
   const fb = parseInt(clean.substring(4, 6) || '00', 16);
 
-  const outCanvas = document.createElement('canvas');
-  outCanvas.width = width;
-  outCanvas.height = height;
-  const octx = outCanvas.getContext('2d');
-  if (!octx) return null;
-  const outImg = octx.createImageData(width, height);
-  const outData = outImg.data;
-
   const visited = new Uint8Array(width * height);
   const stack: number[] = [sx, sy];
 
   const matches = (idx: number) => {
     const p = idx * 4;
+    if (reference === 'active' && sa < 20) {
+      // Filling transparent region on active layer: stop at any opaque stroke
+      return srcData[p + 3] <= tolerance;
+    }
     return (
       Math.abs(srcData[p] - sr) <= tolerance &&
       Math.abs(srcData[p + 1] - sg) <= tolerance &&
-      Math.abs(srcData[p + 2] - sb) <= tolerance
+      Math.abs(srcData[p + 2] - sb) <= tolerance &&
+      Math.abs(srcData[p + 3] - sa) <= tolerance
     );
   };
 
+  let filledCount = 0;
   while (stack.length > 0) {
     const y = stack.pop()!;
     const x = stack.pop()!;
@@ -430,11 +455,7 @@ export function performFloodFill(
     for (let cx = lx; cx <= rx; cx++) {
       const idx = y * width + cx;
       visited[idx] = 1;
-      const p = idx * 4;
-      outData[p] = fr;
-      outData[p + 1] = fg;
-      outData[p + 2] = fb;
-      outData[p + 3] = 255;
+      filledCount++;
 
       if (y > 0) {
         const upIdx = (y - 1) * width + cx;
@@ -456,6 +477,45 @@ export function performFloodFill(
           spanBelow = false;
         }
       }
+    }
+  }
+
+  if (filledCount === 0) return null;
+
+  // Optional edge expansion (1px-4px) to eliminate anti-aliased white halos around lineart
+  let mask = visited;
+  for (let pass = 0; pass < expandPx; pass++) {
+    const nextMask = new Uint8Array(mask);
+    for (let y = 1; y < height - 1; y++) {
+      const row = y * width;
+      for (let x = 1; x < width - 1; x++) {
+        const i = row + x;
+        if (mask[i]) {
+          nextMask[i - 1] = 1;
+          nextMask[i + 1] = 1;
+          nextMask[i - width] = 1;
+          nextMask[i + width] = 1;
+        }
+      }
+    }
+    mask = nextMask;
+  }
+
+  const outCanvas = document.createElement('canvas');
+  outCanvas.width = width;
+  outCanvas.height = height;
+  const octx = outCanvas.getContext('2d');
+  if (!octx) return null;
+  const outImg = octx.createImageData(width, height);
+  const outData = outImg.data;
+
+  for (let i = 0; i < mask.length; i++) {
+    if (mask[i]) {
+      const p = i * 4;
+      outData[p] = fr;
+      outData[p + 1] = fg;
+      outData[p + 2] = fb;
+      outData[p + 3] = 255;
     }
   }
 

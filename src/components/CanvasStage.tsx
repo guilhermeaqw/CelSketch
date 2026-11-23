@@ -35,6 +35,7 @@ export const CanvasStage: React.FC = () => {
   const [isRotating, setIsRotating] = useState(false);
   const [rotateOrigin, setRotateOrigin] = useState<{ angle: number; baseRot: number }>({ angle: 0, baseRot: 0 });
   const [mousePos, setMousePos] = useState<{ x: number; y: number } | null>(null);
+  const [imageTick, setImageTick] = useState(0);
   const [panStart, setPanStart] = useState<Point>({ x: 0, y: 0 });
   const [draftStroke, setDraftStroke] = useState<Stroke | null>(null);
   const [stabilizerCursor, setStabilizerCursor] = useState<Point | null>(null);
@@ -84,6 +85,10 @@ export const CanvasStage: React.FC = () => {
     brushOpacity,
     brushSmoothing,
     shapeFilled,
+    bucketReference,
+    bucketTolerance,
+    bucketExpand,
+    bucketBehind,
     swatches,
     activeSwatchId,
     currentFrame,
@@ -111,6 +116,13 @@ export const CanvasStage: React.FC = () => {
     replaceStrokes,
     deleteStrokes
   } = useHarmonyStore();
+
+  // Repaint immediately whenever a flood-fill or imported image finishes decoding
+  useEffect(() => {
+    const onImgLoaded = () => setImageTick((t) => t + 1);
+    window.addEventListener('celsketch:image-loaded', onImgLoaded);
+    return () => window.removeEventListener('celsketch:image-loaded', onImgLoaded);
+  }, []);
 
   // Initialize crop rectangle whenever Crop Mode (C) opens
   useEffect(() => {
@@ -785,7 +797,8 @@ export const CanvasStage: React.FC = () => {
     transformSubMode,
     transformOrigStrokes,
     transformOrigBounds,
-    mapStrokesToQuad
+    mapStrokesToQuad,
+    imageTick
   ]);
 
   const getPointFromEvent = useCallback(
@@ -920,31 +933,37 @@ export const CanvasStage: React.FC = () => {
     if (effectiveTool === 'paint') {
       const fillUrl = performFloodFill(
         layers,
+        activeLayerId,
+        bucketReference,
         currentFrame,
         canvasWidth,
         canvasHeight,
         pt.x,
         pt.y,
         activeColor,
-        42
+        bucketTolerance,
+        bucketExpand
       );
       if (fillUrl) {
-        addStroke({
-          id: `st-bucket-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-          tool: 'image',
-          artLayer: activeArtLayer,
-          swatchId: activeSwatch.id,
-          color: activeColor,
-          size: 1,
-          opacity: brushOpacity,
-          smoothing: 0,
-          points: [{ x: 0, y: 0 }],
-          imageDataUrl: fillUrl,
-          imageX: 0,
-          imageY: 0,
-          imageW: canvasWidth,
-          imageH: canvasHeight
-        });
+        addStroke(
+          {
+            id: `st-bucket-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+            tool: 'image',
+            artLayer: activeArtLayer,
+            swatchId: activeSwatch.id,
+            color: activeColor,
+            size: 1,
+            opacity: brushOpacity,
+            smoothing: 0,
+            points: [{ x: 0, y: 0 }],
+            imageDataUrl: fillUrl,
+            imageX: 0,
+            imageY: 0,
+            imageW: canvasWidth,
+            imageH: canvasHeight
+          },
+          bucketBehind
+        );
       }
       return;
     }

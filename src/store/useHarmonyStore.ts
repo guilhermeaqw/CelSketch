@@ -70,6 +70,10 @@ interface HarmonyState {
   brushOpacity: number;
   brushSmoothing: number;
   shapeFilled: boolean;
+  bucketReference: 'all' | 'active';
+  bucketTolerance: number;
+  bucketExpand: number;
+  bucketBehind: boolean;
 
   // View state
   zoom: number;
@@ -113,6 +117,10 @@ interface HarmonyState {
   setBrushOpacity: (opacity: number) => void;
   setBrushSmoothing: (smoothing: number) => void;
   setShapeFilled: (filled: boolean) => void;
+  setBucketReference: (ref: 'all' | 'active') => void;
+  setBucketTolerance: (tol: number) => void;
+  setBucketExpand: (px: number) => void;
+  setBucketBehind: (behind: boolean) => void;
 
   setZoom: (zoom: number) => void;
   setPan: (x: number, y: number) => void;
@@ -163,7 +171,7 @@ interface HarmonyState {
   setLayerOpacity: (id: string, opacity: number) => void;
   updateNodePosition: (id: string, x: number, y: number) => void;
 
-  addStroke: (stroke: Stroke) => void;
+  addStroke: (stroke: Stroke, insertAtBottom?: boolean) => void;
   moveStrokes: (strokeIds: string[], dx: number, dy: number) => void;
   replaceStrokes: (updated: Stroke[]) => void;
   deleteStrokes: (strokeIds: string[]) => void;
@@ -269,6 +277,10 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
   brushOpacity: 1,
   brushSmoothing: 35,
   shapeFilled: false,
+  bucketReference: 'all',
+  bucketTolerance: 32,
+  bucketExpand: 1,
+  bucketBehind: true,
 
   zoom: 0.55,
   panX: 0,
@@ -328,6 +340,10 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
   setBrushOpacity: (brushOpacity) => set({ brushOpacity: Math.max(0.05, Math.min(1, brushOpacity)) }),
   setBrushSmoothing: (brushSmoothing) => set({ brushSmoothing: Math.max(0, Math.min(100, brushSmoothing)) }),
   setShapeFilled: (shapeFilled) => set({ shapeFilled }),
+  setBucketReference: (bucketReference) => set({ bucketReference }),
+  setBucketTolerance: (bucketTolerance) => set({ bucketTolerance: Math.max(0, Math.min(150, bucketTolerance)) }),
+  setBucketExpand: (bucketExpand) => set({ bucketExpand: Math.max(0, Math.min(4, bucketExpand)) }),
+  setBucketBehind: (bucketBehind) => set({ bucketBehind }),
 
   setZoom: (zoom) => set({ zoom: Math.max(0.1, Math.min(8, zoom)) }),
   setPan: (panX, panY) => set({ panX, panY }),
@@ -577,7 +593,7 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
       layers: s.layers.map((l) => (l.id === id ? { ...l, nodeX, nodeY } : l))
     })),
 
-  addStroke: (stroke) =>
+  addStroke: (stroke, insertAtBottom = false) =>
     set((s) => {
       const targetLayer = s.layers.find((l) => l.id === s.activeLayerId);
       if (!targetLayer || targetLayer.locked) return s;
@@ -589,7 +605,7 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
           ...l,
           frames: {
             ...l.frames,
-            [s.currentFrame]: [...existing, stroke]
+            [s.currentFrame]: insertAtBottom ? [stroke, ...existing] : [...existing, stroke]
           }
         };
       });
