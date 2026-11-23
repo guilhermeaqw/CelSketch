@@ -119,6 +119,8 @@ export const CanvasStage: React.FC = () => {
     setZoom,
     setPan,
     setRotation,
+    setActiveColor,
+    pushRecentColor,
     setArtLayer,
     setCropMode,
     resizeCanvas,
@@ -942,8 +944,33 @@ export const CanvasStage: React.FC = () => {
     [screenToCanvas, usePressure]
   );
 
+  const sampleColorAtClient = useCallback(
+    (clientX: number, clientY: number) => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const rect = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      const px = Math.floor((clientX - rect.left) * dpr);
+      const py = Math.floor((clientY - rect.top) * dpr);
+      const ctx = canvas.getContext('2d');
+      if (!ctx || px < 0 || py < 0 || px >= canvas.width || py >= canvas.height) return;
+      const data = ctx.getImageData(px, py, 1, 1).data;
+      const toHex = (n: number) => n.toString(16).padStart(2, '0');
+      const hex = `#${toHex(data[0])}${toHex(data[1])}${toHex(data[2])}`;
+      setActiveColor(hex);
+      pushRecentColor(hex);
+    },
+    [setActiveColor, pushRecentColor]
+  );
+
   const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     e.currentTarget.setPointerCapture(e.pointerId);
+
+    // Hold Alt (when not using Lasso) or Eyedropper tool -> pick color from canvas!
+    if ((e.altKey && activeTool !== 'lasso' && activeTool !== 'zoom') || activeTool === 'eyedropper') {
+      sampleColorAtClient(e.clientX, e.clientY);
+      return;
+    }
 
     if (rHeld) {
       const rect = containerRef.current?.getBoundingClientRect();
@@ -1081,6 +1108,7 @@ export const CanvasStage: React.FC = () => {
 
     // Real Scanline Flood-Fill Paint Bucket (G)
     if (effectiveTool === 'paint') {
+      pushRecentColor(activeColor);
       const fillUrl = performFloodFill(
         layers,
         activeLayerId,
@@ -1404,6 +1432,9 @@ export const CanvasStage: React.FC = () => {
       return;
     }
     if (isDrawing && draftStroke) {
+      if (draftStroke.tool !== 'eraser') {
+        pushRecentColor(draftStroke.color);
+      }
       addStroke(draftStroke);
       setDraftStroke(null);
       setStabilizerCursor(null);

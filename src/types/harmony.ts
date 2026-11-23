@@ -54,6 +54,7 @@ export interface Stroke {
   imageY?: number;
   imageW?: number;
   imageH?: number;
+  hsvFilter?: { h: number; s: number; v: number };
 }
 
 export interface ColourSwatch {

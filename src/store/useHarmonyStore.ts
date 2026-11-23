@@ -97,9 +97,10 @@ interface HarmonyState {
   centerTab: 'camera' | 'drawing' | 'node';
   rightTab: 'properties' | 'colour' | 'brushes';
 
-  // Swatches (Harmony Colour Pots)
+  // Swatches & Recent Colors
   swatches: ColourSwatch[];
   activeSwatchId: string;
+  recentColors: string[];
 
   // Layers
   layers: DrawingLayer[];
@@ -114,6 +115,7 @@ interface HarmonyState {
   setTool: (tool: ToolId) => void;
   selectBrushPreset: (preset: BrushPresetId) => void;
   setActiveColor: (hex: string) => void;
+  pushRecentColor: (hex: string) => void;
   setArtLayer: (artLayer: ArtLayerId) => void;
   setBrushSize: (size: number) => void;
   setBrushMinSize: (minPct: number) => void;
@@ -317,6 +319,7 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
 
   swatches: DEFAULT_SWATCHES,
   activeSwatchId: 'sw-black',
+  recentColors: ['#141414', '#ffffff', '#ef4444', '#3b82f6', '#10b981', '#f59e0b'],
 
   layers: createDefaultLayers(),
   activeLayerId: 'layer-1',
@@ -349,6 +352,12 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
     });
   },
   setActiveColor: (activeColor) => set({ activeColor }),
+  pushRecentColor: (hex) =>
+    set((s) => {
+      const norm = hex.toLowerCase();
+      const filtered = s.recentColors.filter((c) => c.toLowerCase() !== norm);
+      return { recentColors: [hex, ...filtered].slice(0, 18) };
+    }),
   setArtLayer: (activeArtLayer) => set({ activeArtLayer }),
   setBrushSize: (brushSize) => set({ brushSize: Math.max(1, Math.min(200, brushSize)) }),
   setBrushMinSize: (brushMinSize) => set({ brushMinSize: Math.max(0, Math.min(100, brushMinSize)) }),
@@ -431,10 +440,23 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
         for (const [fKey, strokes] of Object.entries(l.frames)) {
           const fNum = Number(fKey);
           if (allFrames || fNum === s.currentFrame) {
-            updatedFrames[fNum] = strokes.map((st) => ({
-              ...st,
-              color: adjustHexHsv(st.color, hDelta, sDelta, vDelta)
-            }));
+            updatedFrames[fNum] = strokes.map((st) => {
+              if (st.tool === 'image') {
+                const prev = st.hsvFilter || { h: 0, s: 0, v: 0 };
+                return {
+                  ...st,
+                  hsvFilter: {
+                    h: (prev.h + hDelta + 360) % 360,
+                    s: Math.max(-100, Math.min(200, prev.s + sDelta)),
+                    v: Math.max(-100, Math.min(200, prev.v + vDelta))
+                  }
+                };
+              }
+              return {
+                ...st,
+                color: adjustHexHsv(st.color, hDelta, sDelta, vDelta)
+              };
+            });
           } else {
             updatedFrames[fNum] = strokes;
           }

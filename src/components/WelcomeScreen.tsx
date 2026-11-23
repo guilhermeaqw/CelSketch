@@ -13,6 +13,15 @@ import {
 import { useHarmonyStore } from '../store/useHarmonyStore';
 
 const RECENT_KEY = 'celsketch_recent_projects';
+const THUMBS_KEY = 'celsketch_recent_thumbs';
+
+function loadRecentThumbs(): Record<string, string> {
+  try {
+    return JSON.parse(localStorage.getItem(THUMBS_KEY) || '{}');
+  } catch {
+    return {};
+  }
+}
 
 function loadRecentPaths(): string[] {
   try {
@@ -44,6 +53,7 @@ const PRESETS = [
 export const WelcomeScreen: React.FC = () => {
   const { createNewScene, loadProjectData, setShowWelcome } = useHarmonyStore();
   const [recentProjects, setRecentProjects] = useState<string[]>(() => loadRecentPaths());
+  const [recentThumbs] = useState<Record<string, string>>(() => loadRecentThumbs());
   const [showNewModal, setShowNewModal] = useState(false);
   const [showShortcuts, setShowShortcuts] = useState(false);
   const [sceneName, setSceneName] = useState('Cena_01');
@@ -332,10 +342,19 @@ export const WelcomeScreen: React.FC = () => {
                           display: 'flex',
                           alignItems: 'center',
                           justifyContent: 'center',
-                          color: '#aaa'
+                          color: '#aaa',
+                          overflow: 'hidden'
                         }}
                       >
-                        <FileImage size={38} strokeWidth={1.3} />
+                        {recentThumbs[fp] ? (
+                          <img
+                            src={recentThumbs[fp]}
+                            alt={fileName}
+                            style={{ width: '100%', height: '100%', objectFit: 'contain', background: '#fff' }}
+                          />
+                        ) : (
+                          <FileImage size={38} strokeWidth={1.3} />
+                        )}
                       </div>
                       <span
                         style={{

@@ -17,8 +17,30 @@ import {
 } from 'lucide-react';
 import { useHarmonyStore } from '../store/useHarmonyStore';
 import { parseExternalArtwork } from '../utils/importer';
+import { renderFrameToCanvas } from '../utils/canvasRenderer';
 
 const RECENT_KEY = 'celsketch_recent_projects';
+const THUMBS_KEY = 'celsketch_recent_thumbs';
+
+function saveProjectThumbnail(filePath: string) {
+  try {
+    const s = useHarmonyStore.getState();
+    const src = document.createElement('canvas');
+    renderFrameToCanvas(src, s.layers, 1, s.canvasWidth, s.canvasHeight, '#ffffff');
+    const thumb = document.createElement('canvas');
+    thumb.width = 240;
+    thumb.height = Math.round((240 * s.canvasHeight) / s.canvasWidth) || 135;
+    const tctx = thumb.getContext('2d');
+    if (!tctx) return;
+    tctx.drawImage(src, 0, 0, thumb.width, thumb.height);
+    const dataUrl = thumb.toDataURL('image/jpeg', 0.78);
+    const map = JSON.parse(localStorage.getItem(THUMBS_KEY) || '{}');
+    map[filePath] = dataUrl;
+    localStorage.setItem(THUMBS_KEY, JSON.stringify(map));
+  } catch {
+    // ignore storage quota errors
+  }
+}
 
 function loadRecentPaths(): string[] {
   try {
@@ -99,6 +121,13 @@ export const TitleBar: React.FC = () => {
     return () => window.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
+  const handleNewScene = () => {
+    setOpenMenu(null);
+    if (window.confirm('Deseja realmente criar uma nova cena? Alterações não salvas na cena atual serão perdidas.')) {
+      newProject();
+    }
+  };
+
   const handleSave = async () => {
     setOpenMenu(null);
     const data = JSON.stringify(exportProjectData(), null, 2);
@@ -108,6 +137,7 @@ export const TitleBar: React.FC = () => {
         const name = res.filePath.split(/[\\/]/).pop()?.replace(/\.(celsketch|nexo|hrm)$/i, '') || projectName;
         setProjectMeta(name, res.filePath);
         setRecentProjects(saveRecentPath(res.filePath));
+        saveProjectThumbnail(res.filePath);
       }
     }
   };
@@ -121,6 +151,7 @@ export const TitleBar: React.FC = () => {
         const name = res.filePath.split(/[\\/]/).pop()?.replace(/\.(celsketch|nexo|hrm)$/i, '') || projectName;
         setProjectMeta(name, res.filePath);
         setRecentProjects(saveRecentPath(res.filePath));
+        saveProjectThumbnail(res.filePath);
       }
     }
   };
@@ -209,7 +240,7 @@ export const TitleBar: React.FC = () => {
                   <span>Tela Inicial (Home)</span>
                 </button>
                 <div className="dropdown-sep" />
-                <button className="dropdown-item" onClick={() => { newProject(); setOpenMenu(null); }}>
+                <button className="dropdown-item" onClick={handleNewScene}>
                   <span>New Scene</span><span style={{ color: '#888' }}>Ctrl+N</span>
                 </button>
                 <button className="dropdown-item" onClick={handleOpen}>
@@ -358,7 +389,7 @@ export const TitleBar: React.FC = () => {
 
       {/* Top Quick Toolbar */}
       <div className="top-toolbar">
-        <button className="icon-btn" onClick={newProject} title="New Scene">
+        <button className="icon-btn" onClick={handleNewScene} title="New Scene">
           <FilePlus size={14} />
         </button>
         <button className="icon-btn" onClick={handleOpen} title="Open Project">

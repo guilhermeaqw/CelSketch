@@ -86,10 +86,10 @@ export const RightPanel: React.FC = () => {
     bucketBehind,
     onionPrev,
     onionNext,
-    swatches,
-    activeSwatchId,
+    recentColors,
     selectBrushPreset,
     setActiveColor,
+    pushRecentColor,
     setBrushSize,
     setBrushMinSize,
     setUsePressure,
@@ -100,14 +100,8 @@ export const RightPanel: React.FC = () => {
     setBucketTolerance,
     setBucketExpand,
     setBucketBehind,
-    setOnionRange,
-    setActiveSwatch,
-    addSwatch
+    setOnionRange
   } = useHarmonyStore();
-
-  const handleAddSwatch = () => {
-    addSwatch(`Colour_${swatches.length + 1}`, activeColor);
-  };
 
   return (
     <div className="right-pane">
@@ -141,27 +135,31 @@ export const RightPanel: React.FC = () => {
             onChange={(newHex) => setActiveColor(newHex)}
           />
 
-          {/* Compact Quick Swatches Bar */}
+          {/* Cores Recentes */}
           <div className="prop-group" style={{ borderTop: '1px solid #383838', borderBottom: 'none' }}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
-              <span style={{ fontSize: 10.5, color: '#999' }}>Quick Swatches</span>
-              <button className="icon-btn" onClick={handleAddSwatch} title="Save Current Colour">
+              <span style={{ fontSize: 10.5, color: '#999' }}>Cores Recentes</span>
+              <button
+                className="icon-btn"
+                onClick={() => pushRecentColor(activeColor)}
+                title="Adicionar cor atual às recentes"
+              >
                 <Plus size={12} />
               </button>
             </div>
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
-              {swatches.map((sw) => {
-                const selected = sw.id === activeSwatchId;
+              {recentColors.map((hex, idx) => {
+                const selected = hex.toLowerCase() === activeColor.toLowerCase();
                 return (
                   <button
-                    key={sw.id}
-                    onClick={() => setActiveSwatch(sw.id)}
-                    title={`${sw.name} (${sw.hex})`}
+                    key={`${hex}-${idx}`}
+                    onClick={() => setActiveColor(hex)}
+                    title={hex.toUpperCase()}
                     style={{
                       width: 24,
                       height: 24,
                       borderRadius: 3,
-                      background: sw.hex,
+                      background: hex,
                       border: selected ? '2px solid #ffffff' : '1px solid #555',
                       cursor: 'pointer',
                       boxShadow: selected ? '0 0 0 1px #3a86ff' : 'none'

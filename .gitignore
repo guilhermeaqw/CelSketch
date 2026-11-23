@@ -6,6 +6,7 @@ release-nexo2d/
 release-celsketch/
 release-celsketch-v1.1/
 release-celsketch-v1.2/
+release-celsketch-v1.3/
 *.log
 .DS_Store
 Thumbs.db

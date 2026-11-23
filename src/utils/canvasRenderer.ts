@@ -294,6 +294,11 @@ export function renderStroke(
   } else if (stroke.tool === 'image' && stroke.imageDataUrl) {
     const img = getCachedImage(stroke.imageDataUrl);
     if (img.complete && img.naturalWidth > 0) {
+      if (stroke.hsvFilter) {
+        const satPct = Math.max(0, 100 + stroke.hsvFilter.s);
+        const briPct = Math.max(0, 100 + stroke.hsvFilter.v);
+        ctx.filter = `hue-rotate(${stroke.hsvFilter.h}deg) saturate(${satPct}%) brightness(${briPct}%)`;
+      }
       ctx.drawImage(
         img,
         stroke.imageX ?? 0,
