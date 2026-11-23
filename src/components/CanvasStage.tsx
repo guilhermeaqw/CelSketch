@@ -393,49 +393,47 @@ export const CanvasStage: React.FC = () => {
     layerBuffer.height = canvasHeight;
     const lctx = layerBuffer.getContext('2d');
 
-    // Onion Skinning (Active Layer previous = red, next = green)
-    if (onionSkin && lctx) {
-      const activeLayer = layers.find((l) => l.id === activeLayerId);
-      if (activeLayer && activeLayer.visible) {
-        // Previous frames (reddish tint)
-        for (let offset = onionPrev; offset >= 1; offset--) {
-          const f = currentFrame - offset;
-          if (f < 1) continue;
-          const strokes = activeLayer.frames[f];
-          if (!strokes || strokes.length === 0) continue;
-          lctx.clearRect(0, 0, canvasWidth, canvasHeight);
-          for (const st of strokes) {
-            renderStroke(lctx, st, '#e04848', 1);
-          }
-          ctx.save();
-          ctx.globalAlpha = 0.28 / offset;
-          ctx.drawImage(layerBuffer, 0, 0);
-          ctx.restore();
-        }
-        // Next frames (greenish tint)
-        for (let offset = 1; offset <= onionNext; offset++) {
-          const f = currentFrame + offset;
-          const strokes = activeLayer.frames[f];
-          if (!strokes || strokes.length === 0) continue;
-          lctx.clearRect(0, 0, canvasWidth, canvasHeight);
-          for (const st of strokes) {
-            renderStroke(lctx, st, '#32b85c', 1);
-          }
-          ctx.save();
-          ctx.globalAlpha = 0.28 / offset;
-          ctx.drawImage(layerBuffer, 0, 0);
-          ctx.restore();
-        }
-      }
-    }
-
-    // Render all visible layers bottom-to-top
+    // Render all visible layers bottom-to-top, drawing Onion Skin right beneath the active layer
+    // (so Background / lower layers NEVER cover up the Onion Skin!)
     if (lctx) {
       const ordered = [...layers].reverse();
       for (const layer of ordered) {
+        const isCurrent = layer.id === activeLayerId;
+
+        if (isCurrent && onionSkin && layer.visible) {
+          // Previous frames (reddish tint)
+          for (let offset = onionPrev; offset >= 1; offset--) {
+            const f = currentFrame - offset;
+            if (f < 1) continue;
+            const prevStrokes = layer.frames[f];
+            if (!prevStrokes || prevStrokes.length === 0) continue;
+            lctx.clearRect(0, 0, canvasWidth, canvasHeight);
+            for (const st of prevStrokes) {
+              renderStroke(lctx, st, '#e04848', 1);
+            }
+            ctx.save();
+            ctx.globalAlpha = 0.38 / offset;
+            ctx.drawImage(layerBuffer, 0, 0);
+            ctx.restore();
+          }
+          // Next frames (greenish tint)
+          for (let offset = 1; offset <= onionNext; offset++) {
+            const f = currentFrame + offset;
+            const nextStrokes = layer.frames[f];
+            if (!nextStrokes || nextStrokes.length === 0) continue;
+            lctx.clearRect(0, 0, canvasWidth, canvasHeight);
+            for (const st of nextStrokes) {
+              renderStroke(lctx, st, '#32b85c', 1);
+            }
+            ctx.save();
+            ctx.globalAlpha = 0.38 / offset;
+            ctx.drawImage(layerBuffer, 0, 0);
+            ctx.restore();
+          }
+        }
+
         if (!layer.visible) continue;
         const strokes = getEffectiveFrameStrokes(layer, currentFrame);
-        const isCurrent = layer.id === activeLayerId;
 
         if (strokes.length === 0 && !(isCurrent && draftStroke)) continue;
 
