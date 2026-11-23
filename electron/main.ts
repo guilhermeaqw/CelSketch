@@ -134,6 +134,20 @@ ipcMain.handle('file:importExternal', async () => {
   return { canceled: false, filePath, ext, bytes: new Uint8Array(bytes) };
 });
 
+// Import audio file (.mp3, .wav, .ogg) for Timeline lip-sync
+ipcMain.handle('file:importAudio', async () => {
+  const result = await dialog.showOpenDialog(mainWindow!, {
+    title: 'Import Audio Track (.mp3, .wav, .ogg)',
+    filters: [{ name: 'Audio Files', extensions: ['mp3', 'wav', 'ogg', 'm4a'] }],
+    properties: ['openFile']
+  });
+  if (result.canceled || result.filePaths.length === 0) return { canceled: true };
+  const filePath = result.filePaths[0];
+  const name = path.basename(filePath);
+  const bytes = fs.readFileSync(filePath);
+  return { canceled: false, filePath, name, bytes: new Uint8Array(bytes) };
+});
+
 // Export Single PNG
 ipcMain.handle('file:exportPng', async (_event, { dataUrl, defaultName }: { dataUrl: string; defaultName: string }) => {
   const result = await dialog.showSaveDialog(mainWindow!, {

@@ -14,6 +14,7 @@ contextBridge.exposeInMainWorld('harmonyAPI', {
   openProject: () => ipcRenderer.invoke('file:openProject'),
   openProjectByPath: (filePath: string) => ipcRenderer.invoke('file:openProjectByPath', { filePath }),
   importExternal: () => ipcRenderer.invoke('file:importExternal'),
+  importAudio: () => ipcRenderer.invoke('file:importAudio'),
   exportPng: (dataUrl: string, defaultName: string) =>
     ipcRenderer.invoke('file:exportPng', { dataUrl, defaultName }),
   pickDirectory: () => ipcRenderer.invoke('file:pickDirectory'),

@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import {
   Play,
   Pause,
@@ -6,12 +6,16 @@ import {
   SkipForward,
   Repeat,
   Plus,
+  FolderPlus,
+  Copy,
+  Layers,
   Trash2,
   Eye,
   EyeOff,
   Lock,
   Unlock,
   Pin,
+  Volume2,
   CopyPlus,
   Eraser
 } from 'lucide-react';
@@ -20,10 +24,15 @@ import { getEffectiveFrameStrokes } from '../utils/canvasRenderer';
 
 export const TimelinePanel: React.FC = () => {
   const [dragLayerIdx, setDragLayerIdx] = useState<number | null>(null);
+  const [editingLayerId, setEditingLayerId] = useState<string | null>(null);
+  const [editingName, setEditingName] = useState('');
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+
   const {
     layers,
     activeLayerId,
     selectedLayerIds,
+    audioTrack,
     currentFrame,
     totalFrames,
     playStart,
@@ -41,19 +50,36 @@ export const TimelinePanel: React.FC = () => {
     setIsPlaying,
     toggleLoop,
     addLayer,
+    addFolderLayer,
+    duplicateLayer,
+    mergeLayerDown,
     deleteLayer,
     setActiveLayer,
     toggleSelectLayer,
     reorderLayer,
+    renameLayer,
     setLayerBlendMode,
     toggleLayerVisibility,
     toggleLayerLock,
     toggleLayerHold,
     setSelectedLayersOpacity,
+    setAudioTrack,
     duplicateFrameToNext,
     insertFrameAfterCurrent,
     clearCurrentFrame
   } = useHarmonyStore();
+
+  // Sync Audio Track with Timeline Play / Pause
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio || !audioTrack) return;
+    if (isPlaying) {
+      audio.currentTime = Math.max(0, (currentFrame - 1) / fps);
+      audio.play().catch(() => {});
+    } else {
+      audio.pause();
+    }
+  }, [isPlaying, audioTrack, fps]);
 
   const activeLayer = layers.find((l) => l.id === activeLayerId);
 
@@ -92,7 +118,15 @@ export const TimelinePanel: React.FC = () => {
           <span style={{ fontSize: 11, fontWeight: 600, color: '#ccc', marginRight: 6 }}>Timeline</span>
           <button className="icon-btn" onClick={() => addLayer()} title="Add Drawing Layer">
             <Plus size={13} />
-            <span>Add Layer</span>
+          </button>
+          <button className="icon-btn" onClick={() => addFolderLayer()} title="Add Layer Folder">
+            <FolderPlus size={13} />
+          </button>
+          <button className="icon-btn" onClick={() => duplicateLayer(activeLayerId)} title="Duplicate Layer">
+            <Copy size={13} />
+          </button>
+          <button className="icon-btn" onClick={() => mergeLayerDown(activeLayerId)} title="Merge Layer Down">
+            <Layers size={13} />
           </button>
           <button
             className="icon-btn"
@@ -105,10 +139,10 @@ export const TimelinePanel: React.FC = () => {
           <button
             className="icon-btn"
             onClick={insertFrameAfterCurrent}
-            title="Inserir frame em branco à frente (empurra os seguintes para fazer In-Between)"
+            title="Inserir novo frame à frente (empurra os seguintes)"
           >
             <Plus size={13} />
-            <span>+ In-Between</span>
+            <span>+ Frame</span>
           </button>
           <button className="icon-btn" onClick={duplicateFrameToNext} title="Duplicate Frame to Next (F6)">
             <CopyPlus size={13} />
@@ -340,18 +374,47 @@ export const TimelinePanel: React.FC = () => {
                     flexShrink: 0
                   }}
                 />
-                <span
-                  style={{
-                    fontSize: 11.5,
-                    color: isActive ? '#fff' : '#ccc',
-                    overflow: 'hidden',
-                    textOverflow: 'ellipsis',
-                    whiteSpace: 'nowrap',
-                    flex: 1
-                  }}
-                >
-                  {layer.name}
-                </span>
+                {editingLayerId === layer.id ? (
+                  <input
+                    autoFocus
+                    className="harmony-input"
+                    value={editingName}
+                    onClick={(e) => e.stopPropagation()}
+                    onChange={(e) => setEditingName(e.target.value)}
+                    onBlur={() => {
+                      if (editingName.trim()) renameLayer(layer.id, editingName.trim());
+                      setEditingLayerId(null);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        if (editingName.trim()) renameLayer(layer.id, editingName.trim());
+                        setEditingLayerId(null);
+                      } else if (e.key === 'Escape') {
+                        setEditingLayerId(null);
+                      }
+                    }}
+                    style={{ flex: 1, height: 20, fontSize: 11 }}
+                  />
+                ) : (
+                  <span
+                    onDoubleClick={(e) => {
+                      e.stopPropagation();
+                      setEditingLayerId(layer.id);
+                      setEditingName(layer.name);
+                    }}
+                    title="Duplo-clique para renomear"
+                    style={{
+                      fontSize: 11.5,
+                      color: isActive ? '#fff' : '#ccc',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                      flex: 1
+                    }}
+                  >
+                    {layer.type === 'folder' ? `📁 ${layer.name}` : layer.name}
+                  </span>
+                )}
               </div>
             );
           })}
@@ -413,7 +476,8 @@ export const TimelinePanel: React.FC = () => {
             >
               {framesArray.map((f) => {
                 const hasDirectDrawing = (layer.frames[f]?.length || 0) > 0;
-                const hasHeldDrawing = !hasDirectDrawing && getEffectiveFrameStrokes(layer, f).length > 0;
+                const isExplicitBlank = !hasDirectDrawing && layer.frames[f] !== undefined;
+                const hasHeldDrawing = !hasDirectDrawing && !isExplicitBlank && getEffectiveFrameStrokes(layer, f).length > 0;
                 const isCurr = f === currentFrame;
                 return (
                   <div
@@ -426,10 +490,13 @@ export const TimelinePanel: React.FC = () => {
                       width: 22,
                       height: 26,
                       borderRight: '1px solid #2c2c2c',
+                      position: 'relative',
                       background: isCurr
                         ? 'rgba(229, 57, 53, 0.22)'
                         : hasDirectDrawing
                         ? '#3e4d63'
+                        : isExplicitBlank
+                        ? '#303845'
                         : hasHeldDrawing
                         ? 'rgba(16, 185, 129, 0.18)'
                         : 'transparent',
@@ -439,6 +506,16 @@ export const TimelinePanel: React.FC = () => {
                       cursor: 'pointer'
                     }}
                   >
+                    {isExplicitBlank && (
+                      <div
+                        style={{
+                          width: 6,
+                          height: 6,
+                          borderRadius: '50%',
+                          border: '1.5px solid #93c5fd'
+                        }}
+                      />
+                    )}
                     {hasDirectDrawing && (
                       <div
                         style={{
@@ -446,6 +523,18 @@ export const TimelinePanel: React.FC = () => {
                           height: 7,
                           borderRadius: '50%',
                           background: '#93c5fd'
+                        }}
+                      />
+                    )}
+                    {layer.keyframes?.[f] && (
+                      <div
+                        title="Motion Keyframe"
+                        style={{
+                          width: 7,
+                          height: 7,
+                          background: '#f59e0b',
+                          transform: 'rotate(45deg)',
+                          position: 'absolute'
                         }}
                       />
                     )}
@@ -465,6 +554,50 @@ export const TimelinePanel: React.FC = () => {
           ))}
         </div>
       </div>
+
+      {/* Audio Track & Waveform Bar (when an audio file is imported) */}
+      {audioTrack && (
+        <div
+          style={{
+            height: 36,
+            background: '#1c242b',
+            borderTop: '1px solid #2e4052',
+            display: 'flex',
+            alignItems: 'center',
+            padding: '0 8px',
+            gap: 10
+          }}
+        >
+          <audio ref={audioRef} src={audioTrack.objectUrl} />
+          <div style={{ width: 204, display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: '#93c5fd' }}>
+            <Volume2 size={13} />
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
+              {audioTrack.name}
+            </span>
+            <button
+              className="icon-btn"
+              onClick={() => setAudioTrack(null)}
+              title="Remover Áudio"
+              style={{ height: 18, minWidth: 18 }}
+            >
+              ×
+            </button>
+          </div>
+          <div style={{ flex: 1, height: 26, display: 'flex', alignItems: 'center', gap: 1, overflow: 'hidden' }}>
+            {audioTrack.peaks.map((pk, idx) => (
+              <div
+                key={idx}
+                style={{
+                  flex: 1,
+                  height: `${Math.max(8, Math.round(pk * 100))}%`,
+                  background: '#38bdf8',
+                  borderRadius: 1
+                }}
+              />
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 };

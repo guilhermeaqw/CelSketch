@@ -1,5 +1,15 @@
 import { create } from 'zustand';
-import { ArtLayerId, BrushPresetId, ColourSwatch, DrawingLayer, HarmonyProjectData, Stroke, ToolId } from '../types/harmony';
+import {
+  ArtLayerId,
+  BrushPresetId,
+  ColourSwatch,
+  DrawingLayer,
+  HarmonyProjectData,
+  LayerEffects,
+  LayerTransformKeyframe,
+  Stroke,
+  ToolId
+} from '../types/harmony';
 
 function adjustHexHsv(hex: string, hDelta: number, sDelta: number, vDelta: number): string {
   const clean = hex.replace('#', '');
@@ -68,6 +78,10 @@ interface HarmonyState {
   // Project info
   projectName: string;
   projectPath: string | null;
+  isDirty: boolean;
+  symmetryMode: 'none' | 'vertical';
+  clipboardStrokes: Stroke[];
+  audioTrack: { name: string; objectUrl: string; peaks: number[]; duration: number } | null;
   autoSaveEnabled: boolean;
   autoSaveIntervalSec: number;
   lastAutoSaveTime: string | null;
@@ -200,6 +214,9 @@ interface HarmonyState {
 
   // Layers & Drawing
   addLayer: (name?: string) => void;
+  addFolderLayer: (name?: string) => void;
+  duplicateLayer: (id: string) => void;
+  mergeLayerDown: (id: string) => void;
   importImageLayer: (name: string, dataUrl: string, x: number, y: number, w: number, h: number, opacity?: number) => void;
   deleteLayer: (id: string) => void;
   setActiveLayer: (id: string) => void;
@@ -209,10 +226,22 @@ interface HarmonyState {
   toggleLayerVisibility: (id: string) => void;
   toggleLayerLock: (id: string) => void;
   toggleLayerHold: (id: string) => void;
+  toggleLayerAlphaLock: (id: string) => void;
+  toggleLayerClippingMask: (id: string) => void;
+  setLayerEffects: (id: string, effects: Partial<LayerEffects>) => void;
+  setLayerKeyframe: (id: string, frame: number, kf: Partial<LayerTransformKeyframe>) => void;
+  deleteLayerKeyframe: (id: string, frame: number) => void;
   renameLayer: (id: string, name: string) => void;
   setLayerOpacity: (id: string, opacity: number) => void;
   setSelectedLayersOpacity: (opacity: number) => void;
   updateNodePosition: (id: string, x: number, y: number) => void;
+
+  toggleSymmetry: () => void;
+  copyCurrentFrame: () => void;
+  pasteToCurrentFrame: () => void;
+  extendExposureF5: () => void;
+  reduceExposureShiftF5: () => void;
+  setAudioTrack: (track: { name: string; objectUrl: string; peaks: number[]; duration: number } | null) => void;
 
   addStroke: (stroke: Stroke, insertAtBottom?: boolean) => void;
   moveStrokes: (strokeIds: string[], dx: number, dy: number) => void;
@@ -304,6 +333,10 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
 
   projectName: 'Untitled_Scene',
   projectPath: null,
+  isDirty: false,
+  symmetryMode: 'none',
+  clipboardStrokes: [],
+  audioTrack: null,
   autoSaveEnabled: true,
   autoSaveIntervalSec: 60,
   lastAutoSaveTime: null,
@@ -346,9 +379,9 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
   hsvPreview: null,
   exportModalOpen: false,
   cropMode: false,
-  showGrid: true,
+  showGrid: false,
   perspectiveMode: 0,
-  showCameraFrame: true,
+  showCameraFrame: false,
   lightTable: false,
   onionSkin: true,
   onionPrev: 2,
@@ -758,7 +791,81 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
         undoStack: [...s.undoStack.slice(-39), { layers: cloneLayers(s.layers) }],
         redoStack: [],
         layers: [newLayer, ...s.layers],
-        activeLayerId: newLayer.id
+        activeLayerId: newLayer.id,
+        selectedLayerIds: [newLayer.id],
+        isDirty: true
+      };
+    }),
+
+  addFolderLayer: (name) =>
+    set((s) => {
+      const folder: DrawingLayer = {
+        id: `folder-${Date.now()}`,
+        name: name || `Folder_${s.layers.length + 1}`,
+        type: 'folder',
+        visible: true,
+        locked: false,
+        solo: false,
+        collapsed: false,
+        opacity: 1,
+        tagColor: '#eab308',
+        frames: {},
+        nodeX: 120,
+        nodeY: 80
+      };
+      return {
+        undoStack: [...s.undoStack.slice(-39), { layers: cloneLayers(s.layers) }],
+        redoStack: [],
+        layers: [folder, ...s.layers],
+        activeLayerId: folder.id,
+        selectedLayerIds: [folder.id],
+        isDirty: true
+      };
+    }),
+
+  duplicateLayer: (id) =>
+    set((s) => {
+      const idx = s.layers.findIndex((l) => l.id === id);
+      if (idx === -1) return s;
+      const orig = s.layers[idx];
+      const copy: DrawingLayer = {
+        ...JSON.parse(JSON.stringify(orig)),
+        id: `layer-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+        name: `${orig.name}_Copy`
+      };
+      const next = [...s.layers];
+      next.splice(idx, 0, copy);
+      return {
+        undoStack: [...s.undoStack.slice(-39), { layers: cloneLayers(s.layers) }],
+        redoStack: [],
+        layers: next,
+        activeLayerId: copy.id,
+        selectedLayerIds: [copy.id],
+        isDirty: true
+      };
+    }),
+
+  mergeLayerDown: (id) =>
+    set((s) => {
+      const idx = s.layers.findIndex((l) => l.id === id);
+      if (idx === -1 || idx >= s.layers.length - 1) return s;
+      const top = s.layers[idx];
+      const bottom = s.layers[idx + 1];
+      const mergedFrames: Record<number, Stroke[]> = JSON.parse(JSON.stringify(bottom.frames));
+      for (const [fKey, strokes] of Object.entries(top.frames)) {
+        const f = Number(fKey);
+        mergedFrames[f] = [...(mergedFrames[f] || []), ...JSON.parse(JSON.stringify(strokes))];
+      }
+      const next = s.layers
+        .map((l, i) => (i === idx + 1 ? { ...l, frames: mergedFrames } : l))
+        .filter((_, i) => i !== idx);
+      return {
+        undoStack: [...s.undoStack.slice(-39), { layers: cloneLayers(s.layers) }],
+        redoStack: [],
+        layers: next,
+        activeLayerId: bottom.id,
+        selectedLayerIds: [bottom.id],
+        isDirty: true
       };
     }),
 
@@ -800,7 +907,9 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
         undoStack: [...s.undoStack.slice(-39), { layers: cloneLayers(s.layers) }],
         redoStack: [],
         layers: [newLayer, ...s.layers],
-        activeLayerId: newLayer.id
+        activeLayerId: newLayer.id,
+        selectedLayerIds: [newLayer.id],
+        isDirty: true
       };
     }),
 
@@ -854,8 +963,119 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
     })),
   toggleLayerHold: (id) =>
     set((s) => ({
-      layers: s.layers.map((l) => (l.id === id ? { ...l, holdFrames: !l.holdFrames } : l))
+      layers: s.layers.map((l) => (l.id === id ? { ...l, holdFrames: !l.holdFrames } : l)),
+      isDirty: true
     })),
+  toggleLayerAlphaLock: (id) =>
+    set((s) => ({
+      layers: s.layers.map((l) => (l.id === id ? { ...l, alphaLock: !l.alphaLock } : l)),
+      isDirty: true
+    })),
+  toggleLayerClippingMask: (id) =>
+    set((s) => ({
+      layers: s.layers.map((l) => (l.id === id ? { ...l, clippingMask: !l.clippingMask } : l)),
+      isDirty: true
+    })),
+  setLayerEffects: (id, effects) =>
+    set((s) => ({
+      layers: s.layers.map((l) =>
+        l.id === id
+          ? {
+              ...l,
+              effects: {
+                blur: l.effects?.blur ?? 0,
+                glow: l.effects?.glow ?? 0,
+                glowColor: l.effects?.glowColor ?? '#38bdf8',
+                dropShadow: l.effects?.dropShadow ?? false,
+                ...effects
+              }
+            }
+          : l
+      ),
+      isDirty: true
+    })),
+  setLayerKeyframe: (id, frame, kf) =>
+    set((s) => ({
+      layers: s.layers.map((l) => {
+        if (l.id !== id) return l;
+        const prev = l.keyframes?.[frame] || { x: 0, y: 0, scale: 1, rotation: 0, opacity: l.opacity };
+        return {
+          ...l,
+          keyframes: {
+            ...(l.keyframes || {}),
+            [frame]: { ...prev, ...kf }
+          }
+        };
+      }),
+      isDirty: true
+    })),
+  deleteLayerKeyframe: (id, frame) =>
+    set((s) => ({
+      layers: s.layers.map((l) => {
+        if (l.id !== id || !l.keyframes) return l;
+        const copy = { ...l.keyframes };
+        delete copy[frame];
+        return { ...l, keyframes: copy };
+      }),
+      isDirty: true
+    })),
+  toggleSymmetry: () =>
+    set((s) => ({ symmetryMode: s.symmetryMode === 'none' ? 'vertical' : 'none' })),
+  copyCurrentFrame: () =>
+    set((s) => {
+      const layer = s.layers.find((l) => l.id === s.activeLayerId);
+      const strokes = layer?.frames[s.currentFrame] || [];
+      return { clipboardStrokes: JSON.parse(JSON.stringify(strokes)) };
+    }),
+  pasteToCurrentFrame: () =>
+    set((s) => {
+      if (s.clipboardStrokes.length === 0) return s;
+      const snapshot = { layers: cloneLayers(s.layers) };
+      const pasted = s.clipboardStrokes.map((st) => ({
+        ...JSON.parse(JSON.stringify(st)),
+        id: `st-paste-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
+      }));
+      const layers = s.layers.map((l) => {
+        if (l.id !== s.activeLayerId) return l;
+        const existing = l.frames[s.currentFrame] || [];
+        return {
+          ...l,
+          frames: { ...l.frames, [s.currentFrame]: [...existing, ...pasted] }
+        };
+      });
+      return {
+        undoStack: [...s.undoStack.slice(-39), snapshot],
+        redoStack: [],
+        layers,
+        isDirty: true
+      };
+    }),
+  extendExposureF5: () => {
+    // Same as inserting a held/blank exposure shift right after current frame
+    get().insertFrameAfterCurrent();
+  },
+  reduceExposureShiftF5: () =>
+    set((s) => {
+      const removeAt = s.currentFrame;
+      const snapshot = { layers: cloneLayers(s.layers) };
+      const layers = s.layers.map((l) => {
+        if (l.id !== s.activeLayerId) return l;
+        const shifted: Record<number, Stroke[]> = {};
+        for (const [fKey, strokes] of Object.entries(l.frames)) {
+          const fNum = Number(fKey);
+          if (fNum < removeAt) shifted[fNum] = strokes;
+          else if (fNum > removeAt) shifted[fNum - 1] = strokes;
+        }
+        return { ...l, frames: shifted };
+      });
+      return {
+        undoStack: [...s.undoStack.slice(-39), snapshot],
+        redoStack: [],
+        layers,
+        isDirty: true
+      };
+    }),
+  setAudioTrack: (audioTrack) => set({ audioTrack }),
   renameLayer: (id, name) =>
     set((s) => ({
       layers: s.layers.map((l) => (l.id === id ? { ...l, name } : l))
@@ -895,7 +1115,8 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
       return {
         undoStack: [...s.undoStack.slice(-39), snapshot],
         redoStack: [],
-        layers
+        layers,
+        isDirty: true
       };
     }),
 
@@ -943,7 +1164,8 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
       return {
         undoStack: [...s.undoStack.slice(-39), snapshot],
         redoStack: [],
-        layers
+        layers,
+        isDirty: true
       };
     }),
 
@@ -966,7 +1188,8 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
       return {
         undoStack: [...s.undoStack.slice(-39), snapshot],
         redoStack: [],
-        layers
+        layers,
+        isDirty: true
       };
     }),
 
@@ -1022,7 +1245,8 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
       return {
         undoStack: [...s.undoStack.slice(-39), snapshot],
         redoStack: [],
-        layers
+        layers,
+        isDirty: true
       };
     }),
 
@@ -1075,6 +1299,7 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
     set((s) => ({
       projectName,
       projectPath,
+      isDirty: false,
       openScenes: s.openScenes.map((sc) =>
         sc.id === s.activeSceneId ? { ...sc, name: projectName, path: projectPath } : sc
       )

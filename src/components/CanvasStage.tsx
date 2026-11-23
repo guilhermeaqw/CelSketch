@@ -1,7 +1,13 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
 import { useHarmonyStore } from '../store/useHarmonyStore';
 import { ArtLayerId, Point, Stroke } from '../types/harmony';
-import { renderStroke, getEffectiveFrameStrokes, performFloodFill, renderFrameToCanvas } from '../utils/canvasRenderer';
+import {
+  renderStroke,
+  getEffectiveFrameStrokes,
+  getInterpolatedLayerTransform,
+  performFloodFill,
+  renderFrameToCanvas
+} from '../utils/canvasRenderer';
 
 const ART_LAYERS: { id: ArtLayerId; label: string }[] = [
   { id: 'OL', label: 'Overlay Art' },
@@ -113,6 +119,7 @@ export const CanvasStage: React.FC = () => {
     cropMode,
     showGrid,
     perspectiveMode,
+    symmetryMode,
     showCameraFrame,
     lightTable,
     onionSkin,
@@ -701,18 +708,52 @@ export const CanvasStage: React.FC = () => {
           renderStroke(lctx, draftStroke);
         }
 
+        const kf = getInterpolatedLayerTransform(layer, currentFrame);
         ctx.save();
         const lightTableDim = lightTable && !isCurrent ? 0.3 : 1;
-        ctx.globalAlpha = layer.opacity * lightTableDim;
-        ctx.globalCompositeOperation = layer.blendMode || 'source-over';
+        ctx.globalAlpha = kf.opacity * lightTableDim;
+        ctx.globalCompositeOperation = layer.clippingMask
+          ? 'source-atop'
+          : layer.blendMode || 'source-over';
+
+        const filters: string[] = [];
+        if (layer.effects) {
+          if (layer.effects.blur > 0) filters.push(`blur(${layer.effects.blur}px)`);
+          if (layer.effects.glow > 0) {
+            filters.push(`drop-shadow(0 0 ${layer.effects.glow}px ${layer.effects.glowColor})`);
+          }
+          if (layer.effects.dropShadow) {
+            filters.push('drop-shadow(6px 6px 8px rgba(0,0,0,0.45))');
+          }
+        }
         if (isCurrent && hsvPreview) {
           const satPct = Math.max(0, 100 + hsvPreview.s);
           const briPct = Math.max(0, 100 + hsvPreview.v);
-          ctx.filter = `hue-rotate(${hsvPreview.h}deg) saturate(${satPct}%) brightness(${briPct}%)`;
+          filters.push(`hue-rotate(${hsvPreview.h}deg) saturate(${satPct}%) brightness(${briPct}%)`);
         }
-        ctx.drawImage(layerBuffer, 0, 0);
+        if (filters.length > 0) {
+          ctx.filter = filters.join(' ');
+        }
+
+        ctx.translate(canvasWidth / 2 + kf.x, canvasHeight / 2 + kf.y);
+        ctx.rotate((kf.rotation * Math.PI) / 180);
+        ctx.scale(kf.scale, kf.scale);
+        ctx.drawImage(layerBuffer, -canvasWidth / 2, -canvasHeight / 2);
         ctx.restore();
       }
+      ctx.restore();
+    }
+
+    // Live Symmetry Ruler Axis (Vertical Mirror)
+    if (symmetryMode === 'vertical') {
+      ctx.save();
+      ctx.strokeStyle = 'rgba(236, 72, 153, 0.75)';
+      ctx.lineWidth = 1.5 / zoom;
+      ctx.setLineDash([8 / zoom, 5 / zoom]);
+      ctx.beginPath();
+      ctx.moveTo(canvasWidth / 2, 0);
+      ctx.lineTo(canvasWidth / 2, canvasHeight);
+      ctx.stroke();
       ctx.restore();
     }
 
@@ -1012,6 +1053,7 @@ export const CanvasStage: React.FC = () => {
     mapStrokesToQuad,
     imageTick,
     perspectiveMode,
+    symmetryMode,
     vanishingPoints,
     hsvPreview
   ]);
@@ -1558,6 +1600,18 @@ export const CanvasStage: React.FC = () => {
         pushRecentColor(draftStroke.color);
       }
       addStroke(draftStroke);
+      // If Symmetry Ruler is ON, automatically add mirrored stroke across vertical center!
+      if (symmetryMode === 'vertical' && draftStroke.points.length > 0) {
+        const mirrored: Stroke = {
+          ...draftStroke,
+          id: `${draftStroke.id}-sym`,
+          points: draftStroke.points.map((p) => ({
+            ...p,
+            x: canvasWidth - p.x
+          }))
+        };
+        addStroke(mirrored);
+      }
       captureTimelapseStep();
       setDraftStroke(null);
       setStabilizerCursor(null);

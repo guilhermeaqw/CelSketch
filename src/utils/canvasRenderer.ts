@@ -1,4 +1,47 @@
-import { DrawingLayer, Point, Stroke } from '../types/harmony';
+import { DrawingLayer, LayerTransformKeyframe, Point, Stroke } from '../types/harmony';
+
+export function getInterpolatedLayerTransform(
+  layer: DrawingLayer,
+  frame: number
+): LayerTransformKeyframe {
+  const base: LayerTransformKeyframe = {
+    x: 0,
+    y: 0,
+    scale: 1,
+    rotation: 0,
+    opacity: layer.opacity
+  };
+  if (!layer.keyframes) return base;
+  const keys = Object.keys(layer.keyframes)
+    .map(Number)
+    .sort((a, b) => a - b);
+  if (keys.length === 0) return base;
+  if (layer.keyframes[frame]) return layer.keyframes[frame];
+  if (frame <= keys[0]) return layer.keyframes[keys[0]];
+  if (frame >= keys[keys.length - 1]) return layer.keyframes[keys[keys.length - 1]];
+
+  // Smooth ease-in-out interpolation between surrounding keyframes
+  let prevF = keys[0];
+  let nextF = keys[keys.length - 1];
+  for (let i = 0; i < keys.length - 1; i++) {
+    if (keys[i] <= frame && keys[i + 1] >= frame) {
+      prevF = keys[i];
+      nextF = keys[i + 1];
+      break;
+    }
+  }
+  const tRaw = (frame - prevF) / Math.max(1, nextF - prevF);
+  const t = tRaw * tRaw * (3 - 2 * tRaw); // smoothstep ease
+  const a = layer.keyframes[prevF];
+  const b = layer.keyframes[nextF];
+  return {
+    x: a.x + (b.x - a.x) * t,
+    y: a.y + (b.y - a.y) * t,
+    scale: a.scale + (b.scale - a.scale) * t,
+    rotation: a.rotation + (b.rotation - a.rotation) * t,
+    opacity: a.opacity + (b.opacity - a.opacity) * t
+  };
+}
 
 const imageCache = new Map<string, HTMLImageElement>();
 
@@ -358,10 +401,25 @@ export function renderFrameToCanvas(
       renderStroke(lctx, st);
     }
 
+    const kf = getInterpolatedLayerTransform(layer, frame);
     ctx.save();
-    ctx.globalAlpha = layer.opacity;
+    ctx.globalAlpha = kf.opacity;
     ctx.globalCompositeOperation = layer.blendMode || 'source-over';
-    ctx.drawImage(layerCanvas, 0, 0);
+    if (layer.effects) {
+      const filters: string[] = [];
+      if (layer.effects.blur > 0) filters.push(`blur(${layer.effects.blur}px)`);
+      if (layer.effects.glow > 0) {
+        filters.push(`drop-shadow(0 0 ${layer.effects.glow}px ${layer.effects.glowColor})`);
+      }
+      if (layer.effects.dropShadow) {
+        filters.push('drop-shadow(6px 6px 8px rgba(0,0,0,0.45))');
+      }
+      if (filters.length > 0) ctx.filter = filters.join(' ');
+    }
+    ctx.translate(width / 2 + kf.x, height / 2 + kf.y);
+    ctx.rotate((kf.rotation * Math.PI) / 180);
+    ctx.scale(kf.scale, kf.scale);
+    ctx.drawImage(layerCanvas, -width / 2, -height / 2);
     ctx.restore();
   }
 }

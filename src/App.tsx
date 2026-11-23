@@ -16,6 +16,7 @@ export const App: React.FC = () => {
     showWelcome,
     openScenes,
     activeSceneId,
+    isDirty,
     switchSceneTab,
     closeSceneTab,
     addBlankSceneTab,
@@ -24,6 +25,7 @@ export const App: React.FC = () => {
     layers,
     fps,
     currentFrame,
+    zoom,
     projectName,
     projectPath,
     autoSaveEnabled,
@@ -31,6 +33,8 @@ export const App: React.FC = () => {
     lastAutoSaveTime,
     brushSize,
     setTool,
+    setZoom,
+    resetView,
     setBrushSize,
     setLastAutoSaveTime,
     undo,
@@ -44,6 +48,10 @@ export const App: React.FC = () => {
     nextFrame,
     prevFrame,
     duplicateFrameToNext,
+    copyCurrentFrame,
+    pasteToCurrentFrame,
+    extendExposureF5,
+    reduceExposureShiftF5,
     exportProjectData,
     setProjectMeta
   } = useHarmonyStore();
@@ -85,6 +93,21 @@ export const App: React.FC = () => {
         } else if (k === 'u') {
           e.preventDefault();
           setHsvModalOpen(true);
+        } else if (k === 'c') {
+          e.preventDefault();
+          copyCurrentFrame();
+        } else if (k === 'v') {
+          e.preventDefault();
+          pasteToCurrentFrame();
+        } else if (k === '=' || k === '+') {
+          e.preventDefault();
+          setZoom(zoom * 1.15);
+        } else if (k === '-') {
+          e.preventDefault();
+          setZoom(zoom * 0.85);
+        } else if (k === '0') {
+          e.preventDefault();
+          resetView();
         } else if (k === 's') {
           e.preventDefault();
           if (!window.harmonyAPI) return;
@@ -155,6 +178,11 @@ export const App: React.FC = () => {
         case ',':
           prevFrame();
           break;
+        case 'f5':
+          e.preventDefault();
+          if (e.shiftKey) reduceExposureShiftF5();
+          else extendExposureF5();
+          break;
         case 'f6':
           e.preventDefault();
           duplicateFrameToNext();
@@ -218,7 +246,9 @@ export const App: React.FC = () => {
                   className={`panel-tab ${isActive ? 'active' : ''}`}
                   style={{ gap: 8, paddingRight: 6 }}
                 >
-                  <span>{scene.name}.celsketch</span>
+                  <span>
+                    {scene.name}.celsketch{isActive && isDirty ? ' *' : ''}
+                  </span>
                   <button
                     onClick={(e) => {
                       e.stopPropagation();

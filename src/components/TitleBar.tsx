@@ -74,6 +74,7 @@ export const TitleBar: React.FC = () => {
     canvasHeight,
     showGrid,
     perspectiveMode,
+    symmetryMode,
     showCameraFrame,
     lightTable,
     onionSkin,
@@ -92,7 +93,9 @@ export const TitleBar: React.FC = () => {
     setAutoSaveEnabled,
     setAutoSaveIntervalSec,
     toggleTimelapseRecording,
+    toggleSymmetry,
     setPerspectiveMode,
+    setAudioTrack,
     resetRotation,
     toggleGrid,
     toggleCameraFrame,
@@ -235,6 +238,38 @@ export const TitleBar: React.FC = () => {
     }
   };
 
+  const handleImportAudio = async () => {
+    setOpenMenu(null);
+    if (!window.harmonyAPI) return;
+    const res = await window.harmonyAPI.importAudio();
+    if (!res.canceled && res.bytes && res.name) {
+      try {
+        const copy = new Uint8Array(res.bytes);
+        const blob = new Blob([copy.buffer as ArrayBuffer]);
+        const objectUrl = URL.createObjectURL(blob);
+        const audioCtx = new AudioContext();
+        const decoded = await audioCtx.decodeAudioData(copy.buffer.slice(0) as ArrayBuffer);
+        const channel = decoded.getChannelData(0);
+        const samples = 240;
+        const blockSize = Math.max(1, Math.floor(channel.length / samples));
+        const peaks: number[] = [];
+        for (let i = 0; i < samples; i++) {
+          let max = 0;
+          const start = i * blockSize;
+          for (let j = 0; j < blockSize && start + j < channel.length; j += 16) {
+            const v = Math.abs(channel[start + j]);
+            if (v > max) max = v;
+          }
+          peaks.push(max);
+        }
+        audioCtx.close();
+        setAudioTrack({ name: res.name, objectUrl, peaks, duration: decoded.duration });
+      } catch (err) {
+        console.error('Failed to decode audio', err);
+      }
+    }
+  };
+
   const handleImportArtwork = async () => {
     setOpenMenu(null);
     if (!window.harmonyAPI) return;
@@ -296,6 +331,9 @@ export const TitleBar: React.FC = () => {
                 </button>
                 <button className="dropdown-item" onClick={handleImportArtwork}>
                   <span>Import (.psd, .kra, .clip, .png)...</span>
+                </button>
+                <button className="dropdown-item" onClick={handleImportAudio}>
+                  <span>Import Audio (.mp3, .wav)...</span>
                 </button>
                 {recentProjects.length > 0 && (
                   <>
@@ -485,6 +523,13 @@ export const TitleBar: React.FC = () => {
               ? 'Persp: Fisheye'
               : `Persp: ${perspectiveMode}P`}
           </span>
+        </button>
+        <button
+          className={`icon-btn ${symmetryMode === 'vertical' ? 'active' : ''}`}
+          onClick={toggleSymmetry}
+          title="Régua de Simetria Vertical ao vivo"
+        >
+          <span>Simetria</span>
         </button>
         <button className={`icon-btn ${showCameraFrame ? 'active' : ''}`} onClick={toggleCameraFrame} title="Camera Frame">
           <Camera size={14} />

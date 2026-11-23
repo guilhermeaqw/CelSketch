@@ -64,16 +64,36 @@ export interface ColourSwatch {
   alpha: number;
 }
 
+export interface LayerTransformKeyframe {
+  x: number;
+  y: number;
+  scale: number;
+  rotation: number;
+  opacity: number;
+}
+
+export interface LayerEffects {
+  blur: number;
+  glow: number;
+  glowColor: string;
+  dropShadow: boolean;
+}
+
 export interface DrawingLayer {
   id: string;
   name: string;
-  type: 'drawing' | 'peg' | 'camera';
+  type: 'drawing' | 'peg' | 'camera' | 'folder';
   visible: boolean;
   locked: boolean;
   solo: boolean;
   holdFrames?: boolean;
+  alphaLock?: boolean;
+  clippingMask?: boolean;
+  collapsed?: boolean;
   opacity: number;
   blendMode?: GlobalCompositeOperation;
+  effects?: LayerEffects;
+  keyframes?: Record<number, LayerTransformKeyframe>;
   tagColor: string;
   // Map of frame number (1-based) to array of strokes
   frames: Record<number, Stroke[]>;
@@ -106,6 +126,7 @@ declare global {
       openProject: () => Promise<{ canceled: boolean; filePath?: string; content?: string }>;
       openProjectByPath: (filePath: string) => Promise<{ canceled: boolean; filePath?: string; content?: string; error?: string }>;
       importExternal: () => Promise<{ canceled: boolean; filePath?: string; ext?: string; bytes?: Uint8Array }>;
+      importAudio: () => Promise<{ canceled: boolean; filePath?: string; name?: string; bytes?: Uint8Array }>;
       exportPng: (dataUrl: string, defaultName: string) => Promise<{ canceled: boolean; filePath?: string }>;
       pickDirectory: () => Promise<{ canceled: boolean; dirPath?: string }>;
       writeFrameToDir: (dirPath: string, name: string, dataUrl: string) => Promise<{ ok: boolean }>;

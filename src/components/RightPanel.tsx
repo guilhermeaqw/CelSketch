@@ -100,8 +100,18 @@ export const RightPanel: React.FC = () => {
     setBucketTolerance,
     setBucketExpand,
     setBucketBehind,
-    setOnionRange
+    setOnionRange,
+    layers,
+    activeLayerId,
+    currentFrame,
+    toggleLayerClippingMask,
+    setLayerEffects,
+    setLayerKeyframe,
+    deleteLayerKeyframe
   } = useHarmonyStore();
+
+  const activeLayer = layers.find((l) => l.id === activeLayerId);
+  const currentKf = activeLayer?.keyframes?.[currentFrame];
 
   return (
     <div className="right-pane">
@@ -347,6 +357,125 @@ export const RightPanel: React.FC = () => {
               className="harmony-slider"
             />
           </div>
+
+          {activeLayer && (
+            <>
+              <div className="prop-group">
+                <div style={{ fontSize: 11, fontWeight: 600, color: '#ccc', marginBottom: 6 }}>
+                  Layer FX ({activeLayer.name})
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                  <span style={{ fontSize: 11, color: '#bbb' }}>Clipping Mask</span>
+                  <input
+                    type="checkbox"
+                    checked={Boolean(activeLayer.clippingMask)}
+                    onChange={() => toggleLayerClippingMask(activeLayer.id)}
+                  />
+                </div>
+                <div className="prop-label">
+                  <span>Blur</span>
+                  <span>{activeLayer.effects?.blur ?? 0} px</span>
+                </div>
+                <input
+                  type="range"
+                  min={0}
+                  max={24}
+                  value={activeLayer.effects?.blur ?? 0}
+                  onChange={(e) => setLayerEffects(activeLayer.id, { blur: Number(e.target.value) })}
+                  className="harmony-slider"
+                />
+                <div className="prop-label" style={{ marginTop: 6 }}>
+                  <span>Glow</span>
+                  <span>{activeLayer.effects?.glow ?? 0} px</span>
+                </div>
+                <input
+                  type="range"
+                  min={0}
+                  max={30}
+                  value={activeLayer.effects?.glow ?? 0}
+                  onChange={(e) => setLayerEffects(activeLayer.id, { glow: Number(e.target.value) })}
+                  className="harmony-slider"
+                />
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 6 }}>
+                  <span style={{ fontSize: 11, color: '#bbb' }}>Drop Shadow</span>
+                  <input
+                    type="checkbox"
+                    checked={Boolean(activeLayer.effects?.dropShadow)}
+                    onChange={(e) => setLayerEffects(activeLayer.id, { dropShadow: e.target.checked })}
+                  />
+                </div>
+              </div>
+
+              <div className="prop-group">
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                  <span style={{ fontSize: 11, fontWeight: 600, color: '#ccc' }}>
+                    Motion Keyframe (F{currentFrame})
+                  </span>
+                  {currentKf ? (
+                    <button
+                      className="icon-btn"
+                      onClick={() => deleteLayerKeyframe(activeLayer.id, currentFrame)}
+                      style={{ fontSize: 10, height: 20 }}
+                    >
+                      Remover ◆
+                    </button>
+                  ) : (
+                    <button
+                      className="icon-btn active"
+                      onClick={() => setLayerKeyframe(activeLayer.id, currentFrame, {})}
+                      style={{ fontSize: 10, height: 20 }}
+                    >
+                      + Keyframe ◆
+                    </button>
+                  )}
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+                  <label style={{ fontSize: 10.5, color: '#aaa' }}>
+                    Pos X
+                    <input
+                      type="number"
+                      className="harmony-input"
+                      style={{ width: '100%' }}
+                      value={Math.round(currentKf?.x ?? 0)}
+                      onChange={(e) => setLayerKeyframe(activeLayer.id, currentFrame, { x: Number(e.target.value) || 0 })}
+                    />
+                  </label>
+                  <label style={{ fontSize: 10.5, color: '#aaa' }}>
+                    Pos Y
+                    <input
+                      type="number"
+                      className="harmony-input"
+                      style={{ width: '100%' }}
+                      value={Math.round(currentKf?.y ?? 0)}
+                      onChange={(e) => setLayerKeyframe(activeLayer.id, currentFrame, { y: Number(e.target.value) || 0 })}
+                    />
+                  </label>
+                  <label style={{ fontSize: 10.5, color: '#aaa' }}>
+                    Escala (%)
+                    <input
+                      type="number"
+                      className="harmony-input"
+                      style={{ width: '100%' }}
+                      value={Math.round((currentKf?.scale ?? 1) * 100)}
+                      onChange={(e) =>
+                        setLayerKeyframe(activeLayer.id, currentFrame, { scale: Math.max(0.05, (Number(e.target.value) || 100) / 100) })
+                      }
+                    />
+                  </label>
+                  <label style={{ fontSize: 10.5, color: '#aaa' }}>
+                    Rotação (°)
+                    <input
+                      type="number"
+                      className="harmony-input"
+                      style={{ width: '100%' }}
+                      value={Math.round(currentKf?.rotation ?? 0)}
+                      onChange={(e) => setLayerKeyframe(activeLayer.id, currentFrame, { rotation: Number(e.target.value) || 0 })}
+                    />
+                  </label>
+                </div>
+              </div>
+            </>
+          )}
         </div>
       )}
 
