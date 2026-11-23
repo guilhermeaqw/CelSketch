@@ -167,7 +167,7 @@ export function renderStroke(
 
   const activeColor = tintColor || stroke.color;
 
-  if (stroke.tool === 'eraser') {
+  if (stroke.tool === 'eraser' || stroke.tool === 'erase_poly') {
     ctx.globalCompositeOperation = 'destination-out';
     ctx.strokeStyle = 'rgba(0,0,0,1)';
     ctx.fillStyle = 'rgba(0,0,0,1)';
@@ -302,7 +302,7 @@ export function renderStroke(
         stroke.imageH ?? img.naturalHeight
       );
     }
-  } else if (stroke.tool === 'fill' && pts.length >= 3) {
+  } else if ((stroke.tool === 'fill' || stroke.tool === 'erase_poly') && pts.length >= 3) {
     ctx.beginPath();
     ctx.moveTo(pts[0].x, pts[0].y);
     for (let i = 1; i < pts.length; i++) {

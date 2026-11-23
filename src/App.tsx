@@ -125,6 +125,7 @@ export const App: React.FC = () => {
         case 'v': setTool('select'); break;
         case 'a': setTool('contour'); break;
         case 'q': setTool(e.shiftKey ? 'polylasso' : 'lasso'); break;
+        case 'm': setTool(e.shiftKey ? 'ellipseselect' : 'rectselect'); break;
         case 'b': setTool('brush'); break;
         case 'c': setCropMode(!cropMode); break;
         case 'p': setTool('pencil'); break;

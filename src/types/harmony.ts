@@ -3,6 +3,8 @@ export type ToolId =
   | 'contour'
   | 'lasso'
   | 'polylasso'
+  | 'rectselect'
+  | 'ellipseselect'
   | 'brush'
   | 'pencil'
   | 'eraser'
@@ -36,7 +38,7 @@ export interface Point {
 
 export interface Stroke {
   id: string;
-  tool: 'brush' | 'pencil' | 'eraser' | 'line' | 'rectangle' | 'ellipse' | 'fill' | 'image';
+  tool: 'brush' | 'pencil' | 'eraser' | 'line' | 'rectangle' | 'ellipse' | 'fill' | 'erase_poly' | 'image';
   preset?: BrushPresetId;
   artLayer: ArtLayerId;
   swatchId: string;

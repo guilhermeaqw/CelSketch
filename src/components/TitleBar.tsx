@@ -51,6 +51,7 @@ export const TitleBar: React.FC = () => {
     canvasWidth,
     canvasHeight,
     showGrid,
+    perspectiveMode,
     showCameraFrame,
     lightTable,
     onionSkin,
@@ -66,6 +67,7 @@ export const TitleBar: React.FC = () => {
     setBrushSmoothing,
     setAutoSaveEnabled,
     setAutoSaveIntervalSec,
+    setPerspectiveMode,
     resetRotation,
     toggleGrid,
     toggleCameraFrame,
@@ -391,6 +393,19 @@ export const TitleBar: React.FC = () => {
         </button>
         <button className={`icon-btn ${showGrid ? 'active' : ''}`} onClick={toggleGrid} title="12-Field Grid">
           <Grid3X3 size={14} />
+        </button>
+        <button
+          className={`icon-btn ${perspectiveMode > 0 ? 'active' : ''}`}
+          onClick={() => setPerspectiveMode(((perspectiveMode + 1) % 5) as 0 | 1 | 2 | 3 | 4)}
+          title="Régua de Perspectiva (Off / 1P / 2P / 3P / Fisheye)"
+        >
+          <span>
+            {perspectiveMode === 0
+              ? 'Persp: Off'
+              : perspectiveMode === 4
+              ? 'Persp: Fisheye'
+              : `Persp: ${perspectiveMode}P`}
+          </span>
         </button>
         <button className={`icon-btn ${showCameraFrame ? 'active' : ''}`} onClick={toggleCameraFrame} title="Camera Frame">
           <Camera size={14} />

@@ -4,6 +4,7 @@ dist-electron/
 release/
 release-nexo2d/
 release-celsketch/
+release-celsketch-v1.1/
 *.log
 .DS_Store
 Thumbs.db

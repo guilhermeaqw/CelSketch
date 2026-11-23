@@ -48,7 +48,16 @@ export const CanvasStage: React.FC = () => {
   const [lassoPoints, setLassoPoints] = useState<Point[]>([]);
   const [lassoClosed, setLassoClosed] = useState(false);
   const [lassoCursor, setLassoCursor] = useState<Point | null>(null);
+  const [selectShapeStart, setSelectShapeStart] = useState<Point | null>(null);
   const [selectedStrokeIds, setSelectedStrokeIds] = useState<string[]>([]);
+
+  // Perspective Vanishing Points (VP1, VP2, VP3)
+  const [vanishingPoints, setVanishingPoints] = useState<Point[]>([
+    { x: 960, y: 540 },
+    { x: 180, y: 540 },
+    { x: 960, y: 100 }
+  ]);
+  const [draggingVpIndex, setDraggingVpIndex] = useState<number | null>(null);
   const [isDraggingSelection, setIsDraggingSelection] = useState(false);
   const [dragLastPt, setDragLastPt] = useState<Point | null>(null);
 
@@ -100,6 +109,7 @@ export const CanvasStage: React.FC = () => {
     grayscaleMode,
     cropMode,
     showGrid,
+    perspectiveMode,
     showCameraFrame,
     lightTable,
     onionSkin,
@@ -231,11 +241,22 @@ export const CanvasStage: React.FC = () => {
 
   const deleteSelection = useCallback(() => {
     if (!lassoClosed || lassoPoints.length < 3) return;
-    if (selectedStrokeIds.length > 0) {
-      deleteStrokes(selectedStrokeIds);
-    }
+    // Exact polygon erase mask: ONLY erases pixels strictly inside the selection on the active layer!
+    const eraseMask: Stroke = {
+      id: `st-erase-poly-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      tool: 'erase_poly',
+      artLayer: activeArtLayer,
+      swatchId: activeSwatch.id,
+      color: '#000000',
+      size: 1,
+      opacity: 1,
+      smoothing: 0,
+      points: lassoPoints.map((p) => ({ x: p.x, y: p.y })),
+      filled: true
+    };
+    addStroke(eraseMask);
     setSelectedStrokeIds([]);
-  }, [lassoClosed, lassoPoints, selectedStrokeIds, deleteStrokes]);
+  }, [lassoClosed, lassoPoints, activeArtLayer, activeSwatch.id, addStroke]);
 
   const mapStrokesToQuad = useCallback(
     (origStrokes: Stroke[], bounds: { minX: number; minY: number; maxX: number; maxY: number }, quad: Quad): Stroke[] => {
@@ -519,9 +540,13 @@ export const CanvasStage: React.FC = () => {
     layerBuffer.height = canvasHeight;
     const lctx = layerBuffer.getContext('2d');
 
-    // Render all visible layers bottom-to-top, drawing Onion Skin right beneath the active layer
-    // (so Background / lower layers NEVER cover up the Onion Skin!)
+    // Render all visible layers bottom-to-top, clipped strictly to the canvas bounds!
     if (lctx) {
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(0, 0, canvasWidth, canvasHeight);
+      ctx.clip();
+
       const ordered = [...layers].reverse();
       for (const layer of ordered) {
         const isCurrent = layer.id === activeLayerId;
@@ -587,6 +612,95 @@ export const CanvasStage: React.FC = () => {
         ctx.drawImage(layerBuffer, 0, 0);
         ctx.restore();
       }
+      ctx.restore();
+    }
+
+    // Perspective Ruler Guides (1P / 2P / 3P / Fisheye 5-Point) with Draggable Vanishing Points
+    if (perspectiveMode > 0) {
+      ctx.save();
+      if (perspectiveMode === 4) {
+        // Fisheye (5-Point Curvilinear Perspective Sphere) centered on VP1
+        const cx = vanishingPoints[0].x;
+        const cy = vanishingPoints[0].y;
+        const radius = Math.min(canvasWidth, canvasHeight) * 0.46;
+
+        // Outer sphere circle + horizon & vertical meridian
+        ctx.strokeStyle = 'rgba(0, 210, 255, 0.55)';
+        ctx.lineWidth = 1.5 / zoom;
+        ctx.beginPath();
+        ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.moveTo(cx - radius, cy);
+        ctx.lineTo(cx + radius, cy);
+        ctx.moveTo(cx, cy - radius);
+        ctx.lineTo(cx, cy + radius);
+        ctx.stroke();
+
+        // Curved horizontal & vertical fisheye grid arcs
+        ctx.strokeStyle = 'rgba(0, 210, 255, 0.30)';
+        ctx.lineWidth = 1 / zoom;
+        for (const frac of [-0.75, -0.5, -0.25, 0.25, 0.5, 0.75]) {
+          // Horizontal bowed arcs
+          ctx.beginPath();
+          ctx.moveTo(cx - radius, cy);
+          ctx.quadraticCurveTo(cx, cy + radius * frac * 1.4, cx + radius, cy);
+          ctx.stroke();
+          // Vertical bowed arcs
+          ctx.beginPath();
+          ctx.moveTo(cx, cy - radius);
+          ctx.quadraticCurveTo(cx + radius * frac * 1.4, cy, cx, cy + radius);
+          ctx.stroke();
+        }
+
+        // Draggable Fisheye Center Handle
+        ctx.fillStyle = '#00d2ff';
+        ctx.beginPath();
+        ctx.arc(cx, cy, 7 / zoom, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = '#111';
+        ctx.lineWidth = 1.5 / zoom;
+        ctx.stroke();
+      } else {
+        const activeVps =
+          perspectiveMode === 1
+            ? [vanishingPoints[0]]
+            : perspectiveMode === 2
+            ? [vanishingPoints[0], vanishingPoints[1]]
+            : [vanishingPoints[0], vanishingPoints[1], vanishingPoints[2]];
+
+        // Horizon line (through VP1)
+        ctx.strokeStyle = 'rgba(0, 210, 255, 0.55)';
+        ctx.lineWidth = 1.5 / zoom;
+        ctx.beginPath();
+        ctx.moveTo(-canvasWidth, vanishingPoints[0].y);
+        ctx.lineTo(canvasWidth * 2, vanishingPoints[0].y);
+        ctx.stroke();
+
+        const vpColors = ['rgba(0, 210, 255, 0.35)', 'rgba(255, 100, 200, 0.35)', 'rgba(255, 200, 50, 0.35)'];
+        activeVps.forEach((vp, idx) => {
+          ctx.strokeStyle = vpColors[idx];
+          ctx.lineWidth = 1 / zoom;
+          const rays = 24;
+          for (let r = 0; r < rays; r++) {
+            const ang = (r / rays) * Math.PI * 2;
+            ctx.beginPath();
+            ctx.moveTo(vp.x, vp.y);
+            ctx.lineTo(vp.x + Math.cos(ang) * canvasWidth * 2.5, vp.y + Math.sin(ang) * canvasWidth * 2.5);
+            ctx.stroke();
+          }
+          // Vanishing point handle
+          ctx.fillStyle = idx === 0 ? '#00d2ff' : idx === 1 ? '#ff64c8' : '#ffc832';
+          ctx.beginPath();
+          ctx.arc(vp.x, vp.y, 7 / zoom, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.strokeStyle = '#111';
+          ctx.lineWidth = 1.5 / zoom;
+          ctx.stroke();
+        });
+      }
+      ctx.restore();
     }
 
     // Lasso Selection Overlay (Photoshop-style marching ants)
@@ -798,7 +912,9 @@ export const CanvasStage: React.FC = () => {
     transformOrigStrokes,
     transformOrigBounds,
     mapStrokesToQuad,
-    imageTick
+    imageTick,
+    perspectiveMode,
+    vanishingPoints
   ]);
 
   const getPointFromEvent = useCallback(
@@ -847,6 +963,18 @@ export const CanvasStage: React.FC = () => {
     const pt = getPointFromEvent(e);
     setPenStatus({ type: e.pointerType || 'mouse', pressure: pt.pressure ?? 1 });
 
+    // Draggable Perspective Vanishing Points
+    if (perspectiveMode > 0) {
+      const vpCount = perspectiveMode === 4 ? 1 : perspectiveMode;
+      const tol = 16 / zoom;
+      for (let i = 0; i < vpCount; i++) {
+        if (Math.hypot(pt.x - vanishingPoints[i].x, pt.y - vanishingPoints[i].y) <= tol) {
+          setDraggingVpIndex(i);
+          return;
+        }
+      }
+    }
+
     // Free Transform Mode (Ctrl+T) pointer down
     if (transformActive && transformQuad) {
       const tol = 16 / zoom;
@@ -884,12 +1012,26 @@ export const CanvasStage: React.FC = () => {
       return;
     }
 
-    // Lasso & Polygonal Lasso handling (Photoshop style)
-    if (activeTool === 'lasso' || activeTool === 'polylasso') {
+    // Selection tools: Lasso, Polygonal Lasso, Rect Select, Ellipse Select
+    if (
+      activeTool === 'lasso' ||
+      activeTool === 'polylasso' ||
+      activeTool === 'rectselect' ||
+      activeTool === 'ellipseselect'
+    ) {
       // If we already have a closed selection and user clicks inside it -> drag to move strokes!
       if (lassoClosed && lassoPoints.length >= 3 && isPointInPolygon(pt, lassoPoints)) {
         setIsDraggingSelection(true);
         setDragLastPt(pt);
+        return;
+      }
+
+      if (activeTool === 'rectselect' || activeTool === 'ellipseselect') {
+        setLassoClosed(false);
+        setSelectedStrokeIds([]);
+        setSelectShapeStart(pt);
+        setLassoPoints([pt]);
+        setIsDrawing(true);
         return;
       }
 
@@ -983,7 +1125,7 @@ export const CanvasStage: React.FC = () => {
         artLayer: activeArtLayer,
         swatchId: activeSwatch.id,
         color: activeColor,
-        size: effectiveTool === 'eraser' ? brushSize * 2 : brushSize,
+        size: brushSize,
         minSizeRatio: brushMinSize / 100,
         opacity: brushOpacity,
         smoothing: brushSmoothing,
@@ -1015,6 +1157,14 @@ export const CanvasStage: React.FC = () => {
     }
 
     const pt = screenToCanvas(e.clientX, e.clientY);
+
+    // Dragging a Perspective Vanishing Point
+    if (draggingVpIndex !== null) {
+      setVanishingPoints((prev) =>
+        prev.map((vp, idx) => (idx === draggingVpIndex ? { x: pt.x, y: pt.y } : vp))
+      );
+      return;
+    }
 
     // Free Transform Mode (Ctrl+T) pointer move
     if (transformActive && activeTransformHandle && transformDragStart) {
@@ -1116,6 +1266,34 @@ export const CanvasStage: React.FC = () => {
       return;
     }
 
+    // Rectangle / Ellipse selection drag
+    if ((activeTool === 'rectselect' || activeTool === 'ellipseselect') && isDrawing && selectShapeStart) {
+      const x1 = selectShapeStart.x;
+      const y1 = selectShapeStart.y;
+      const x2 = pt.x;
+      const y2 = pt.y;
+      if (activeTool === 'rectselect') {
+        setLassoPoints([
+          { x: x1, y: y1 },
+          { x: x2, y: y1 },
+          { x: x2, y: y2 },
+          { x: x1, y: y2 }
+        ]);
+      } else {
+        const cx = (x1 + x2) / 2;
+        const cy = (y1 + y2) / 2;
+        const rx = Math.abs(x2 - x1) / 2;
+        const ry = Math.abs(y2 - y1) / 2;
+        const ellipsePts: Point[] = [];
+        for (let i = 0; i < 36; i++) {
+          const ang = (i / 36) * Math.PI * 2;
+          ellipsePts.push({ x: cx + Math.cos(ang) * rx, y: cy + Math.sin(ang) * ry });
+        }
+        setLassoPoints(ellipsePts);
+      }
+      return;
+    }
+
     // Freehand lasso drawing
     if (activeTool === 'lasso' && isDrawing && !lassoClosed) {
       setLassoPoints((prev) => [...prev, pt]);
@@ -1180,6 +1358,10 @@ export const CanvasStage: React.FC = () => {
   };
 
   const handlePointerUp = () => {
+    if (draggingVpIndex !== null) {
+      setDraggingVpIndex(null);
+      return;
+    }
     if (isRotating) {
       setIsRotating(false);
       return;
@@ -1203,8 +1385,13 @@ export const CanvasStage: React.FC = () => {
       setDragLastPt(null);
       return;
     }
-    if (activeTool === 'lasso' && isDrawing && !lassoClosed) {
+    if (
+      (activeTool === 'lasso' || activeTool === 'rectselect' || activeTool === 'ellipseselect') &&
+      isDrawing &&
+      !lassoClosed
+    ) {
       setIsDrawing(false);
+      setSelectShapeStart(null);
       closeLassoAndSelect(lassoPoints);
       return;
     }
@@ -1246,10 +1433,7 @@ export const CanvasStage: React.FC = () => {
     !isRotating &&
     (activeTool === 'brush' || activeTool === 'pencil' || activeTool === 'eraser');
 
-  const brushRingDiameter = Math.max(
-    4,
-    (activeTool === 'eraser' ? brushSize * 2 : brushSize) * zoom
-  );
+  const brushRingDiameter = Math.max(4, brushSize * zoom);
 
   const cursorStyle = cropMode
     ? getCropCursor(activeCropHandle || hoverCropHandle)

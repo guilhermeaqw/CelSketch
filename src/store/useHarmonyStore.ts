@@ -87,6 +87,7 @@ interface HarmonyState {
   exportModalOpen: boolean;
   cropMode: boolean;
   showGrid: boolean;
+  perspectiveMode: 0 | 1 | 2 | 3 | 4;
   showCameraFrame: boolean;
   lightTable: boolean;
   onionSkin: boolean;
@@ -138,6 +139,7 @@ interface HarmonyState {
   applyLayerHsv: (hDelta: number, sDelta: number, vDelta: number) => void;
   resetView: () => void;
   toggleGrid: () => void;
+  setPerspectiveMode: (mode: 0 | 1 | 2 | 3 | 4) => void;
   toggleCameraFrame: () => void;
   toggleLightTable: () => void;
   toggleOnionSkin: () => void;
@@ -296,6 +298,7 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
   exportModalOpen: false,
   cropMode: false,
   showGrid: true,
+  perspectiveMode: 0,
   showCameraFrame: true,
   lightTable: false,
   onionSkin: true,
@@ -431,6 +434,7 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
     }),
   resetView: () => set({ zoom: 0.55, panX: 0, panY: 0, rotation: 0, flipX: false }),
   toggleGrid: () => set((s) => ({ showGrid: !s.showGrid })),
+  setPerspectiveMode: (perspectiveMode) => set({ perspectiveMode }),
   toggleCameraFrame: () => set((s) => ({ showCameraFrame: !s.showCameraFrame })),
   toggleLightTable: () => set((s) => ({ lightTable: !s.lightTable })),
   toggleOnionSkin: () => set((s) => ({ onionSkin: !s.onionSkin })),
