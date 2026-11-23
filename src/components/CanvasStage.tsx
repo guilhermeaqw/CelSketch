@@ -77,7 +77,9 @@ export const CanvasStage: React.FC = () => {
   const [transformOrigBounds, setTransformOrigBounds] = useState<{ minX: number; minY: number; maxX: number; maxY: number } | null>(null);
   const [transformQuad, setTransformQuad] = useState<Quad | null>(null);
   const [activeTransformHandle, setActiveTransformHandle] = useState<TransformHandle | null>(null);
+  const [hoverTransformHandle, setHoverTransformHandle] = useState<TransformHandle | null>(null);
   const [transformDragStart, setTransformDragStart] = useState<{ pt: Point; quad: Quad } | null>(null);
+  const [transformMenuPos, setTransformMenuPos] = useState<{ x: number; y: number } | null>(null);
 
   const {
     canvasWidth,
@@ -371,6 +373,46 @@ export const CanvasStage: React.FC = () => {
     setTransformOrigBounds(null);
     setTransformOrigStrokes([]);
   }, []);
+
+  const rotateQuadBy = useCallback((deg: number) => {
+    setTransformQuad((q) => {
+      if (!q) return q;
+      const cx = (q.tl.x + q.tr.x + q.br.x + q.bl.x) / 4;
+      const cy = (q.tl.y + q.tr.y + q.br.y + q.bl.y) / 4;
+      const rad = (deg * Math.PI) / 180;
+      const cos = Math.cos(rad);
+      const sin = Math.sin(rad);
+      const r = (p: Point): Point => ({
+        x: cx + (p.x - cx) * cos - (p.y - cy) * sin,
+        y: cy + (p.x - cx) * sin + (p.y - cy) * cos
+      });
+      return { tl: r(q.tl), tr: r(q.tr), br: r(q.br), bl: r(q.bl) };
+    });
+  }, []);
+
+  const hitTestTransformHandle = useCallback(
+    (pt: Point, q: Quad): TransformHandle | null => {
+      const tol = 14 / zoom;
+      const { tl, tr, br, bl } = q;
+      const tMid = { x: (tl.x + tr.x) / 2, y: (tl.y + tr.y) / 2 };
+      const rMid = { x: (tr.x + br.x) / 2, y: (tr.y + br.y) / 2 };
+      const bMid = { x: (br.x + bl.x) / 2, y: (br.y + bl.y) / 2 };
+      const lMid = { x: (bl.x + tl.x) / 2, y: (bl.y + tl.y) / 2 };
+
+      if (Math.hypot(pt.x - tl.x, pt.y - tl.y) <= tol) return 'tl';
+      if (Math.hypot(pt.x - tr.x, pt.y - tr.y) <= tol) return 'tr';
+      if (Math.hypot(pt.x - br.x, pt.y - br.y) <= tol) return 'br';
+      if (Math.hypot(pt.x - bl.x, pt.y - bl.y) <= tol) return 'bl';
+      if (Math.hypot(pt.x - tMid.x, pt.y - tMid.y) <= tol) return 't';
+      if (Math.hypot(pt.x - rMid.x, pt.y - rMid.y) <= tol) return 'r';
+      if (Math.hypot(pt.x - bMid.x, pt.y - bMid.y) <= tol) return 'b';
+      if (Math.hypot(pt.x - lMid.x, pt.y - lMid.y) <= tol) return 'l';
+      if (isPointInPolygon(pt, [tl, tr, br, bl])) return 'move';
+      // Anywhere outside the box -> Rotate! (classic pro Free Transform feel)
+      return 'rot';
+    },
+    [zoom]
+  );
 
   // Ctrl+T to open Transform, Enter to commit, Escape to cancel
   useEffect(() => {
@@ -803,13 +845,11 @@ export const CanvasStage: React.FC = () => {
       ctx.restore();
     }
 
-    // Free Transform / Perspective Bounding Quad (Ctrl+T)
+    // Free Transform Bounding Quad (Ctrl+T)
     if (transformActive && transformQuad) {
       const { tl, tr, br, bl } = transformQuad;
-      const topMidX = (tl.x + tr.x) / 2;
-      const topMidY = (tl.y + tr.y) / 2;
-      const rotHandleX = topMidX;
-      const rotHandleY = topMidY - 28 / zoom;
+      const cx = (tl.x + tr.x + br.x + bl.x) / 4;
+      const cy = (tl.y + tr.y + br.y + bl.y) / 4;
 
       ctx.save();
       ctx.strokeStyle = '#3a86ff';
@@ -822,22 +862,20 @@ export const CanvasStage: React.FC = () => {
       ctx.closePath();
       ctx.stroke();
 
-      // Rotation stem & circle handle
-      ctx.beginPath();
-      ctx.moveTo(topMidX, topMidY);
-      ctx.lineTo(rotHandleX, rotHandleY);
-      ctx.stroke();
-
-      ctx.fillStyle = '#3a86ff';
-      ctx.beginPath();
-      ctx.arc(rotHandleX, rotHandleY, 5.5 / zoom, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.strokeStyle = '#ffffff';
+      // Center Pivot Crosshair (⊕)
+      const pr = 6 / zoom;
+      ctx.strokeStyle = '#3a86ff';
       ctx.lineWidth = 1.2 / zoom;
+      ctx.beginPath();
+      ctx.arc(cx, cy, pr, 0, Math.PI * 2);
+      ctx.moveTo(cx - pr * 1.6, cy);
+      ctx.lineTo(cx + pr * 1.6, cy);
+      ctx.moveTo(cx, cy - pr * 1.6);
+      ctx.lineTo(cx, cy + pr * 1.6);
       ctx.stroke();
 
-      // 8 Handles (4 Corners + 4 Edge Midpoints)
-      const hs = 9 / zoom;
+      // 8 Crisp Handles (4 Corners + 4 Edge Midpoints)
+      const hs = 8 / zoom;
       const edgeMids = [
         { x: (tl.x + tr.x) / 2, y: (tl.y + tr.y) / 2 },
         { x: (tr.x + br.x) / 2, y: (tr.y + br.y) / 2 },
@@ -1052,28 +1090,8 @@ export const CanvasStage: React.FC = () => {
 
     // Free Transform Mode (Ctrl+T) pointer down
     if (transformActive && transformQuad) {
-      const tol = 16 / zoom;
-      const { tl, tr, br, bl } = transformQuad;
-      const rotX = (tl.x + tr.x) / 2;
-      const rotY = (tl.y + tr.y) / 2 - 28 / zoom;
-
-      let hit: TransformHandle | null = null;
-      const tMid = { x: (tl.x + tr.x) / 2, y: (tl.y + tr.y) / 2 };
-      const rMid = { x: (tr.x + br.x) / 2, y: (tr.y + br.y) / 2 };
-      const bMid = { x: (br.x + bl.x) / 2, y: (br.y + bl.y) / 2 };
-      const lMid = { x: (bl.x + tl.x) / 2, y: (bl.y + tl.y) / 2 };
-
-      if (Math.hypot(pt.x - rotX, pt.y - rotY) <= tol) hit = 'rot';
-      else if (Math.hypot(pt.x - tl.x, pt.y - tl.y) <= tol) hit = 'tl';
-      else if (Math.hypot(pt.x - tr.x, pt.y - tr.y) <= tol) hit = 'tr';
-      else if (Math.hypot(pt.x - br.x, pt.y - br.y) <= tol) hit = 'br';
-      else if (Math.hypot(pt.x - bl.x, pt.y - bl.y) <= tol) hit = 'bl';
-      else if (Math.hypot(pt.x - tMid.x, pt.y - tMid.y) <= tol) hit = 't';
-      else if (Math.hypot(pt.x - rMid.x, pt.y - rMid.y) <= tol) hit = 'r';
-      else if (Math.hypot(pt.x - bMid.x, pt.y - bMid.y) <= tol) hit = 'b';
-      else if (Math.hypot(pt.x - lMid.x, pt.y - lMid.y) <= tol) hit = 'l';
-      else if (isPointInPolygon(pt, [tl, tr, br, bl])) hit = 'move';
-
+      setTransformMenuPos(null);
+      const hit = hitTestTransformHandle(pt, transformQuad);
       if (hit) {
         setActiveTransformHandle(hit);
         setTransformDragStart({ pt, quad: JSON.parse(JSON.stringify(transformQuad)) });
@@ -1252,7 +1270,11 @@ export const CanvasStage: React.FC = () => {
     }
 
     // Free Transform Mode (Ctrl+T) pointer move
-    if (transformActive && activeTransformHandle && transformDragStart) {
+    if (transformActive && transformQuad) {
+      if (!activeTransformHandle || !transformDragStart) {
+        setHoverTransformHandle(hitTestTransformHandle(pt, transformQuad));
+        return;
+      }
       const dx = pt.x - transformDragStart.pt.x;
       const dy = pt.y - transformDragStart.pt.y;
       const q = JSON.parse(JSON.stringify(transformDragStart.quad)) as Quad;
@@ -1267,7 +1289,12 @@ export const CanvasStage: React.FC = () => {
         const cy = (q.tl.y + q.tr.y + q.br.y + q.bl.y) / 4;
         const a0 = Math.atan2(transformDragStart.pt.y - cy, transformDragStart.pt.x - cx);
         const a1 = Math.atan2(pt.y - cy, pt.x - cx);
-        const delta = a1 - a0;
+        let delta = a1 - a0;
+        if (e.shiftKey) {
+          // Snap rotation to 15-degree increments when holding Shift
+          const snap = (15 * Math.PI) / 180;
+          delta = Math.round(delta / snap) * snap;
+        }
         const cos = Math.cos(delta);
         const sin = Math.sin(delta);
         const rotPt = (p: Point): Point => ({
@@ -1278,25 +1305,48 @@ export const CanvasStage: React.FC = () => {
         q.tr = rotPt(q.tr);
         q.br = rotPt(q.br);
         q.bl = rotPt(q.bl);
-      } else if (transformSubMode === 'perspective' && (activeTransformHandle === 'tl' || activeTransformHandle === 'tr' || activeTransformHandle === 'br' || activeTransformHandle === 'bl')) {
-        // Free 4-corner perspective warp!
+      } else if (
+        (transformSubMode === 'perspective' || e.ctrlKey) &&
+        (activeTransformHandle === 'tl' || activeTransformHandle === 'tr' || activeTransformHandle === 'br' || activeTransformHandle === 'bl')
+      ) {
+        // Free 4-corner distort/perspective (Perspective mode OR holding Ctrl on any corner!)
         q[activeTransformHandle].x += dx;
         q[activeTransformHandle].y += dy;
+      } else if (activeTransformHandle === 'tl' || activeTransformHandle === 'tr' || activeTransformHandle === 'br' || activeTransformHandle === 'bl') {
+        // Corner scale: proportional by default (Shift = free stretch, Alt = scale from center)
+        const oppositeMap: Record<'tl' | 'tr' | 'br' | 'bl', 'br' | 'bl' | 'tl' | 'tr'> = {
+          tl: 'br',
+          tr: 'bl',
+          br: 'tl',
+          bl: 'tr'
+        };
+        const cx = (q.tl.x + q.tr.x + q.br.x + q.bl.x) / 4;
+        const cy = (q.tl.y + q.tr.y + q.br.y + q.bl.y) / 4;
+        const anchor = e.altKey ? { x: cx, y: cy } : q[oppositeMap[activeTransformHandle]];
+        const origCorner = q[activeTransformHandle];
+        const origDx = origCorner.x - anchor.x;
+        const origDy = origCorner.y - anchor.y;
+        const newDx = origCorner.x + dx - anchor.x;
+        const newDy = origCorner.y + dy - anchor.y;
+        let sx = Math.abs(origDx) > 1 ? newDx / origDx : 1;
+        let sy = Math.abs(origDy) > 1 ? newDy / origDy : 1;
+        if (!e.shiftKey) {
+          // Proportional scale by default
+          const uniform = (sx + sy) / 2;
+          sx = uniform;
+          sy = uniform;
+        }
+        const scalePt = (p: Point): Point => ({
+          x: anchor.x + (p.x - anchor.x) * sx,
+          y: anchor.y + (p.y - anchor.y) * sy
+        });
+        q.tl = scalePt(q.tl);
+        q.tr = scalePt(q.tr);
+        q.br = scalePt(q.br);
+        q.bl = scalePt(q.bl);
       } else {
-        // Rectangular scale (4 corners + 4 edges)
-        if (activeTransformHandle === 'tl') {
-          q.tl.x += dx; q.tl.y += dy;
-          q.tr.y += dy; q.bl.x += dx;
-        } else if (activeTransformHandle === 'tr') {
-          q.tr.x += dx; q.tr.y += dy;
-          q.tl.y += dy; q.br.x += dx;
-        } else if (activeTransformHandle === 'br') {
-          q.br.x += dx; q.br.y += dy;
-          q.bl.y += dy; q.tr.x += dx;
-        } else if (activeTransformHandle === 'bl') {
-          q.bl.x += dx; q.bl.y += dy;
-          q.br.y += dy; q.tl.x += dx;
-        } else if (activeTransformHandle === 't') {
+        // Edge stretch (top, bottom, left, right)
+        if (activeTransformHandle === 't') {
           q.tl.y += dy; q.tr.y += dy;
         } else if (activeTransformHandle === 'b') {
           q.bl.y += dy; q.br.y += dy;
@@ -1531,8 +1581,20 @@ export const CanvasStage: React.FC = () => {
 
   const brushRingDiameter = Math.max(4, brushSize * zoom);
 
+  const getTransformCursor = (h: TransformHandle | null) => {
+    if (h === 'tl' || h === 'br') return 'nwse-resize';
+    if (h === 'tr' || h === 'bl') return 'nesw-resize';
+    if (h === 't' || h === 'b') return 'ns-resize';
+    if (h === 'l' || h === 'r') return 'ew-resize';
+    if (h === 'move') return 'move';
+    if (h === 'rot') return 'grab';
+    return 'default';
+  };
+
   const cursorStyle = cropMode
     ? getCropCursor(activeCropHandle || hoverCropHandle)
+    : transformActive
+    ? getTransformCursor(activeTransformHandle || hoverTransformHandle)
     : rHeld
     ? isRotating
       ? 'grabbing'
@@ -1580,6 +1642,15 @@ export const CanvasStage: React.FC = () => {
           setMousePos(null);
         }}
         onDoubleClick={handleDoubleClick}
+        onContextMenu={(e) => {
+          if (transformActive) {
+            e.preventDefault();
+            const rect = containerRef.current?.getBoundingClientRect();
+            if (rect) {
+              setTransformMenuPos({ x: e.clientX - rect.left, y: e.clientY - rect.top });
+            }
+          }
+        }}
         onWheel={handleWheel}
         style={{
           display: 'block',
@@ -1656,12 +1727,63 @@ export const CanvasStage: React.FC = () => {
           >
             Flip V
           </button>
+          <button
+            className="icon-btn"
+            onClick={() => rotateQuadBy(90)}
+            title="Girar 90° Horário"
+          >
+            90° ↻
+          </button>
           <div className="tb-sep" />
           <button className="icon-btn active" onClick={commitTransform} style={{ fontWeight: 600 }}>
             Aplicar (Enter)
           </button>
           <button className="icon-btn" onClick={cancelTransform}>
             Cancelar (Esc)
+          </button>
+        </div>
+      )}
+
+      {/* Right-click Context Menu inside Free Transform */}
+      {transformActive && transformMenuPos && (
+        <div
+          className="dropdown-menu"
+          style={{ left: transformMenuPos.x, top: transformMenuPos.y, zIndex: 90 }}
+        >
+          <button className="dropdown-item" onClick={() => { setTransformSubMode('scale'); setTransformMenuPos(null); }}>
+            <span>Escala / Girar</span>
+          </button>
+          <button className="dropdown-item" onClick={() => { setTransformSubMode('perspective'); setTransformMenuPos(null); }}>
+            <span>Distorcer / Perspectiva (ou segure Ctrl)</span>
+          </button>
+          <div className="dropdown-sep" />
+          <button className="dropdown-item" onClick={() => { rotateQuadBy(90); setTransformMenuPos(null); }}>
+            <span>Girar 90° Horário</span>
+          </button>
+          <button className="dropdown-item" onClick={() => { rotateQuadBy(-90); setTransformMenuPos(null); }}>
+            <span>Girar 90° Anti-horário</span>
+          </button>
+          <button className="dropdown-item" onClick={() => { rotateQuadBy(180); setTransformMenuPos(null); }}>
+            <span>Girar 180°</span>
+          </button>
+          <div className="dropdown-sep" />
+          <button
+            className="dropdown-item"
+            onClick={() => {
+              setTransformQuad((q) => (q ? { tl: q.tr, tr: q.tl, br: q.bl, bl: q.br } : q));
+              setTransformMenuPos(null);
+            }}
+          >
+            <span>Virar Horizontalmente</span>
+          </button>
+          <button
+            className="dropdown-item"
+            onClick={() => {
+              setTransformQuad((q) => (q ? { tl: q.bl, tr: q.br, br: q.tr, bl: q.tl } : q));
+              setTransformMenuPos(null);
+            }}
+          >
+            <span>Virar Verticalmente</span>
           </button>
         </div>
       )}

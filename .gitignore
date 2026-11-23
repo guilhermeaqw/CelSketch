@@ -8,6 +8,7 @@ release-celsketch-v1.1/
 release-celsketch-v1.2/
 release-celsketch-v1.3/
 release-celsketch-v1.4/
+release-celsketch-v1.5/
 *.log
 .DS_Store
 Thumbs.db
