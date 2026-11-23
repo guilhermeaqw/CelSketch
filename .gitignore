@@ -1,0 +1,9 @@
+node_modules/
+dist/
+dist-electron/
+release/
+release-nexo2d/
+release-celsketch/
+*.log
+.DS_Store
+Thumbs.db
