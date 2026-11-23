@@ -70,7 +70,7 @@ export const CanvasStage: React.FC = () => {
 
   // Free Transform / Perspective Tool (Ctrl+T)
   type Quad = { tl: Point; tr: Point; br: Point; bl: Point };
-  type TransformHandle = 'tl' | 'tr' | 'br' | 'bl' | 'rot' | 'move';
+  type TransformHandle = 'tl' | 'tr' | 'br' | 'bl' | 't' | 'r' | 'b' | 'l' | 'rot' | 'move';
   const [transformActive, setTransformActive] = useState(false);
   const [transformSubMode, setTransformSubMode] = useState<'scale' | 'perspective'>('scale');
   const [transformOrigStrokes, setTransformOrigStrokes] = useState<Stroke[]>([]);
@@ -265,26 +265,49 @@ export const CanvasStage: React.FC = () => {
     (origStrokes: Stroke[], bounds: { minX: number; minY: number; maxX: number; maxY: number }, quad: Quad): Stroke[] => {
       const bw = Math.max(1, bounds.maxX - bounds.minX);
       const bh = Math.max(1, bounds.maxY - bounds.minY);
-      return origStrokes.map((st) => ({
-        ...st,
-        points: st.points.map((pt) => {
-          const u = (pt.x - bounds.minX) / bw;
-          const v = (pt.y - bounds.minY) / bh;
-          const x =
+      const mapPt = (px: number, py: number) => {
+        const u = (px - bounds.minX) / bw;
+        const v = (py - bounds.minY) / bh;
+        return {
+          x:
             (1 - u) * (1 - v) * quad.tl.x +
             u * (1 - v) * quad.tr.x +
             u * v * quad.br.x +
-            (1 - u) * v * quad.bl.x;
-          const y =
+            (1 - u) * v * quad.bl.x,
+          y:
             (1 - u) * (1 - v) * quad.tl.y +
             u * (1 - v) * quad.tr.y +
             u * v * quad.br.y +
-            (1 - u) * v * quad.bl.y;
-          return { ...pt, x, y };
-        })
-      }));
+            (1 - u) * v * quad.bl.y
+        };
+      };
+
+      return origStrokes.map((st) => {
+        if (st.tool === 'image') {
+          const ix = st.imageX ?? 0;
+          const iy = st.imageY ?? 0;
+          const iw = st.imageW ?? canvasWidth;
+          const ih = st.imageH ?? canvasHeight;
+          const p1 = mapPt(ix, iy);
+          const p2 = mapPt(ix + iw, iy + ih);
+          return {
+            ...st,
+            imageX: Math.min(p1.x, p2.x),
+            imageY: Math.min(p1.y, p2.y),
+            imageW: Math.max(4, Math.abs(p2.x - p1.x)),
+            imageH: Math.max(4, Math.abs(p2.y - p1.y))
+          };
+        }
+        return {
+          ...st,
+          points: st.points.map((pt) => {
+            const m = mapPt(pt.x, pt.y);
+            return { ...pt, x: m.x, y: m.y };
+          })
+        };
+      });
     },
-    []
+    [canvasWidth, canvasHeight]
   );
 
   const openTransform = useCallback(() => {
@@ -298,11 +321,22 @@ export const CanvasStage: React.FC = () => {
 
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (const st of targetStrokes) {
-      for (const p of st.points) {
-        if (p.x < minX) minX = p.x;
-        if (p.y < minY) minY = p.y;
-        if (p.x > maxX) maxX = p.x;
-        if (p.y > maxY) maxY = p.y;
+      if (st.tool === 'image') {
+        const ix = st.imageX ?? 0;
+        const iy = st.imageY ?? 0;
+        const iw = st.imageW ?? canvasWidth;
+        const ih = st.imageH ?? canvasHeight;
+        if (ix < minX) minX = ix;
+        if (iy < minY) minY = iy;
+        if (ix + iw > maxX) maxX = ix + iw;
+        if (iy + ih > maxY) maxY = iy + ih;
+      } else {
+        for (const p of st.points) {
+          if (p.x < minX) minX = p.x;
+          if (p.y < minY) minY = p.y;
+          if (p.x > maxX) maxX = p.x;
+          if (p.y > maxY) maxY = p.y;
+        }
       }
     }
     if (!isFinite(minX)) return;
@@ -319,7 +353,7 @@ export const CanvasStage: React.FC = () => {
     });
     setTransformSubMode('scale');
     setTransformActive(true);
-  }, [layers, activeLayerId, currentFrame, selectedStrokeIds]);
+  }, [layers, activeLayerId, currentFrame, selectedStrokeIds, canvasWidth, canvasHeight]);
 
   const commitTransform = useCallback(() => {
     if (!transformActive || !transformOrigBounds || !transformQuad) return;
@@ -802,14 +836,20 @@ export const CanvasStage: React.FC = () => {
       ctx.lineWidth = 1.2 / zoom;
       ctx.stroke();
 
-      // 4 Corner Handles
+      // 8 Handles (4 Corners + 4 Edge Midpoints)
       const hs = 9 / zoom;
-      for (const corner of [tl, tr, br, bl]) {
+      const edgeMids = [
+        { x: (tl.x + tr.x) / 2, y: (tl.y + tr.y) / 2 },
+        { x: (tr.x + br.x) / 2, y: (tr.y + br.y) / 2 },
+        { x: (br.x + bl.x) / 2, y: (br.y + bl.y) / 2 },
+        { x: (bl.x + tl.x) / 2, y: (bl.y + tl.y) / 2 }
+      ];
+      for (const hPt of [tl, tr, br, bl, ...edgeMids]) {
         ctx.fillStyle = transformSubMode === 'perspective' ? '#f59e0b' : '#ffffff';
         ctx.strokeStyle = '#1d4ed8';
         ctx.lineWidth = 1.5 / zoom;
-        ctx.fillRect(corner.x - hs / 2, corner.y - hs / 2, hs, hs);
-        ctx.strokeRect(corner.x - hs / 2, corner.y - hs / 2, hs, hs);
+        ctx.fillRect(hPt.x - hs / 2, hPt.y - hs / 2, hs, hs);
+        ctx.strokeRect(hPt.x - hs / 2, hPt.y - hs / 2, hs, hs);
       }
       ctx.restore();
     }
@@ -1018,11 +1058,20 @@ export const CanvasStage: React.FC = () => {
       const rotY = (tl.y + tr.y) / 2 - 28 / zoom;
 
       let hit: TransformHandle | null = null;
+      const tMid = { x: (tl.x + tr.x) / 2, y: (tl.y + tr.y) / 2 };
+      const rMid = { x: (tr.x + br.x) / 2, y: (tr.y + br.y) / 2 };
+      const bMid = { x: (br.x + bl.x) / 2, y: (br.y + bl.y) / 2 };
+      const lMid = { x: (bl.x + tl.x) / 2, y: (bl.y + tl.y) / 2 };
+
       if (Math.hypot(pt.x - rotX, pt.y - rotY) <= tol) hit = 'rot';
       else if (Math.hypot(pt.x - tl.x, pt.y - tl.y) <= tol) hit = 'tl';
       else if (Math.hypot(pt.x - tr.x, pt.y - tr.y) <= tol) hit = 'tr';
       else if (Math.hypot(pt.x - br.x, pt.y - br.y) <= tol) hit = 'br';
       else if (Math.hypot(pt.x - bl.x, pt.y - bl.y) <= tol) hit = 'bl';
+      else if (Math.hypot(pt.x - tMid.x, pt.y - tMid.y) <= tol) hit = 't';
+      else if (Math.hypot(pt.x - rMid.x, pt.y - rMid.y) <= tol) hit = 'r';
+      else if (Math.hypot(pt.x - bMid.x, pt.y - bMid.y) <= tol) hit = 'b';
+      else if (Math.hypot(pt.x - lMid.x, pt.y - lMid.y) <= tol) hit = 'l';
       else if (isPointInPolygon(pt, [tl, tr, br, bl])) hit = 'move';
 
       if (hit) {
@@ -1229,12 +1278,12 @@ export const CanvasStage: React.FC = () => {
         q.tr = rotPt(q.tr);
         q.br = rotPt(q.br);
         q.bl = rotPt(q.bl);
-      } else if (transformSubMode === 'perspective') {
+      } else if (transformSubMode === 'perspective' && (activeTransformHandle === 'tl' || activeTransformHandle === 'tr' || activeTransformHandle === 'br' || activeTransformHandle === 'bl')) {
         // Free 4-corner perspective warp!
         q[activeTransformHandle].x += dx;
         q[activeTransformHandle].y += dy;
       } else {
-        // Rectangular scale
+        // Rectangular scale (4 corners + 4 edges)
         if (activeTransformHandle === 'tl') {
           q.tl.x += dx; q.tl.y += dy;
           q.tr.y += dy; q.bl.x += dx;
@@ -1247,6 +1296,14 @@ export const CanvasStage: React.FC = () => {
         } else if (activeTransformHandle === 'bl') {
           q.bl.x += dx; q.bl.y += dy;
           q.br.y += dy; q.tl.x += dx;
+        } else if (activeTransformHandle === 't') {
+          q.tl.y += dy; q.tr.y += dy;
+        } else if (activeTransformHandle === 'b') {
+          q.bl.y += dy; q.br.y += dy;
+        } else if (activeTransformHandle === 'l') {
+          q.tl.x += dx; q.bl.x += dx;
+        } else if (activeTransformHandle === 'r') {
+          q.tr.x += dx; q.br.x += dx;
         }
       }
       setTransformQuad(q);

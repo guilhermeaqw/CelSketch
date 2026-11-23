@@ -11,6 +11,7 @@ import {
   FileImage
 } from 'lucide-react';
 import { useHarmonyStore } from '../store/useHarmonyStore';
+import { renderFrameToCanvas } from '../utils/canvasRenderer';
 
 const RECENT_KEY = 'celsketch_recent_projects';
 const THUMBS_KEY = 'celsketch_recent_thumbs';
@@ -53,7 +54,52 @@ const PRESETS = [
 export const WelcomeScreen: React.FC = () => {
   const { createNewScene, loadProjectData, setShowWelcome } = useHarmonyStore();
   const [recentProjects, setRecentProjects] = useState<string[]>(() => loadRecentPaths());
-  const [recentThumbs] = useState<Record<string, string>>(() => loadRecentThumbs());
+  const [recentThumbs, setRecentThumbs] = useState<Record<string, string>>(() => loadRecentThumbs());
+
+  // Auto-generate real thumbnails for any recent .celsketch project missing a cached preview
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!window.harmonyAPI) return;
+      const currentThumbs = loadRecentThumbs();
+      let changed = false;
+      for (const fp of recentProjects) {
+        if (currentThumbs[fp]) continue;
+        try {
+          const res = await window.harmonyAPI.openProjectByPath(fp);
+          if (!res.canceled && res.content) {
+            const parsed = JSON.parse(res.content);
+            if (parsed.layers && parsed.width && parsed.height) {
+              const src = document.createElement('canvas');
+              renderFrameToCanvas(src, parsed.layers, 1, parsed.width, parsed.height, '#ffffff');
+              const thumb = document.createElement('canvas');
+              thumb.width = 240;
+              thumb.height = Math.round((240 * parsed.height) / parsed.width) || 135;
+              const tctx = thumb.getContext('2d');
+              if (tctx) {
+                tctx.drawImage(src, 0, 0, thumb.width, thumb.height);
+                currentThumbs[fp] = thumb.toDataURL('image/jpeg', 0.8);
+                changed = true;
+              }
+            }
+          }
+        } catch {
+          // skip unreadable files
+        }
+      }
+      if (changed && !cancelled) {
+        try {
+          localStorage.setItem(THUMBS_KEY, JSON.stringify(currentThumbs));
+        } catch {
+          // ignore
+        }
+        setRecentThumbs({ ...currentThumbs });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [recentProjects]);
   const [showNewModal, setShowNewModal] = useState(false);
   const [showShortcuts, setShowShortcuts] = useState(false);
   const [sceneName, setSceneName] = useState('Cena_01');
