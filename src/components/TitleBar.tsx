@@ -82,6 +82,8 @@ export const TitleBar: React.FC = () => {
     brushSmoothing,
     autoSaveEnabled,
     autoSaveIntervalSec,
+    timelapseRecording,
+    timelapseFrames,
     undoStack,
     redoStack,
     undo,
@@ -89,6 +91,7 @@ export const TitleBar: React.FC = () => {
     setBrushSmoothing,
     setAutoSaveEnabled,
     setAutoSaveIntervalSec,
+    toggleTimelapseRecording,
     setPerspectiveMode,
     resetRotation,
     toggleGrid,
@@ -126,6 +129,51 @@ export const TitleBar: React.FC = () => {
     if (window.confirm('Deseja realmente criar uma nova cena? Alterações não salvas na cena atual serão perdidas.')) {
       newProject();
     }
+  };
+
+  const handleExportTimelapse = async () => {
+    if (!window.harmonyAPI || timelapseFrames.length === 0) return;
+    const firstImg = new Image();
+    firstImg.src = timelapseFrames[0];
+    await new Promise((r) => { firstImg.onload = r; });
+    const canvas = document.createElement('canvas');
+    canvas.width = firstImg.naturalWidth || 960;
+    canvas.height = firstImg.naturalHeight || 540;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const mp4Supported = MediaRecorder.isTypeSupported('video/mp4;codecs=avc1.42E01E') || MediaRecorder.isTypeSupported('video/mp4');
+    const mimeType = MediaRecorder.isTypeSupported('video/mp4;codecs=avc1.42E01E')
+      ? 'video/mp4;codecs=avc1.42E01E'
+      : MediaRecorder.isTypeSupported('video/mp4')
+      ? 'video/mp4'
+      : 'video/webm;codecs=vp9';
+    const ext = mp4Supported ? 'mp4' : 'webm';
+    const stream = canvas.captureStream(15);
+    const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 6_000_000 });
+    const chunks: Blob[] = [];
+    recorder.ondataavailable = (ev) => { if (ev.data.size > 0) chunks.push(ev.data); };
+    const done = new Promise<Blob>((resolve) => {
+      recorder.onstop = () => resolve(new Blob(chunks, { type: mimeType }));
+    });
+    recorder.start();
+    for (const url of timelapseFrames) {
+      const img = new Image();
+      img.src = url;
+      await new Promise((r) => { img.onload = r; img.onerror = r; });
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      await new Promise((r) => setTimeout(r, 66));
+    }
+    recorder.stop();
+    const blob = await done;
+    const buf = await blob.arrayBuffer();
+    await window.harmonyAPI.saveBinaryFile(
+      `${projectName}_timelapse.${ext}`,
+      mp4Supported ? 'MP4 Timelapse' : 'WebM Timelapse',
+      [ext],
+      new Uint8Array(buf)
+    );
   };
 
   const handleSave = async () => {
@@ -497,6 +545,27 @@ export const TitleBar: React.FC = () => {
           title="Intervalo do Auto-Save em segundos"
         />
         <span style={{ fontSize: 10.5, color: '#888' }}>s</span>
+
+        <div className="tb-sep" />
+
+        {/* Timelapse Recording (Process Recorder) */}
+        <button
+          className={`icon-btn ${timelapseRecording ? 'active' : ''}`}
+          onClick={toggleTimelapseRecording}
+          style={timelapseRecording ? { background: '#b91c1c', borderColor: '#ef4444', color: '#fff' } : undefined}
+          title="Gravar Timelapse do processo de desenho"
+        >
+          <span>{timelapseRecording ? '● REC' : '○ REC'}</span>
+        </button>
+        {timelapseFrames.length > 0 && (
+          <button
+            className="icon-btn"
+            onClick={handleExportTimelapse}
+            title="Exportar vídeo do Timelapse gravado"
+          >
+            <span>Timelapse ({timelapseFrames.length})</span>
+          </button>
+        )}
       </div>
     </>
   );

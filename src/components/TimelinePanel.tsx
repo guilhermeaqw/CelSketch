@@ -51,6 +51,7 @@ export const TimelinePanel: React.FC = () => {
     toggleLayerHold,
     setSelectedLayersOpacity,
     duplicateFrameToNext,
+    insertFrameAfterCurrent,
     clearCurrentFrame
   } = useHarmonyStore();
 
@@ -101,6 +102,14 @@ export const TimelinePanel: React.FC = () => {
             <Trash2 size={13} />
           </button>
           <div className="tb-sep" />
+          <button
+            className="icon-btn"
+            onClick={insertFrameAfterCurrent}
+            title="Inserir frame em branco à frente (empurra os seguintes para fazer In-Between)"
+          >
+            <Plus size={13} />
+            <span>+ In-Between</span>
+          </button>
           <button className="icon-btn" onClick={duplicateFrameToNext} title="Duplicate Frame to Next (F6)">
             <CopyPlus size={13} />
             <span>Dup Frame</span>

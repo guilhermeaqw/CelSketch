@@ -97,6 +97,10 @@ interface HarmonyState {
   bucketExpand: number;
   bucketBehind: boolean;
 
+  // Timelapse recording
+  timelapseRecording: boolean;
+  timelapseFrames: string[];
+
   // View state
   showWelcome: boolean;
   zoom: number;
@@ -214,8 +218,12 @@ interface HarmonyState {
   moveStrokes: (strokeIds: string[], dx: number, dy: number) => void;
   replaceStrokes: (updated: Stroke[]) => void;
   deleteStrokes: (strokeIds: string[]) => void;
+  toggleTimelapseRecording: () => void;
+  pushTimelapseFrame: (dataUrl: string) => void;
+  clearTimelapse: () => void;
   clearCurrentFrame: () => void;
   duplicateFrameToNext: () => void;
+  insertFrameAfterCurrent: () => void;
 
   // Undo/Redo
   undo: () => void;
@@ -323,6 +331,9 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
   bucketTolerance: 32,
   bucketExpand: 1,
   bucketBehind: true,
+
+  timelapseRecording: false,
+  timelapseFrames: [],
 
   showWelcome: true,
   zoom: 0.55,
@@ -956,6 +967,42 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
         undoStack: [...s.undoStack.slice(-39), snapshot],
         redoStack: [],
         layers
+      };
+    }),
+
+  toggleTimelapseRecording: () => set((s) => ({ timelapseRecording: !s.timelapseRecording })),
+  pushTimelapseFrame: (dataUrl) =>
+    set((s) => ({
+      timelapseFrames: [...s.timelapseFrames.slice(-1499), dataUrl]
+    })),
+  clearTimelapse: () => set({ timelapseFrames: [] }),
+
+  insertFrameAfterCurrent: () =>
+    set((s) => {
+      const insertAt = s.currentFrame + 1;
+      const snapshot = { layers: cloneLayers(s.layers) };
+      const layers = s.layers.map((l) => {
+        if (l.id !== s.activeLayerId) return l;
+        const shifted: Record<number, Stroke[]> = {};
+        for (const [fKey, strokes] of Object.entries(l.frames)) {
+          const fNum = Number(fKey);
+          if (fNum >= insertAt) {
+            shifted[fNum + 1] = strokes;
+          } else {
+            shifted[fNum] = strokes;
+          }
+        }
+        shifted[insertAt] = [];
+        return { ...l, frames: shifted };
+      });
+      const newTotal = Math.max(s.totalFrames, insertAt + 1);
+      return {
+        undoStack: [...s.undoStack.slice(-39), snapshot],
+        redoStack: [],
+        layers,
+        totalFrames: newTotal,
+        playEnd: Math.max(s.playEnd, insertAt),
+        currentFrame: insertAt
       };
     }),
 

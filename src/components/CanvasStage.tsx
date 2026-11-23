@@ -1,7 +1,7 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
 import { useHarmonyStore } from '../store/useHarmonyStore';
 import { ArtLayerId, Point, Stroke } from '../types/harmony';
-import { renderStroke, getEffectiveFrameStrokes, performFloodFill } from '../utils/canvasRenderer';
+import { renderStroke, getEffectiveFrameStrokes, performFloodFill, renderFrameToCanvas } from '../utils/canvasRenderer';
 
 const ART_LAYERS: { id: ArtLayerId; label: string }[] = [
   { id: 'OL', label: 'Overlay Art' },
@@ -129,8 +129,29 @@ export const CanvasStage: React.FC = () => {
     addStroke,
     moveStrokes,
     replaceStrokes,
-    deleteStrokes
+    deleteStrokes,
+    timelapseRecording,
+    pushTimelapseFrame
   } = useHarmonyStore();
+
+  // Capture a lightweight timelapse snapshot whenever a stroke is committed while recording
+  const captureTimelapseStep = useCallback(() => {
+    if (!timelapseRecording) return;
+    window.setTimeout(() => {
+      const s = useHarmonyStore.getState();
+      const src = document.createElement('canvas');
+      renderFrameToCanvas(src, s.layers, s.currentFrame, s.canvasWidth, s.canvasHeight, '#ffffff');
+      const snap = document.createElement('canvas');
+      const scale = Math.min(1, 960 / s.canvasWidth);
+      snap.width = Math.round(s.canvasWidth * scale);
+      snap.height = Math.round(s.canvasHeight * scale);
+      const sctx = snap.getContext('2d');
+      if (sctx) {
+        sctx.drawImage(src, 0, 0, snap.width, snap.height);
+        pushTimelapseFrame(snap.toDataURL('image/jpeg', 0.8));
+      }
+    }, 20);
+  }, [timelapseRecording, pushTimelapseFrame]);
 
   // Repaint immediately whenever a flood-fill or imported image finishes decoding
   useEffect(() => {
@@ -1445,6 +1466,20 @@ export const CanvasStage: React.FC = () => {
           points: [prev.points[0], lastPt]
         };
       } else if (prev.tool !== 'fill') {
+        // Hold Shift while drawing -> lock perfectly straight Horizontal or Vertical line!
+        if (e.shiftKey && prev.points.length > 0) {
+          const origin = prev.points[0];
+          const adx = Math.abs(lastPt.x - origin.x);
+          const ady = Math.abs(lastPt.y - origin.y);
+          const lockedPt: Point =
+            adx >= ady
+              ? { x: lastPt.x, y: origin.y, pressure: lastPt.pressure }
+              : { x: origin.x, y: lastPt.y, pressure: lastPt.pressure };
+          return {
+            ...prev,
+            points: [origin, lockedPt]
+          };
+        }
         if (brushSmoothing <= 0) {
           return {
             ...prev,
@@ -1523,6 +1558,7 @@ export const CanvasStage: React.FC = () => {
         pushRecentColor(draftStroke.color);
       }
       addStroke(draftStroke);
+      captureTimelapseStep();
       setDraftStroke(null);
       setStabilizerCursor(null);
       setIsDrawing(false);
