@@ -84,6 +84,7 @@ interface HarmonyState {
   flipX: boolean;
   grayscaleMode: boolean;
   hsvModalOpen: boolean;
+  hsvPreview: { h: number; s: number; v: number; allFrames: boolean } | null;
   exportModalOpen: boolean;
   cropMode: boolean;
   showGrid: boolean;
@@ -103,6 +104,7 @@ interface HarmonyState {
   // Layers
   layers: DrawingLayer[];
   activeLayerId: string;
+  selectedLayerIds: string[];
 
   // Undo/Redo
   undoStack: HistorySnapshot[];
@@ -133,10 +135,11 @@ interface HarmonyState {
   toggleFlipX: () => void;
   toggleGrayscaleMode: () => void;
   setHsvModalOpen: (open: boolean) => void;
+  setHsvPreview: (preview: { h: number; s: number; v: number; allFrames: boolean } | null) => void;
   setExportModalOpen: (open: boolean) => void;
   setCropMode: (open: boolean) => void;
   resizeCanvas: (offsetX: number, offsetY: number, newWidth: number, newHeight: number) => void;
-  applyLayerHsv: (hDelta: number, sDelta: number, vDelta: number) => void;
+  applyLayerHsv: (hDelta: number, sDelta: number, vDelta: number, allFrames: boolean) => void;
   resetView: () => void;
   toggleGrid: () => void;
   setPerspectiveMode: (mode: 0 | 1 | 2 | 3 | 4) => void;
@@ -169,11 +172,15 @@ interface HarmonyState {
   importImageLayer: (name: string, dataUrl: string, x: number, y: number, w: number, h: number, opacity?: number) => void;
   deleteLayer: (id: string) => void;
   setActiveLayer: (id: string) => void;
+  toggleSelectLayer: (id: string, multi: boolean) => void;
+  reorderLayer: (fromIndex: number, toIndex: number) => void;
+  setLayerBlendMode: (id: string, blendMode: GlobalCompositeOperation) => void;
   toggleLayerVisibility: (id: string) => void;
   toggleLayerLock: (id: string) => void;
   toggleLayerHold: (id: string) => void;
   renameLayer: (id: string, name: string) => void;
   setLayerOpacity: (id: string, opacity: number) => void;
+  setSelectedLayersOpacity: (opacity: number) => void;
   updateNodePosition: (id: string, x: number, y: number) => void;
 
   addStroke: (stroke: Stroke, insertAtBottom?: boolean) => void;
@@ -282,7 +289,7 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
   brushOpacity: 1,
   brushSmoothing: 35,
   shapeFilled: false,
-  bucketReference: 'all',
+  bucketReference: 'active',
   bucketTolerance: 32,
   bucketExpand: 1,
   bucketBehind: true,
@@ -295,6 +302,7 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
   flipX: false,
   grayscaleMode: false,
   hsvModalOpen: false,
+  hsvPreview: null,
   exportModalOpen: false,
   cropMode: false,
   showGrid: true,
@@ -312,6 +320,7 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
 
   layers: createDefaultLayers(),
   activeLayerId: 'layer-1',
+  selectedLayerIds: ['layer-1'],
 
   undoStack: [],
   redoStack: [],
@@ -380,7 +389,8 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
   resetRotation: () => set({ rotation: 0 }),
   toggleFlipX: () => set((s) => ({ flipX: !s.flipX })),
   toggleGrayscaleMode: () => set((s) => ({ grayscaleMode: !s.grayscaleMode })),
-  setHsvModalOpen: (hsvModalOpen) => set({ hsvModalOpen }),
+  setHsvModalOpen: (hsvModalOpen) => set((s) => ({ hsvModalOpen, hsvPreview: hsvModalOpen ? s.hsvPreview : null })),
+  setHsvPreview: (hsvPreview) => set({ hsvPreview }),
   setExportModalOpen: (exportModalOpen) => set({ exportModalOpen }),
   setCropMode: (cropMode) => set({ cropMode }),
   resizeCanvas: (offsetX, offsetY, newWidth, newHeight) =>
@@ -411,25 +421,31 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
         cropMode: false
       };
     }),
-  applyLayerHsv: (hDelta, sDelta, vDelta) =>
+  applyLayerHsv: (hDelta, sDelta, vDelta, allFrames) =>
     set((s) => {
-      if (hDelta === 0 && sDelta === 0 && vDelta === 0) return s;
+      if (hDelta === 0 && sDelta === 0 && vDelta === 0) return { hsvPreview: null };
       const snapshot = { layers: cloneLayers(s.layers) };
       const layers = s.layers.map((l) => {
         if (l.id !== s.activeLayerId) return l;
         const updatedFrames: Record<number, Stroke[]> = {};
         for (const [fKey, strokes] of Object.entries(l.frames)) {
-          updatedFrames[Number(fKey)] = strokes.map((st) => ({
-            ...st,
-            color: adjustHexHsv(st.color, hDelta, sDelta, vDelta)
-          }));
+          const fNum = Number(fKey);
+          if (allFrames || fNum === s.currentFrame) {
+            updatedFrames[fNum] = strokes.map((st) => ({
+              ...st,
+              color: adjustHexHsv(st.color, hDelta, sDelta, vDelta)
+            }));
+          } else {
+            updatedFrames[fNum] = strokes;
+          }
         }
         return { ...l, frames: updatedFrames };
       });
       return {
         undoStack: [...s.undoStack.slice(-39), snapshot],
         redoStack: [],
-        layers
+        layers,
+        hsvPreview: null
       };
     }),
   resetView: () => set({ zoom: 0.55, panX: 0, panY: 0, rotation: 0, flipX: false }),
@@ -597,7 +613,34 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
       };
     }),
 
-  setActiveLayer: (activeLayerId) => set({ activeLayerId }),
+  setActiveLayer: (activeLayerId) => set({ activeLayerId, selectedLayerIds: [activeLayerId] }),
+  toggleSelectLayer: (id, multi) =>
+    set((s) => {
+      if (!multi) {
+        return { activeLayerId: id, selectedLayerIds: [id] };
+      }
+      const exists = s.selectedLayerIds.includes(id);
+      const next = exists
+        ? s.selectedLayerIds.length > 1
+          ? s.selectedLayerIds.filter((x) => x !== id)
+          : s.selectedLayerIds
+        : [...s.selectedLayerIds, id];
+      return { activeLayerId: id, selectedLayerIds: next };
+    }),
+  reorderLayer: (fromIndex, toIndex) =>
+    set((s) => {
+      if (fromIndex === toIndex || fromIndex < 0 || toIndex < 0 || fromIndex >= s.layers.length || toIndex >= s.layers.length) {
+        return s;
+      }
+      const next = [...s.layers];
+      const [moved] = next.splice(fromIndex, 1);
+      next.splice(toIndex, 0, moved);
+      return { layers: next };
+    }),
+  setLayerBlendMode: (id, blendMode) =>
+    set((s) => ({
+      layers: s.layers.map((l) => (l.id === id ? { ...l, blendMode } : l))
+    })),
   toggleLayerVisibility: (id) =>
     set((s) => ({
       layers: s.layers.map((l) => (l.id === id ? { ...l, visible: !l.visible } : l))
@@ -618,6 +661,13 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
     set((s) => ({
       layers: s.layers.map((l) => (l.id === id ? { ...l, opacity } : l))
     })),
+  setSelectedLayersOpacity: (opacity) =>
+    set((s) => {
+      const targetSet = new Set(s.selectedLayerIds.length > 0 ? s.selectedLayerIds : [s.activeLayerId]);
+      return {
+        layers: s.layers.map((l) => (targetSet.has(l.id) ? { ...l, opacity } : l))
+      };
+    }),
   updateNodePosition: (id, nodeX, nodeY) =>
     set((s) => ({
       layers: s.layers.map((l) => (l.id === id ? { ...l, nodeX, nodeY } : l))

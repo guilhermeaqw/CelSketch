@@ -1,4 +1,4 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Play,
   Pause,
@@ -19,9 +19,11 @@ import { useHarmonyStore } from '../store/useHarmonyStore';
 import { getEffectiveFrameStrokes } from '../utils/canvasRenderer';
 
 export const TimelinePanel: React.FC = () => {
+  const [dragLayerIdx, setDragLayerIdx] = useState<number | null>(null);
   const {
     layers,
     activeLayerId,
+    selectedLayerIds,
     currentFrame,
     totalFrames,
     playStart,
@@ -41,10 +43,13 @@ export const TimelinePanel: React.FC = () => {
     addLayer,
     deleteLayer,
     setActiveLayer,
+    toggleSelectLayer,
+    reorderLayer,
+    setLayerBlendMode,
     toggleLayerVisibility,
     toggleLayerLock,
     toggleLayerHold,
-    setLayerOpacity,
+    setSelectedLayersOpacity,
     duplicateFrameToNext,
     clearCurrentFrame
   } = useHarmonyStore();
@@ -129,21 +134,48 @@ export const TimelinePanel: React.FC = () => {
           </button>
         </div>
 
-        {/* Right: Layer Opacity + Play Range (In/Out) + Total Frames + FPS */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 11 }}>
+        {/* Right: Blend Mode + Multi-Layer Opacity + Play Range (In/Out) + Total Frames + FPS */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11 }}>
           {activeLayer && (
-            <label style={{ display: 'flex', alignItems: 'center', gap: 4 }} title="Active Layer Opacity">
-              Opacity:
-              <input
-                type="range"
-                min={0}
-                max={100}
-                value={Math.round(activeLayer.opacity * 100)}
-                onChange={(e) => setLayerOpacity(activeLayer.id, Number(e.target.value) / 100)}
-                style={{ width: 64, accentColor: '#3a86ff' }}
-              />
-              <span style={{ width: 28, color: '#bbb' }}>{Math.round(activeLayer.opacity * 100)}%</span>
-            </label>
+            <>
+              <select
+                value={activeLayer.blendMode || 'source-over'}
+                onChange={(e) =>
+                  setLayerBlendMode(activeLayer.id, e.target.value as GlobalCompositeOperation)
+                }
+                className="harmony-input"
+                title="Modo de Mesclagem da Layer (Blend Mode)"
+                style={{ width: 92, padding: '2px 4px' }}
+              >
+                <option value="source-over">Normal</option>
+                <option value="multiply">Multiply</option>
+                <option value="screen">Screen</option>
+                <option value="overlay">Overlay</option>
+                <option value="darken">Darken</option>
+                <option value="lighten">Lighten</option>
+                <option value="color-dodge">Color Dodge</option>
+                <option value="color-burn">Color Burn</option>
+                <option value="hard-light">Hard Light</option>
+                <option value="soft-light">Soft Light</option>
+                <option value="difference">Difference</option>
+              </select>
+
+              <label
+                style={{ display: 'flex', alignItems: 'center', gap: 4 }}
+                title={`Opacidade (${selectedLayerIds.length > 1 ? `${selectedLayerIds.length} layers selecionadas` : activeLayer.name})`}
+              >
+                Opac{selectedLayerIds.length > 1 ? ` (${selectedLayerIds.length})` : ''}:
+                <input
+                  type="range"
+                  min={0}
+                  max={100}
+                  value={Math.round(activeLayer.opacity * 100)}
+                  onChange={(e) => setSelectedLayersOpacity(Number(e.target.value) / 100)}
+                  style={{ width: 60, accentColor: '#3a86ff' }}
+                />
+                <span style={{ width: 28, color: '#bbb' }}>{Math.round(activeLayer.opacity * 100)}%</span>
+              </label>
+            </>
           )}
           <div className="tb-sep" />
           <label style={{ display: 'flex', alignItems: 'center', gap: 3 }} title="Playback Start Frame">
@@ -226,21 +258,33 @@ export const TimelinePanel: React.FC = () => {
             Layers ({layers.length})
           </div>
 
-          {layers.map((layer) => {
+          {layers.map((layer, index) => {
             const isActive = layer.id === activeLayerId;
+            const isSelected = selectedLayerIds.includes(layer.id);
             return (
               <div
                 key={layer.id}
-                onClick={() => setActiveLayer(layer.id)}
+                draggable
+                onDragStart={() => setDragLayerIdx(index)}
+                onDragOver={(e) => e.preventDefault()}
+                onDrop={() => {
+                  if (dragLayerIdx !== null && dragLayerIdx !== index) {
+                    reorderLayer(dragLayerIdx, index);
+                  }
+                  setDragLayerIdx(null);
+                }}
+                onDragEnd={() => setDragLayerIdx(null)}
+                onClick={(e) => toggleSelectLayer(layer.id, e.ctrlKey || e.metaKey || e.shiftKey)}
+                title="Arraste para reordenar • Ctrl+Clique para selecionar várias layers"
                 style={{
                   height: 26,
                   display: 'flex',
                   alignItems: 'center',
                   padding: '0 6px',
                   gap: 6,
-                  background: isActive ? '#2d4b75' : 'transparent',
+                  background: isActive ? '#2d4b75' : isSelected ? '#263b59' : 'transparent',
                   borderBottom: '1px solid #1f1f1f',
-                  cursor: 'pointer'
+                  cursor: 'grab'
                 }}
               >
                 <button

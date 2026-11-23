@@ -355,6 +355,7 @@ export function renderFrameToCanvas(
 
     ctx.save();
     ctx.globalAlpha = layer.opacity;
+    ctx.globalCompositeOperation = layer.blendMode || 'source-over';
     ctx.drawImage(layerCanvas, 0, 0);
     ctx.restore();
   }

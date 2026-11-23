@@ -107,6 +107,7 @@ export const CanvasStage: React.FC = () => {
     rotation,
     flipX,
     grayscaleMode,
+    hsvPreview,
     cropMode,
     showGrid,
     perspectiveMode,
@@ -609,6 +610,12 @@ export const CanvasStage: React.FC = () => {
         ctx.save();
         const lightTableDim = lightTable && !isCurrent ? 0.3 : 1;
         ctx.globalAlpha = layer.opacity * lightTableDim;
+        ctx.globalCompositeOperation = layer.blendMode || 'source-over';
+        if (isCurrent && hsvPreview) {
+          const satPct = Math.max(0, 100 + hsvPreview.s);
+          const briPct = Math.max(0, 100 + hsvPreview.v);
+          ctx.filter = `hue-rotate(${hsvPreview.h}deg) saturate(${satPct}%) brightness(${briPct}%)`;
+        }
         ctx.drawImage(layerBuffer, 0, 0);
         ctx.restore();
       }
@@ -914,7 +921,8 @@ export const CanvasStage: React.FC = () => {
     mapStrokesToQuad,
     imageTick,
     perspectiveMode,
-    vanishingPoints
+    vanishingPoints,
+    hsvPreview
   ]);
 
   const getPointFromEvent = useCallback(

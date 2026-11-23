@@ -72,6 +72,7 @@ export interface DrawingLayer {
   solo: boolean;
   holdFrames?: boolean;
   opacity: number;
+  blendMode?: GlobalCompositeOperation;
   tagColor: string;
   // Map of frame number (1-based) to array of strokes
   frames: Record<number, Stroke[]>;
