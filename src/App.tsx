@@ -1,9 +1,8 @@
 import React, { useEffect } from 'react';
-import { Camera, PenTool, Network } from 'lucide-react';
+import { Plus, X } from 'lucide-react';
 import { TitleBar } from './components/TitleBar';
 import { ToolsBar } from './components/ToolsBar';
 import { CanvasStage } from './components/CanvasStage';
-import { NodeView } from './components/NodeView';
 import { RightPanel } from './components/RightPanel';
 import { TimelinePanel } from './components/TimelinePanel';
 import { DockablePanel } from './components/DockablePanel';
@@ -15,8 +14,11 @@ import { useHarmonyStore } from './store/useHarmonyStore';
 export const App: React.FC = () => {
   const {
     showWelcome,
-    centerTab,
-    setCenterTab,
+    openScenes,
+    activeSceneId,
+    switchSceneTab,
+    closeSceneTab,
+    addBlankSceneTab,
     activeTool,
     activeLayerId,
     layers,
@@ -206,31 +208,57 @@ export const App: React.FC = () => {
         </DockablePanel>
 
         <div className="center-pane">
-          <div className="panel-tabs">
+          <div className="panel-tabs" style={{ overflowX: 'auto' }}>
+            {openScenes.map((scene) => {
+              const isActive = scene.id === activeSceneId;
+              return (
+                <div
+                  key={scene.id}
+                  onClick={() => switchSceneTab(scene.id)}
+                  className={`panel-tab ${isActive ? 'active' : ''}`}
+                  style={{ gap: 8, paddingRight: 6 }}
+                >
+                  <span>{scene.name}.celsketch</span>
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      closeSceneTab(scene.id);
+                    }}
+                    title="Fechar cena"
+                    style={{
+                      background: 'none',
+                      border: 'none',
+                      color: isActive ? '#ddd' : '#888',
+                      cursor: 'pointer',
+                      display: 'flex',
+                      alignItems: 'center',
+                      padding: 1
+                    }}
+                  >
+                    <X size={11} />
+                  </button>
+                </div>
+              );
+            })}
             <button
-              className={`panel-tab ${centerTab === 'camera' ? 'active' : ''}`}
-              onClick={() => setCenterTab('camera')}
+              onClick={addBlankSceneTab}
+              title="Nova cena em nova aba"
+              style={{
+                background: 'transparent',
+                border: 'none',
+                color: '#aaa',
+                cursor: 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                padding: '0 8px',
+                height: 23
+              }}
             >
-              <Camera size={12} />
-              Camera
-            </button>
-            <button
-              className={`panel-tab ${centerTab === 'drawing' ? 'active' : ''}`}
-              onClick={() => setCenterTab('drawing')}
-            >
-              <PenTool size={12} />
-              Drawing
-            </button>
-            <button
-              className={`panel-tab ${centerTab === 'node' ? 'active' : ''}`}
-              onClick={() => setCenterTab('node')}
-            >
-              <Network size={12} />
-              Node View
+              <Plus size={13} />
             </button>
           </div>
 
-          {centerTab === 'node' ? <NodeView /> : <CanvasStage />}
+          <CanvasStage />
         </div>
 
         <DockablePanel

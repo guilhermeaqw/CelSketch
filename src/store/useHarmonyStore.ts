@@ -42,7 +42,29 @@ interface HistorySnapshot {
   layers: DrawingLayer[];
 }
 
+export interface SceneTab {
+  id: string;
+  name: string;
+  path: string | null;
+  width: number;
+  height: number;
+  fps: number;
+  totalFrames: number;
+  playStart: number;
+  playEnd: number;
+  currentFrame: number;
+  layers: DrawingLayer[];
+  activeLayerId: string;
+  selectedLayerIds: string[];
+  swatches: ColourSwatch[];
+  activeSwatchId: string;
+}
+
 interface HarmonyState {
+  // Multi-scene tabs
+  openScenes: SceneTab[];
+  activeSceneId: string;
+
   // Project info
   projectName: string;
   projectPath: string | null;
@@ -131,6 +153,9 @@ interface HarmonyState {
   setZoom: (zoom: number) => void;
   setShowWelcome: (show: boolean) => void;
   createNewScene: (name: string, width: number, height: number, fps: number) => void;
+  switchSceneTab: (id: string) => void;
+  closeSceneTab: (id: string) => void;
+  addBlankSceneTab: () => void;
   setPan: (x: number, y: number) => void;
   setRotation: (deg: number) => void;
   resetRotation: () => void;
@@ -266,6 +291,9 @@ const cloneLayers = (layers: DrawingLayer[]): DrawingLayer[] =>
   JSON.parse(JSON.stringify(layers));
 
 export const useHarmonyStore = create<HarmonyState>((set, get) => ({
+  openScenes: [],
+  activeSceneId: '',
+
   projectName: 'Untitled_Scene',
   projectPath: null,
   autoSaveEnabled: true,
@@ -373,26 +401,168 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
   setZoom: (zoom) => set({ zoom: Math.max(0.1, Math.min(8, zoom)) }),
   setShowWelcome: (showWelcome) => set({ showWelcome }),
   createNewScene: (name, width, height, fps) =>
-    set({
-      projectName: name.trim() || 'Untitled_Scene',
-      projectPath: null,
-      canvasWidth: Math.max(64, Math.min(8192, Math.round(width))),
-      canvasHeight: Math.max(64, Math.min(8192, Math.round(height))),
-      fps: Math.max(1, Math.min(120, Math.round(fps))),
-      currentFrame: 1,
-      playStart: 1,
-      playEnd: 60,
-      totalFrames: 60,
-      isPlaying: false,
-      swatches: DEFAULT_SWATCHES,
-      activeSwatchId: 'sw-black',
-      activeColor: '#141414',
-      layers: createDefaultLayers(),
-      activeLayerId: 'layer-1',
-      undoStack: [],
-      redoStack: [],
-      showWelcome: false
+    set((s) => {
+      const id = `scene-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`;
+      const newLayers = createDefaultLayers();
+      const w = Math.max(64, Math.min(8192, Math.round(width)));
+      const h = Math.max(64, Math.min(8192, Math.round(height)));
+      const f = Math.max(1, Math.min(120, Math.round(fps)));
+      const sceneName = name.trim() || `Cena_${s.openScenes.length + 1}`;
+
+      // Save current active scene state back into openScenes before adding new one
+      const synced = s.openScenes.map((sc) =>
+        sc.id === s.activeSceneId
+          ? {
+              ...sc,
+              name: s.projectName,
+              path: s.projectPath,
+              width: s.canvasWidth,
+              height: s.canvasHeight,
+              fps: s.fps,
+              totalFrames: s.totalFrames,
+              playStart: s.playStart,
+              playEnd: s.playEnd,
+              currentFrame: s.currentFrame,
+              layers: s.layers,
+              activeLayerId: s.activeLayerId,
+              selectedLayerIds: s.selectedLayerIds,
+              swatches: s.swatches,
+              activeSwatchId: s.activeSwatchId
+            }
+          : sc
+      );
+
+      const newTab: SceneTab = {
+        id,
+        name: sceneName,
+        path: null,
+        width: w,
+        height: h,
+        fps: f,
+        totalFrames: 60,
+        playStart: 1,
+        playEnd: 60,
+        currentFrame: 1,
+        layers: newLayers,
+        activeLayerId: newLayers[0].id,
+        selectedLayerIds: [newLayers[0].id],
+        swatches: DEFAULT_SWATCHES,
+        activeSwatchId: 'sw-black'
+      };
+
+      return {
+        openScenes: [...synced, newTab],
+        activeSceneId: id,
+        projectName: sceneName,
+        projectPath: null,
+        canvasWidth: w,
+        canvasHeight: h,
+        fps: f,
+        currentFrame: 1,
+        playStart: 1,
+        playEnd: 60,
+        totalFrames: 60,
+        isPlaying: false,
+        swatches: DEFAULT_SWATCHES,
+        activeSwatchId: 'sw-black',
+        activeColor: '#141414',
+        layers: newLayers,
+        activeLayerId: newLayers[0].id,
+        selectedLayerIds: [newLayers[0].id],
+        undoStack: [],
+        redoStack: [],
+        showWelcome: false
+      };
     }),
+  switchSceneTab: (id) =>
+    set((s) => {
+      if (id === s.activeSceneId) return s;
+      const synced = s.openScenes.map((sc) =>
+        sc.id === s.activeSceneId
+          ? {
+              ...sc,
+              name: s.projectName,
+              path: s.projectPath,
+              width: s.canvasWidth,
+              height: s.canvasHeight,
+              fps: s.fps,
+              totalFrames: s.totalFrames,
+              playStart: s.playStart,
+              playEnd: s.playEnd,
+              currentFrame: s.currentFrame,
+              layers: s.layers,
+              activeLayerId: s.activeLayerId,
+              selectedLayerIds: s.selectedLayerIds,
+              swatches: s.swatches,
+              activeSwatchId: s.activeSwatchId
+            }
+          : sc
+      );
+      const target = synced.find((sc) => sc.id === id);
+      if (!target) return s;
+      return {
+        openScenes: synced,
+        activeSceneId: target.id,
+        projectName: target.name,
+        projectPath: target.path,
+        canvasWidth: target.width,
+        canvasHeight: target.height,
+        fps: target.fps,
+        totalFrames: target.totalFrames,
+        playStart: target.playStart,
+        playEnd: target.playEnd,
+        currentFrame: target.currentFrame,
+        layers: target.layers,
+        activeLayerId: target.activeLayerId,
+        selectedLayerIds: target.selectedLayerIds,
+        swatches: target.swatches,
+        activeSwatchId: target.activeSwatchId,
+        isPlaying: false,
+        undoStack: [],
+        redoStack: []
+      };
+    }),
+  closeSceneTab: (id) =>
+    set((s) => {
+      const remaining = s.openScenes.filter((sc) => sc.id !== id);
+      if (remaining.length === 0) {
+        return {
+          openScenes: [],
+          activeSceneId: '',
+          isPlaying: false,
+          showWelcome: true
+        };
+      }
+      if (id !== s.activeSceneId) {
+        return { openScenes: remaining };
+      }
+      const next = remaining[remaining.length - 1];
+      return {
+        openScenes: remaining,
+        activeSceneId: next.id,
+        projectName: next.name,
+        projectPath: next.path,
+        canvasWidth: next.width,
+        canvasHeight: next.height,
+        fps: next.fps,
+        totalFrames: next.totalFrames,
+        playStart: next.playStart,
+        playEnd: next.playEnd,
+        currentFrame: next.currentFrame,
+        layers: next.layers,
+        activeLayerId: next.activeLayerId,
+        selectedLayerIds: next.selectedLayerIds,
+        swatches: next.swatches,
+        activeSwatchId: next.activeSwatchId,
+        isPlaying: false,
+        undoStack: [],
+        redoStack: []
+      };
+    }),
+  addBlankSceneTab: () => {
+    const s = get();
+    s.createNewScene(`Cena_${s.openScenes.length + 1}`, s.canvasWidth, s.canvasHeight, s.fps);
+  },
   setPan: (panX, panY) => set({ panX, panY }),
   setRotation: (rotation) => set({ rotation: ((rotation % 360) + 360) % 360 }),
   resetRotation: () => set({ rotation: 0 }),
@@ -854,7 +1024,14 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
       };
     }),
 
-  setProjectMeta: (projectName, projectPath) => set({ projectName, projectPath }),
+  setProjectMeta: (projectName, projectPath) =>
+    set((s) => ({
+      projectName,
+      projectPath,
+      openScenes: s.openScenes.map((sc) =>
+        sc.id === s.activeSceneId ? { ...sc, name: projectName, path: projectPath } : sc
+      )
+    })),
   setAutoSaveEnabled: (autoSaveEnabled) => set({ autoSaveEnabled }),
   setAutoSaveIntervalSec: (sec) => set({ autoSaveIntervalSec: Math.max(5, Math.min(3600, Math.round(sec))) }),
   setLastAutoSaveTime: (lastAutoSaveTime) => set({ lastAutoSaveTime }),
@@ -874,20 +1051,97 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
   },
 
   loadProjectData: (data, filePath) =>
-    set({
-      projectName: data.name || 'Loaded_Scene',
-      projectPath: filePath,
-      canvasWidth: data.width || 1920,
-      canvasHeight: data.height || 1080,
-      fps: data.fps || 24,
-      totalFrames: data.totalFrames || 60,
-      currentFrame: 1,
-      swatches: data.swatches?.length ? data.swatches : DEFAULT_SWATCHES,
-      activeSwatchId: data.swatches?.[0]?.id || 'sw-black',
-      layers: data.layers?.length ? data.layers : createDefaultLayers(),
-      activeLayerId: data.layers?.[0]?.id || 'layer-1',
-      undoStack: [],
-      redoStack: []
+    set((s) => {
+      // If already open in a tab, just switch to it!
+      if (filePath) {
+        const existing = s.openScenes.find((sc) => sc.path === filePath);
+        if (existing) {
+          return {
+            activeSceneId: existing.id,
+            projectName: existing.name,
+            projectPath: existing.path,
+            canvasWidth: existing.width,
+            canvasHeight: existing.height,
+            fps: existing.fps,
+            totalFrames: existing.totalFrames,
+            playStart: existing.playStart,
+            playEnd: existing.playEnd,
+            currentFrame: existing.currentFrame,
+            layers: existing.layers,
+            activeLayerId: existing.activeLayerId,
+            selectedLayerIds: existing.selectedLayerIds,
+            swatches: existing.swatches,
+            activeSwatchId: existing.activeSwatchId,
+            showWelcome: false
+          };
+        }
+      }
+
+      const synced = s.openScenes.map((sc) =>
+        sc.id === s.activeSceneId
+          ? {
+              ...sc,
+              name: s.projectName,
+              path: s.projectPath,
+              width: s.canvasWidth,
+              height: s.canvasHeight,
+              fps: s.fps,
+              totalFrames: s.totalFrames,
+              playStart: s.playStart,
+              playEnd: s.playEnd,
+              currentFrame: s.currentFrame,
+              layers: s.layers,
+              activeLayerId: s.activeLayerId,
+              selectedLayerIds: s.selectedLayerIds,
+              swatches: s.swatches,
+              activeSwatchId: s.activeSwatchId
+            }
+          : sc
+      );
+
+      const id = `scene-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`;
+      const loadedLayers = data.layers?.length ? data.layers : createDefaultLayers();
+      const loadedSwatches = data.swatches?.length ? data.swatches : DEFAULT_SWATCHES;
+      const total = data.totalFrames || 60;
+      const newTab: SceneTab = {
+        id,
+        name: data.name || 'Loaded_Scene',
+        path: filePath,
+        width: data.width || 1920,
+        height: data.height || 1080,
+        fps: data.fps || 24,
+        totalFrames: total,
+        playStart: 1,
+        playEnd: total,
+        currentFrame: 1,
+        layers: loadedLayers,
+        activeLayerId: loadedLayers[0].id,
+        selectedLayerIds: [loadedLayers[0].id],
+        swatches: loadedSwatches,
+        activeSwatchId: loadedSwatches[0].id
+      };
+
+      return {
+        openScenes: [...synced, newTab],
+        activeSceneId: id,
+        projectName: newTab.name,
+        projectPath: filePath,
+        canvasWidth: newTab.width,
+        canvasHeight: newTab.height,
+        fps: newTab.fps,
+        totalFrames: total,
+        playStart: 1,
+        playEnd: total,
+        currentFrame: 1,
+        swatches: loadedSwatches,
+        activeSwatchId: loadedSwatches[0].id,
+        layers: loadedLayers,
+        activeLayerId: loadedLayers[0].id,
+        selectedLayerIds: [loadedLayers[0].id],
+        undoStack: [],
+        redoStack: [],
+        showWelcome: false
+      };
     }),
 
   newProject: () =>

@@ -141,11 +141,6 @@ export const CanvasStage: React.FC = () => {
 
   // Initialize crop rectangle whenever Crop Mode (C) opens
   useEffect(() => {
-    if (transformActive) {
-      setActiveTransformHandle(null);
-      setTransformDragStart(null);
-      return;
-    }
     if (cropMode) {
       setCropRect({ left: 0, top: 0, right: canvasWidth, bottom: canvasHeight });
       setActiveCropHandle(null);
@@ -893,11 +888,6 @@ export const CanvasStage: React.FC = () => {
     }
 
     // Canvas Crop / Resize Overlay (C key — Clip Studio style)
-    if (transformActive) {
-      setActiveTransformHandle(null);
-      setTransformDragStart(null);
-      return;
-    }
     if (cropMode) {
       ctx.save();
       const cw = cropRect.right - cropRect.left;
@@ -1100,11 +1090,6 @@ export const CanvasStage: React.FC = () => {
     }
 
     // Canvas Crop Mode pointer down
-    if (transformActive) {
-      setActiveTransformHandle(null);
-      setTransformDragStart(null);
-      return;
-    }
     if (cropMode) {
       const handle = hitTestCropHandle(pt);
       if (handle) {
@@ -1361,11 +1346,6 @@ export const CanvasStage: React.FC = () => {
     }
 
     // Canvas Crop Mode pointer move
-    if (transformActive) {
-      setActiveTransformHandle(null);
-      setTransformDragStart(null);
-      return;
-    }
     if (cropMode) {
       if (activeCropHandle && cropDragStart) {
         const dx = pt.x - cropDragStart.pt.x;
