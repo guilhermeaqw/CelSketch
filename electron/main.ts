@@ -2,6 +2,12 @@ import { app, BrowserWindow, ipcMain, dialog, Menu, shell } from 'electron';
 import * as path from 'path';
 import * as fs from 'fs';
 
+// Hardware acceleration flags (maximizes GPU PCs; Chromium safely falls back to software on no-GPU PCs)
+app.commandLine.appendSwitch('enable-gpu-rasterization');
+app.commandLine.appendSwitch('enable-zero-copy');
+app.commandLine.appendSwitch('enable-accelerated-2d-canvas');
+app.commandLine.appendSwitch('disable-renderer-backgrounding');
+
 let mainWindow: BrowserWindow | null = null;
 
 function createWindow() {
@@ -11,6 +17,7 @@ function createWindow() {
     minWidth: 1024,
     minHeight: 680,
     title: 'CelSketch',
+    icon: path.join(__dirname, '../dist/icon.png'),
     backgroundColor: '#232323',
     frame: false,
     titleBarStyle: 'hidden',
@@ -22,6 +29,7 @@ function createWindow() {
     }
   });
 
+  mainWindow.maximize();
   Menu.setApplicationMenu(null);
 
   const isDev = !app.isPackaged;
@@ -161,21 +169,23 @@ ipcMain.handle('file:exportPng', async (_event, { dataUrl, defaultName }: { data
   return { canceled: false, filePath: result.filePath };
 });
 
-// Pick directory for PNG Sequence
-ipcMain.handle('file:pickDirectory', async () => {
+// Pick directory for PNG Sequence or Auto-Rec Process Folder
+ipcMain.handle('file:pickDirectory', async (_event, title?: string) => {
   const result = await dialog.showOpenDialog(mainWindow!, {
-    title: 'Select Folder for PNG Sequence Export',
+    title: title || 'Selecionar Pasta',
     properties: ['openDirectory', 'createDirectory']
   });
   if (result.canceled || result.filePaths.length === 0) return { canceled: true };
   return { canceled: false, dirPath: result.filePaths[0] };
 });
 
-// Write a single frame PNG to a chosen directory (streams frame-by-frame)
+// Write a single frame PNG/JPG to a chosen directory (auto-creates scene subfolders!)
 ipcMain.handle('file:writeFrameToDir', async (_event, { dirPath, name, dataUrl }: { dirPath: string; name: string; dataUrl: string }) => {
-  const base64Data = dataUrl.replace(/^data:image\/png;base64,/, '');
-  fs.writeFileSync(path.join(dirPath, name), Buffer.from(base64Data, 'base64'));
-  return { ok: true };
+  const fullPath = path.join(dirPath, name);
+  fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+  const base64Data = dataUrl.replace(/^data:image\/[a-zA-Z0-9.+-]+;base64,/, '');
+  fs.writeFileSync(fullPath, Buffer.from(base64Data, 'base64'));
+  return { ok: true, fullPath };
 });
 
 // Save binary file (GIF / MP4 / WebM)

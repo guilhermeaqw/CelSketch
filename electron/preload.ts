@@ -17,7 +17,7 @@ contextBridge.exposeInMainWorld('harmonyAPI', {
   importAudio: () => ipcRenderer.invoke('file:importAudio'),
   exportPng: (dataUrl: string, defaultName: string) =>
     ipcRenderer.invoke('file:exportPng', { dataUrl, defaultName }),
-  pickDirectory: () => ipcRenderer.invoke('file:pickDirectory'),
+  pickDirectory: (title?: string) => ipcRenderer.invoke('file:pickDirectory', title),
   writeFrameToDir: (dirPath: string, name: string, dataUrl: string) =>
     ipcRenderer.invoke('file:writeFrameToDir', { dirPath, name, dataUrl }),
   saveBinaryFile: (defaultName: string, filterName: string, extensions: string[], bytes: Uint8Array) =>

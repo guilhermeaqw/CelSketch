@@ -33,6 +33,9 @@ export const App: React.FC = () => {
     lastAutoSaveTime,
     brushSize,
     setTool,
+    activateSelectionGroup,
+    activateShapeGroup,
+    swapColors,
     setZoom,
     resetView,
     setBrushSize,
@@ -118,6 +121,14 @@ export const App: React.FC = () => {
           if (!res.canceled && res.filePath) {
             const name = res.filePath.split(/[\\/]/).pop()?.replace(/\.(celsketch|nexo|hrm)$/i, '') || projectName;
             setProjectMeta(name, res.filePath);
+            try {
+              const raw = localStorage.getItem('celsketch_recent_projects');
+              const list: string[] = raw ? JSON.parse(raw) : [];
+              const updated = [res.filePath, ...list.filter((p) => p !== res.filePath)].slice(0, 12);
+              localStorage.setItem('celsketch_recent_projects', JSON.stringify(updated));
+            } catch {
+              // ignore storage errors
+            }
           }
         }
         return;
@@ -147,21 +158,27 @@ export const App: React.FC = () => {
       }
 
       switch (e.key.toLowerCase()) {
-        case 'v': setTool('select'); break;
+        case 'v':
+        case 'k': setTool('select'); break;
         case 'a': setTool('contour'); break;
         case 'q': setTool(e.shiftKey ? 'polylasso' : 'lasso'); break;
-        case 'm': setTool(e.shiftKey ? 'ellipseselect' : 'rectselect'); break;
+        case 'm': activateSelectionGroup(e.shiftKey); break;
         case 'b': setTool('brush'); break;
         case 'c': setCropMode(!cropMode); break;
         case 'p': setTool('pencil'); break;
         case 'e': setTool('eraser'); break;
-        case 'g': setTool('paint'); break;
+        case 'g': setTool(e.altKey ? 'polylassofill' : e.shiftKey ? 'lassofill' : 'paint'); break;
         case 'l': setTool('line'); break;
-        case 'u': setTool('rectangle'); break;
+        case 'u': activateShapeGroup(e.shiftKey); break;
         case 'o': setTool('ellipse'); break;
         case 'i': setTool('eyedropper'); break;
+        case 'x': swapColors(); break;
         case 'h': setTool('hand'); break;
         case 'z': setTool('zoom'); break;
+        case '5':
+          e.preventDefault();
+          resetView();
+          break;
         case ' ':
           if (e.shiftKey) {
             e.preventDefault();
@@ -193,6 +210,8 @@ export const App: React.FC = () => {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [
     setTool,
+    activateSelectionGroup,
+    activateShapeGroup,
     setBrushSize,
     brushSize,
     undo,

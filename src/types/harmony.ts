@@ -3,6 +3,8 @@ export type ToolId =
   | 'contour'
   | 'lasso'
   | 'polylasso'
+  | 'lassofill'
+  | 'polylassofill'
   | 'rectselect'
   | 'ellipseselect'
   | 'brush'
@@ -19,7 +21,10 @@ export type ToolId =
 export type ArtLayerId = 'OL' | 'LA' | 'CA' | 'UL';
 
 export type BrushPresetId =
+  | 'csp_line'
+  | 'csp_sketch'
   | 'sai_pen'
+  | 'sketch_graphite'
   | 'sai_pencil'
   | 'sai_airbrush'
   | 'sai_brush'
@@ -55,6 +60,7 @@ export interface Stroke {
   imageW?: number;
   imageH?: number;
   hsvFilter?: { h: number; s: number; v: number };
+  alphaLock?: boolean;
 }
 
 export interface ColourSwatch {
@@ -79,10 +85,13 @@ export interface LayerEffects {
   dropShadow: boolean;
 }
 
+export type PoseTag = 'key' | 'breakdown' | 'inbetween';
+
 export interface DrawingLayer {
   id: string;
   name: string;
   type: 'drawing' | 'peg' | 'camera' | 'folder';
+  parentId?: string | null;
   visible: boolean;
   locked: boolean;
   solo: boolean;
@@ -94,6 +103,10 @@ export interface DrawingLayer {
   blendMode?: GlobalCompositeOperation;
   effects?: LayerEffects;
   keyframes?: Record<number, LayerTransformKeyframe>;
+  // Exposure duration per drawing start frame (e.g. { 1: 3 } means frame 1 holds across frames 1, 2, 3)
+  celDurations?: Record<number, number>;
+  // Pose tags per frame ('key' | 'breakdown' | 'inbetween')
+  frameTags?: Record<number, PoseTag>;
   tagColor: string;
   // Map of frame number (1-based) to array of strokes
   frames: Record<number, Stroke[]>;
@@ -128,7 +141,7 @@ declare global {
       importExternal: () => Promise<{ canceled: boolean; filePath?: string; ext?: string; bytes?: Uint8Array }>;
       importAudio: () => Promise<{ canceled: boolean; filePath?: string; name?: string; bytes?: Uint8Array }>;
       exportPng: (dataUrl: string, defaultName: string) => Promise<{ canceled: boolean; filePath?: string }>;
-      pickDirectory: () => Promise<{ canceled: boolean; dirPath?: string }>;
+      pickDirectory: (title?: string) => Promise<{ canceled: boolean; dirPath?: string }>;
       writeFrameToDir: (dirPath: string, name: string, dataUrl: string) => Promise<{ ok: boolean }>;
       saveBinaryFile: (
         defaultName: string,

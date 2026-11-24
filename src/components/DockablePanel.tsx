@@ -44,7 +44,7 @@ export const DockablePanel: React.FC<DockablePanelProps> = ({
   });
 
   useEffect(() => {
-    const onMouseMove = (e: MouseEvent) => {
+    const onPointerMove = (e: PointerEvent) => {
       const st = dragState.current;
       if (!st.type) return;
 
@@ -70,19 +70,19 @@ export const DockablePanel: React.FC<DockablePanelProps> = ({
       }
     };
 
-    const onMouseUp = () => {
+    const onPointerUp = () => {
       dragState.current.type = null;
     };
 
-    window.addEventListener('mousemove', onMouseMove);
-    window.addEventListener('mouseup', onMouseUp);
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp);
     return () => {
-      window.removeEventListener('mousemove', onMouseMove);
-      window.removeEventListener('mouseup', onMouseUp);
+      window.removeEventListener('pointermove', onPointerMove);
+      window.removeEventListener('pointerup', onPointerUp);
     };
   }, [dockSide, minDockedSize, maxDockedSize]);
 
-  const startDockResize = (e: React.MouseEvent) => {
+  const startDockResize = (e: React.PointerEvent) => {
     e.preventDefault();
     dragState.current = {
       type: 'dock-resize',
@@ -94,7 +94,7 @@ export const DockablePanel: React.FC<DockablePanelProps> = ({
     };
   };
 
-  const startFloatMove = (e: React.MouseEvent) => {
+  const startFloatMove = (e: React.PointerEvent) => {
     e.preventDefault();
     dragState.current = {
       type: 'float-move',
@@ -106,7 +106,7 @@ export const DockablePanel: React.FC<DockablePanelProps> = ({
     };
   };
 
-  const startFloatResize = (e: React.MouseEvent) => {
+  const startFloatResize = (e: React.PointerEvent) => {
     e.preventDefault();
     e.stopPropagation();
     dragState.current = {
@@ -140,7 +140,7 @@ export const DockablePanel: React.FC<DockablePanelProps> = ({
         }}
       >
         <div
-          onMouseDown={startFloatMove}
+          onPointerDown={startFloatMove}
           onDoubleClick={() => setIsFloating(false)}
           style={{
             height: 24,
@@ -151,6 +151,7 @@ export const DockablePanel: React.FC<DockablePanelProps> = ({
             justifyContent: 'space-between',
             padding: '0 6px',
             cursor: 'grab',
+            touchAction: 'none',
             flexShrink: 0
           }}
         >
@@ -174,7 +175,7 @@ export const DockablePanel: React.FC<DockablePanelProps> = ({
 
         {/* Bottom-Right Resize Handle */}
         <div
-          onMouseDown={startFloatResize}
+          onPointerDown={startFloatResize}
           title="Arraste para redimensionar"
           style={{
             position: 'absolute',
@@ -183,6 +184,7 @@ export const DockablePanel: React.FC<DockablePanelProps> = ({
             width: 14,
             height: 14,
             cursor: 'nwse-resize',
+            touchAction: 'none',
             background: 'linear-gradient(135deg, transparent 50%, #5b93e6 50%)',
             opacity: 0.75
           }}
@@ -204,11 +206,12 @@ export const DockablePanel: React.FC<DockablePanelProps> = ({
       {/* Splitter handle for right or bottom dock */}
       {dockSide === 'right' && (
         <div
-          onMouseDown={startDockResize}
+          onPointerDown={startDockResize}
           title="Arraste para redimensionar"
           style={{
-            width: 5,
+            width: 6,
             cursor: 'ew-resize',
+            touchAction: 'none',
             background: '#181818',
             flexShrink: 0
           }}
@@ -216,11 +219,12 @@ export const DockablePanel: React.FC<DockablePanelProps> = ({
       )}
       {dockSide === 'bottom' && (
         <div
-          onMouseDown={startDockResize}
+          onPointerDown={startDockResize}
           title="Arraste para redimensionar"
           style={{
-            height: 5,
+            height: 6,
             cursor: 'ns-resize',
+            touchAction: 'none',
             background: '#181818',
             flexShrink: 0
           }}
@@ -255,20 +259,30 @@ export const DockablePanel: React.FC<DockablePanelProps> = ({
           </button>
         </div>
 
-        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, minHeight: 0, overflow: 'hidden' }}>
+        <div
+          style={{
+            flex: 1,
+            display: 'flex',
+            flexDirection: 'column',
+            minWidth: 0,
+            minHeight: 0,
+            overflow: dockSide === 'left' ? 'visible' : 'hidden'
+          }}
+        >
           {children}
         </div>
       </div>
 
       {dockSide === 'left' && (
         <div
-          onMouseDown={startDockResize}
+          onPointerDown={startDockResize}
           title="Arraste para redimensionar"
           style={{
-            width: 4,
+            width: 5,
             cursor: 'ew-resize',
             background: '#181818',
-            flexShrink: 0
+            flexShrink: 0,
+            touchAction: 'none'
           }}
         />
       )}

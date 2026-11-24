@@ -40,6 +40,21 @@ body,
   -webkit-app-region: no-drag;
 }
 
+/* Clean number inputs without cramped spinner arrows */
+.timeline-num-input::-webkit-inner-spin-button,
+.timeline-num-input::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+.timeline-num-input {
+  -moz-appearance: textfield;
+  appearance: textfield;
+  padding: 0 5px !important;
+  text-align: center;
+  font-weight: 600;
+  color: #ffffff;
+}
+
 /* Custom Harmony-style thin scrollbars */
 ::-webkit-scrollbar {
   width: 8px;

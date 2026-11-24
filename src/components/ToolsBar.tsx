@@ -23,6 +23,8 @@ import { ToolId } from '../types/harmony';
 const SELECTION_TOOLS: { id: ToolId; label: string; shortcut: string; icon: React.ReactNode }[] = [
   { id: 'lasso', label: 'Laço Livre (Alt = Poligonal)', shortcut: 'Q', icon: <Lasso size={16} /> },
   { id: 'polylasso', label: 'Laço Poligonal', shortcut: 'Shift+Q', icon: <Pentagon size={15} /> },
+  { id: 'lassofill', label: 'Laço Fill (Preencher)', shortcut: 'Shift+G', icon: <PaintBucket size={15} /> },
+  { id: 'polylassofill', label: 'Laço Poligonal Fill', shortcut: 'Alt+G', icon: <Pentagon size={15} style={{ fill: 'rgba(58,134,255,0.45)' }} /> },
   { id: 'rectselect', label: 'Seleção Retangular', shortcut: 'M', icon: <SquareDashed size={16} /> },
   { id: 'ellipseselect', label: 'Seleção Elipse', shortcut: 'Shift+M', icon: <CircleDashed size={16} /> }
 ];
@@ -42,13 +44,13 @@ const OTHER_TOOLS: { id: ToolId; label: string; shortcut: string; icon: React.Re
 
 export const ToolsBar: React.FC = () => {
   const activeTool = useHarmonyStore((s) => s.activeTool);
+  const lastSelectionTool = useHarmonyStore((s) => s.lastSelectionTool);
   const setTool = useHarmonyStore((s) => s.setTool);
   const [showSelectFlyout, setShowSelectFlyout] = useState(false);
-  const [lastSelectTool, setLastSelectTool] = useState<ToolId>('lasso');
 
   const isSelectActive = SELECTION_TOOLS.some((t) => t.id === activeTool);
   const currentSelectObj =
-    SELECTION_TOOLS.find((t) => t.id === (isSelectActive ? activeTool : lastSelectTool)) ||
+    SELECTION_TOOLS.find((t) => t.id === (isSelectActive ? activeTool : lastSelectionTool)) ||
     SELECTION_TOOLS[0];
 
   return (
@@ -77,7 +79,7 @@ export const ToolsBar: React.FC = () => {
         <button
           className={`tool-btn ${isSelectActive ? 'active' : ''}`}
           onClick={() => setTool(currentSelectObj.id)}
-          title={`${currentSelectObj.label} (${currentSelectObj.shortcut})`}
+          title={`${currentSelectObj.label} (M • Shift+M alterna)`}
         >
           {currentSelectObj.icon}
           <span
@@ -107,15 +109,14 @@ export const ToolsBar: React.FC = () => {
               flexDirection: 'column',
               gap: 3,
               boxShadow: '0 6px 18px rgba(0,0,0,0.6)',
-              zIndex: 900,
-              minWidth: 165
+              zIndex: 9999,
+              minWidth: 185
             }}
           >
             {SELECTION_TOOLS.map((st) => (
               <button
                 key={st.id}
                 onClick={() => {
-                  setLastSelectTool(st.id);
                   setTool(st.id);
                   setShowSelectFlyout(false);
                 }}

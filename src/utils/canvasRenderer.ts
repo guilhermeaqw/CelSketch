@@ -1,4 +1,99 @@
 import { DrawingLayer, LayerTransformKeyframe, Point, Stroke } from '../types/harmony';
+import { LINE_SUT_TIP_URL, SKETCH_SUT_TIP_URL, SKETCH_SUT_PAPER_URL } from './customBrushAssets';
+
+// Preload extracted .sut brush tip & paper texture images
+function preloadBrushImg(url: string): HTMLImageElement {
+  const img = new Image();
+  img.onload = () => {
+    window.dispatchEvent(new Event('celsketch:image-loaded'));
+  };
+  img.src = url;
+  return img;
+}
+
+const lineSutImg = preloadBrushImg(LINE_SUT_TIP_URL);
+const sketchSutImg = preloadBrushImg(SKETCH_SUT_TIP_URL);
+const sketchPaperImg = preloadBrushImg(SKETCH_SUT_PAPER_URL);
+
+// Adaptive hardware detection & Eco mode scaling (runs smoothly on no-GPU PCs, scales up on strong GPUs)
+let cachedWeakHardware: boolean | null = null;
+let globalEcoMode = false;
+
+export function detectIsWeakHardware(): boolean {
+  if (cachedWeakHardware !== null) return cachedWeakHardware;
+  try {
+    const cores = navigator.hardwareConcurrency || 4;
+    const c = document.createElement('canvas');
+    const gl = c.getContext('webgl') || c.getContext('experimental-webgl');
+    if (!gl) {
+      cachedWeakHardware = true;
+      return true;
+    }
+    const dbg = (gl as WebGLRenderingContext).getExtension('WEBGL_debug_renderer_info');
+    if (dbg) {
+      const renderer = String((gl as WebGLRenderingContext).getParameter(dbg.UNMASKED_RENDERER_WEBGL) || '');
+      if (/swiftshader|basic render|llvmpipe|software|mesa|virgl/i.test(renderer)) {
+        cachedWeakHardware = true;
+        return true;
+      }
+    }
+    cachedWeakHardware = cores <= 4;
+  } catch {
+    cachedWeakHardware = false;
+  }
+  return cachedWeakHardware;
+}
+
+export function setGlobalEcoMode(eco: boolean) {
+  globalEcoMode = eco;
+}
+
+const tintedSutCache = new Map<string, HTMLCanvasElement>();
+
+// Reusable zero-allocation scratch canvas + cached paper pattern for Sketch.sut
+let sketchScratchCanvas: HTMLCanvasElement | null = null;
+let sketchScratchCtx: CanvasRenderingContext2D | null = null;
+let sketchPaperPattern: CanvasPattern | null = null;
+
+function getSketchScratch(w: number, h: number): { canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D; pattern: CanvasPattern | null } {
+  if (!sketchScratchCanvas) {
+    sketchScratchCanvas = document.createElement('canvas');
+    sketchScratchCanvas.width = Math.max(256, w);
+    sketchScratchCanvas.height = Math.max(256, h);
+    sketchScratchCtx = sketchScratchCanvas.getContext('2d')!;
+  } else if (sketchScratchCanvas.width < w || sketchScratchCanvas.height < h) {
+    sketchScratchCanvas.width = Math.max(sketchScratchCanvas.width, w);
+    sketchScratchCanvas.height = Math.max(sketchScratchCanvas.height, h);
+    sketchPaperPattern = null; // re-create pattern after resize
+  }
+  const ctx = sketchScratchCtx!;
+  if (!sketchPaperPattern && sketchPaperImg.complete && sketchPaperImg.naturalWidth > 0) {
+    sketchPaperPattern = ctx.createPattern(sketchPaperImg, 'repeat');
+  }
+  return { canvas: sketchScratchCanvas, ctx, pattern: sketchPaperPattern };
+}
+
+function getTintedSutTip(kind: 'line' | 'sketch', color: string): HTMLCanvasElement | null {
+  const src = kind === 'line' ? lineSutImg : sketchSutImg;
+  if (!src.complete || src.naturalWidth === 0) return null;
+  const key = `sut:${kind}:${color}`;
+  const cached = tintedSutCache.get(key);
+  if (cached) return cached;
+  if (tintedSutCache.size > 120) {
+    const first = tintedSutCache.keys().next().value;
+    if (first) tintedSutCache.delete(first);
+  }
+  const c = document.createElement('canvas');
+  c.width = src.naturalWidth;
+  c.height = src.naturalHeight;
+  const cctx = c.getContext('2d')!;
+  cctx.drawImage(src, 0, 0);
+  cctx.globalCompositeOperation = 'source-in';
+  cctx.fillStyle = color;
+  cctx.fillRect(0, 0, c.width, c.height);
+  tintedSutCache.set(key, c);
+  return c;
+}
 
 export function getInterpolatedLayerTransform(
   layer: DrawingLayer,
@@ -58,9 +153,37 @@ function getCachedImage(dataUrl: string): HTMLImageElement {
   return img;
 }
 
+export function isLayerEffectivelyVisible(layer: DrawingLayer, allLayers: DrawingLayer[]): boolean {
+  if (layer.type === 'folder') return false;
+  if (!layer.visible) return false;
+  // Check parent folder visibility
+  if (layer.parentId) {
+    const parent = allLayers.find((l) => l.id === layer.parentId);
+    if (parent && !parent.visible) return false;
+  }
+  // If any layer is Soloed, only Soloed layers render!
+  const anySolo = allLayers.some((l) => l.type !== 'folder' && l.solo);
+  if (anySolo && !layer.solo) return false;
+  return true;
+}
+
 export function getEffectiveFrameStrokes(layer: DrawingLayer, frame: number): Stroke[] {
   const direct = layer.frames[frame];
   if (direct && direct.length > 0) return direct;
+
+  // Check explicit Cel Exposure blocks (e.g. celDurations[1] = 3 covers frames 1, 2, 3)
+  if (layer.celDurations) {
+    for (let f = frame - 1; f >= 1; f--) {
+      const dur = layer.celDurations[f] || 1;
+      if (dur > 1 && frame < f + dur) {
+        const celStrokes = layer.frames[f];
+        if (celStrokes && celStrokes.length > 0) return celStrokes;
+      }
+      // Stop if we hit an explicit drawing or blank cel before f
+      if (layer.frames[f] !== undefined) break;
+    }
+  }
+
   if (!layer.holdFrames) return [];
 
   // Hold exposure: find the nearest previous frame with strokes
@@ -128,6 +251,167 @@ function subdivideCurve(pts: Point[]): Point[] {
     }
   }
   return result;
+}
+
+/**
+ * Resample a polyline by exact Euclidean arc-length spacing (eliminates speed-dependent dots/blobs)
+ */
+interface ResampledPoint extends Point {
+  angle: number;
+  t: number; // normalized 0..1 progress along stroke
+}
+
+function resampleByDistance(pts: Point[], spacing: number): ResampledPoint[] {
+  if (pts.length === 0) return [];
+  if (pts.length === 1) {
+    return [{ ...pts[0], angle: 0, t: 0 }];
+  }
+  const step = Math.max(0.75, spacing);
+  const out: ResampledPoint[] = [];
+  let totalDist = 0;
+  for (let i = 1; i < pts.length; i++) {
+    totalDist += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
+  }
+  if (totalDist < 0.001) {
+    return [{ ...pts[0], angle: 0, t: 0 }];
+  }
+
+  let carry = 0;
+  let walked = 0;
+  const firstAngle = Math.atan2(pts[1].y - pts[0].y, pts[1].x - pts[0].x);
+  out.push({ ...pts[0], angle: firstAngle, t: 0 });
+
+  for (let i = 1; i < pts.length; i++) {
+    const a = pts[i - 1];
+    const b = pts[i];
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const segLen = Math.hypot(dx, dy);
+    if (segLen < 0.0001) continue;
+    const angle = Math.atan2(dy, dx);
+    const pa = a.pressure ?? 1;
+    const pb = b.pressure ?? 1;
+
+    let d = step - carry;
+    while (d <= segLen) {
+      const f = d / segLen;
+      out.push({
+        x: a.x + dx * f,
+        y: a.y + dy * f,
+        pressure: pa + (pb - pa) * f,
+        angle,
+        t: Math.min(1, (walked + d) / totalDist)
+      });
+      d += step;
+    }
+    carry = segLen - (d - step);
+    walked += segLen;
+  }
+
+  const last = pts[pts.length - 1];
+  const prev = pts[pts.length - 2];
+  out.push({ ...last, angle: Math.atan2(last.y - prev.y, last.x - prev.x), t: 1 });
+  return out;
+}
+
+/**
+ * Deterministic hash for procedural brush grain (zero flicker across re-renders)
+ */
+function hash2d(x: number, y: number): number {
+  const n = Math.sin(x * 127.1 + y * 311.7) * 43758.5453123;
+  return n - Math.floor(n);
+}
+
+/**
+ * Cached procedural tinted brush tip canvases (Graphite Grain, Bristle Tufts, Soft Gaussian, Watercolor Ring)
+ */
+const tipCache = new Map<string, HTMLCanvasElement>();
+
+function getProceduralTip(kind: 'graphite' | 'pencil' | 'bristle' | 'soft' | 'water', color: string): HTMLCanvasElement {
+  const key = `${kind}:${color}`;
+  const cached = tipCache.get(key);
+  if (cached) return cached;
+
+  // Cap cache size to prevent unbounded growth
+  if (tipCache.size > 160) {
+    const firstKey = tipCache.keys().next().value;
+    if (firstKey) tipCache.delete(firstKey);
+  }
+
+  const S = 64;
+  const c = document.createElement('canvas');
+  c.width = S;
+  c.height = S;
+  const ctx = c.getContext('2d')!;
+  const half = S / 2;
+
+  if (kind === 'soft') {
+    const g = ctx.createRadialGradient(half, half, 0, half, half, half);
+    g.addColorStop(0, color);
+    g.addColorStop(0.35, color);
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(half, half, half, 0, Math.PI * 2);
+    ctx.fill();
+  } else if (kind === 'water') {
+    // Soft translucent center + subtle darker wet-edge pigment ring
+    const g = ctx.createRadialGradient(half, half, 0, half, half, half);
+    g.addColorStop(0, color);
+    g.addColorStop(0.7, color);
+    g.addColorStop(0.88, color);
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.globalAlpha = 0.55;
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(half, half, half, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.globalAlpha = 0.35;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.arc(half, half, half * 0.84, 0, Math.PI * 2);
+    ctx.stroke();
+  } else if (kind === 'bristle') {
+    // Organic painterly multi-bristle tuft (18 fine hair fibers)
+    ctx.fillStyle = color;
+    for (let i = 0; i < 20; i++) {
+      const a = hash2d(i, 1.7) * Math.PI * 2;
+      const dist = Math.sqrt(hash2d(i, 3.1)) * (half * 0.78);
+      const bx = half + Math.cos(a) * dist;
+      const by = half + Math.sin(a) * dist;
+      const rx = 3.2 + hash2d(i, 5.3) * 5.5;
+      const ry = 1.6 + hash2d(i, 7.9) * 3.2;
+      ctx.globalAlpha = 0.32 + hash2d(i, 9.2) * 0.55;
+      ctx.beginPath();
+      ctx.ellipse(bx, by, rx, ry, (hash2d(i, 11.4) - 0.5) * 0.35, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  } else {
+    // Graphite / Pencil: authentic organic paper-tooth grain mask
+    const density = kind === 'graphite' ? 0.52 : 0.68;
+    ctx.fillStyle = color;
+    for (let py = 0; py < S; py += 2) {
+      for (let px = 0; px < S; px += 2) {
+        const dx = (px - half) / half;
+        const dy = (py - half) / half;
+        const r = Math.hypot(dx, dy);
+        if (r > 0.96) continue;
+        const falloff = Math.pow(1 - r, kind === 'graphite' ? 0.75 : 0.55);
+        const grain = hash2d(px * 0.73, py * 0.73);
+        const fine = hash2d(px * 1.9 + 13, py * 1.9 + 7);
+        const v = (grain * 0.65 + fine * 0.35) * falloff;
+        if (v > 1 - density) {
+          ctx.globalAlpha = Math.min(1, (v - (1 - density)) * 2.6);
+          ctx.fillRect(px, py, 2, 2);
+        }
+      }
+    }
+  }
+
+  tipCache.set(key, c);
+  return c;
 }
 
 /**
@@ -215,7 +499,7 @@ export function renderStroke(
     ctx.strokeStyle = 'rgba(0,0,0,1)';
     ctx.fillStyle = 'rgba(0,0,0,1)';
   } else {
-    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalCompositeOperation = stroke.alphaLock ? 'source-atop' : 'source-over';
     ctx.strokeStyle = activeColor;
     ctx.fillStyle = activeColor;
   }
@@ -234,71 +518,215 @@ export function renderStroke(
 
     const calcRadius = (pressure: number, idx: number, total: number) => {
       const p = Math.max(0.02, Math.min(1, pressure));
-      const curveExp = preset === 'sai_inkpen' ? 1.65 : 1.28;
+      const curveExp = preset === 'sai_inkpen' ? 1.72 : preset === 'sai_pen' ? 1.35 : 1.25;
       let width = stroke.size * (minRatio + (1 - minRatio) * Math.pow(p, curveExp));
 
-      // Subtle natural taper at very start/end of SAI Pen & InkPen strokes
-      if ((preset === 'sai_pen' || preset === 'sai_inkpen') && total > 6) {
-        if (idx < 3) width *= 0.65 + (idx / 3) * 0.35;
-        if (idx > total - 4) width *= 0.65 + ((total - 1 - idx) / 3) * 0.35;
+      // Smooth organic taper at start and end of Pen / InkPen strokes
+      if ((preset === 'sai_pen' || preset === 'sai_inkpen') && total > 8) {
+        const taperLen = Math.min(8, Math.floor(total * 0.18));
+        if (idx < taperLen) {
+          const f = idx / taperLen;
+          width *= 0.32 + 0.68 * (f * f * (3 - 2 * f));
+        } else if (idx > total - 1 - taperLen) {
+          const f = (total - 1 - idx) / taperLen;
+          width *= 0.25 + 0.75 * (f * f * (3 - 2 * f));
+        }
       }
       return Math.max(0.4, width / 2);
     };
 
-    if ((preset === 'sai_airbrush' || preset === 'blur_soft' || preset === 'blur_smudge') && stroke.tool !== 'eraser') {
-      // Soft airbrush / blur / smudge using feathered radial gradients
-      const alphaFactor = preset === 'blur_soft' ? 0.1 : preset === 'blur_smudge' ? 0.18 : 0.14;
-      const radiusMult = preset === 'blur_soft' ? 1.7 : 1.45;
-      for (let i = 0; i < curvePts.length; i += 2) {
-        const pt = curvePts[i];
-        const r = Math.max(4, calcRadius(pt.pressure ?? 1, i, curvePts.length) * radiusMult);
-        const grad = ctx.createRadialGradient(pt.x, pt.y, 0, pt.x, pt.y, r);
-        grad.addColorStop(0, activeColor);
-        grad.addColorStop(1, 'rgba(0,0,0,0)');
-        ctx.save();
-        ctx.globalAlpha = stroke.opacity * opacityMultiplier * alphaFactor;
-        if (preset === 'blur_soft' || preset === 'blur_smudge') {
-          ctx.filter = `blur(${preset === 'blur_soft' ? 4 : 2}px)`;
+    const ecoMult = globalEcoMode ? 1.55 : 1;
+
+    if (preset === 'csp_line' && stroke.tool !== 'eraser') {
+      // Line.sut (ガサ伽サ線画ペン): textured rough organic lineart ribbon along stroke angle
+      const tip = getTintedSutTip('line', activeColor);
+      if (tip) {
+        const spacing = Math.max(1.5, stroke.size * 0.18) * ecoMult;
+        const dabs = resampleByDistance(curvePts, spacing);
+        const aspect = tip.height / Math.max(1, tip.width);
+        ctx.globalAlpha = stroke.opacity * opacityMultiplier;
+        for (let i = 0; i < dabs.length; i++) {
+          const pt = dabs[i];
+          const p = Math.max(0.03, Math.min(1, pt.pressure ?? 1));
+          let taper = 1;
+          if (dabs.length > 10) {
+            if (pt.t < 0.14) {
+              const f = pt.t / 0.14;
+              taper = 0.25 + 0.75 * (f * f * (3 - 2 * f));
+            } else if (pt.t > 0.86) {
+              const f = (1 - pt.t) / 0.14;
+              taper = 0.2 + 0.8 * (f * f * (3 - 2 * f));
+            }
+          }
+          const diam = Math.max(1.2, stroke.size * (minRatio + (1 - minRatio) * Math.pow(p, 1.38)) * taper);
+          const w = diam * 0.85;
+          const h = Math.max(w * 1.15, Math.min(diam * 2.2, w * aspect * 0.45));
+          ctx.save();
+          ctx.translate(pt.x, pt.y);
+          ctx.rotate(pt.angle + Math.PI / 2);
+          ctx.drawImage(tip, -w / 2, -h / 2, w, h);
+          ctx.restore();
         }
-        ctx.fillStyle = grad;
+      } else {
+        renderVariableWidthRibbon(ctx, curvePts, calcRadius);
+      }
+    } else if (preset === 'csp_sketch' && stroke.tool !== 'eraser') {
+      // Sketch.sut (鉛筆R): zero-allocation reusable scratch canvas + world-space paper grain
+      const tip = getTintedSutTip('sketch', activeColor);
+      if (tip) {
+        const spacing = Math.max(1.8, stroke.size * 0.22) * ecoMult;
+        const dabs = resampleByDistance(curvePts, spacing);
+
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (const pt of dabs) {
+          if (pt.x < minX) minX = pt.x;
+          if (pt.y < minY) minY = pt.y;
+          if (pt.x > maxX) maxX = pt.x;
+          if (pt.y > maxY) maxY = pt.y;
+        }
+        const pad = Math.ceil(stroke.size * 1.4) + 6;
+        const bx = Math.floor(minX - pad);
+        const by = Math.floor(minY - pad);
+        const bw = Math.max(4, Math.ceil(maxX - minX + pad * 2));
+        const bh = Math.max(4, Math.ceil(maxY - minY + pad * 2));
+
+        const usePaper = sketchPaperImg.complete && sketchPaperImg.naturalWidth > 0 && bw <= 3072 && bh <= 3072;
+        const scratch = usePaper ? getSketchScratch(bw, bh) : null;
+        const targetCtx = scratch ? scratch.ctx : ctx;
+
+        if (scratch) {
+          targetCtx.clearRect(0, 0, bw, bh);
+          targetCtx.save();
+          targetCtx.translate(-bx, -by);
+        }
+
+        const aspect = tip.height / Math.max(1, tip.width);
+        for (let i = 0; i < dabs.length; i++) {
+          const pt = dabs[i];
+          const p = Math.max(0.05, Math.min(1, pt.pressure ?? 1));
+          const diam = Math.max(1.5, stroke.size * (minRatio + (1 - minRatio) * Math.pow(p, 1.25)));
+          const w = diam * 1.15;
+          const h = diam * aspect * 0.58;
+          const randRot = (hash2d(i, Math.round(pt.x)) - 0.5) * (Math.PI * 0.5);
+          targetCtx.save();
+          targetCtx.translate(pt.x, pt.y);
+          targetCtx.rotate(pt.angle + randRot);
+          targetCtx.globalAlpha = Math.min(1, 0.73 * (0.28 + 0.72 * p) * (scratch ? 1 : stroke.opacity * opacityMultiplier));
+          targetCtx.drawImage(tip, -w / 2, -h / 2, w, h);
+          targetCtx.restore();
+        }
+
+        if (scratch) {
+          targetCtx.restore();
+          if (scratch.pattern) {
+            const pw = sketchPaperImg.naturalWidth;
+            const ph = sketchPaperImg.naturalHeight;
+            const ox = ((bx % pw) + pw) % pw;
+            const oy = ((by % ph) + ph) % ph;
+            targetCtx.save();
+            targetCtx.globalCompositeOperation = 'destination-out';
+            targetCtx.globalAlpha = 0.42;
+            targetCtx.translate(-ox, -oy);
+            targetCtx.fillStyle = scratch.pattern;
+            targetCtx.fillRect(ox, oy, bw + pw, bh + ph);
+            targetCtx.restore();
+          }
+          ctx.globalAlpha = stroke.opacity * opacityMultiplier;
+          ctx.drawImage(scratch.canvas, 0, 0, bw, bh, bx, by, bw, bh);
+        }
+      } else {
+        renderVariableWidthRibbon(ctx, curvePts, calcRadius);
+      }
+    } else if ((preset === 'sai_airbrush' || preset === 'blur_soft' || preset === 'blur_smudge') && stroke.tool !== 'eraser') {
+      // Distance-resampled Gaussian Feathered Airbrush / Soft Blend (zero polka-dots at any speed!)
+      const tip = getProceduralTip('soft', activeColor);
+      const spacing = Math.max(2.0, stroke.size * 0.22) * ecoMult;
+      const dabs = resampleByDistance(curvePts, spacing);
+      const radiusMult = preset === 'blur_soft' ? 1.65 : preset === 'blur_smudge' ? 1.35 : 1.45;
+      const flowFactor = preset === 'blur_soft' ? 0.08 : preset === 'blur_smudge' ? 0.16 : 0.11;
+      for (let i = 0; i < dabs.length; i++) {
+        const pt = dabs[i];
+        const p = Math.max(0.05, Math.min(1, pt.pressure ?? 1));
+        const r = Math.max(2.5, calcRadius(p, i, dabs.length) * radiusMult);
+        ctx.globalAlpha = Math.min(1, stroke.opacity * opacityMultiplier * flowFactor * (0.35 + 0.65 * p));
+        ctx.drawImage(tip, pt.x - r, pt.y - r, r * 2, r * 2);
+      }
+    } else if (preset === 'sai_water' && stroke.tool !== 'eraser') {
+      // Watercolor Wash: distance-resampled translucent pigment with subtle wet-edge ring
+      const tip = getProceduralTip('water', activeColor);
+      const spacing = Math.max(1.5, stroke.size * 0.16);
+      const dabs = resampleByDistance(curvePts, spacing);
+      for (let i = 0; i < dabs.length; i++) {
+        const pt = dabs[i];
+        const p = Math.max(0.08, Math.min(1, pt.pressure ?? 1));
+        const r = Math.max(2, calcRadius(p, i, dabs.length) * 1.15);
+        ctx.globalAlpha = Math.min(0.85, stroke.opacity * opacityMultiplier * 0.22 * (0.4 + 0.6 * p));
+        ctx.drawImage(tip, pt.x - r, pt.y - r, r * 2, r * 2);
+      }
+    } else if (preset === 'sai_brush' && stroke.tool !== 'eraser') {
+      // Painterly Bristle Brush: rotating multi-strand bristles along stroke direction + pressure buildup
+      const tip = getProceduralTip('bristle', activeColor);
+      const spacing = Math.max(1.2, stroke.size * 0.11);
+      const dabs = resampleByDistance(curvePts, spacing);
+      for (let i = 0; i < dabs.length; i++) {
+        const pt = dabs[i];
+        const p = Math.max(0.08, Math.min(1, pt.pressure ?? 1));
+        const r = Math.max(1.8, calcRadius(p, i, dabs.length) * 1.12);
+        ctx.save();
+        ctx.translate(pt.x, pt.y);
+        ctx.rotate(pt.angle);
+        ctx.globalAlpha = Math.min(1, stroke.opacity * opacityMultiplier * (0.28 + 0.55 * p));
+        ctx.drawImage(tip, -r, -r, r * 2, r * 2);
+        ctx.restore();
+      }
+    } else if (preset === 'sai_marker' && stroke.tool !== 'eraser') {
+      // Alcohol Chisel Marker: smooth distance-resampled 45-degree rounded chisel nib
+      const spacing = Math.max(1, stroke.size * 0.08);
+      const dabs = resampleByDistance(curvePts, spacing);
+      ctx.globalAlpha = Math.min(1, stroke.opacity * opacityMultiplier * 0.35);
+      for (let i = 0; i < dabs.length; i++) {
+        const pt = dabs[i];
+        const p = Math.max(0.2, Math.min(1, pt.pressure ?? 1));
+        const r = Math.max(1.5, calcRadius(p, i, dabs.length));
+        ctx.save();
+        ctx.translate(pt.x, pt.y);
+        ctx.rotate(-Math.PI / 4);
         ctx.beginPath();
-        ctx.arc(pt.x, pt.y, r, 0, Math.PI * 2);
+        ctx.ellipse(0, 0, r * 1.25, r * 0.36, 0, 0, Math.PI * 2);
         ctx.fill();
         ctx.restore();
       }
-    } else if (preset === 'sai_water' && stroke.tool !== 'eraser') {
-      // SAI Water (Watercolor): soft translucent wash with gentle wet edge
-      ctx.save();
-      ctx.shadowColor = activeColor;
-      ctx.shadowBlur = Math.max(4, stroke.size * 0.35);
-      renderVariableWidthRibbon(ctx, curvePts, calcRadius);
-      ctx.restore();
-    } else if (preset === 'sai_brush' && stroke.tool !== 'eraser') {
-      // SAI Brush (Painterly round): smooth core + soft blendable halo
-      ctx.save();
-      ctx.shadowColor = activeColor;
-      ctx.shadowBlur = Math.max(2, stroke.size * 0.15);
-      renderVariableWidthRibbon(ctx, curvePts, calcRadius);
-      ctx.restore();
-    } else if (preset === 'sai_marker' && stroke.tool !== 'eraser') {
-      // SAI Marker: flat 45-degree chisel nib
-      renderVariableWidthRibbon(ctx, curvePts, calcRadius, Math.PI / 4);
     } else if (preset === 'sai_binary' && stroke.tool !== 'eraser') {
-      // SAI Binary: crisp hard-edge square pixel pen
+      // Crisp Pixel Art Binary Pen (distance-stepped, zero anti-aliasing)
       ctx.imageSmoothingEnabled = false;
       const sz = Math.max(1, Math.round(stroke.size));
-      for (const pt of curvePts) {
+      const dabs = resampleByDistance(curvePts, Math.max(1, sz * 0.35));
+      for (const pt of dabs) {
         ctx.fillRect(Math.round(pt.x - sz / 2), Math.round(pt.y - sz / 2), sz, sz);
       }
-    } else if (preset === 'sai_pencil' && stroke.tool !== 'eraser') {
-      // SAI Pencil: organic graphite core + soft tooth
-      renderVariableWidthRibbon(ctx, curvePts, (p, i, t) => calcRadius(p, i, t) * 0.85);
-      ctx.save();
-      ctx.globalAlpha = stroke.opacity * opacityMultiplier * 0.28;
-      renderVariableWidthRibbon(ctx, curvePts, (p, i, t) => calcRadius(p, i, t) * 1.18);
-      ctx.restore();
+    } else if ((preset === 'sketch_graphite' || preset === 'sai_pencil') && stroke.tool !== 'eraser') {
+      // Authentic Textured Graphite / 2B Pencil: paper-grain dabs with pressure-to-opacity & subtle rotation
+      const isGraphite = preset === 'sketch_graphite';
+      const tip = getProceduralTip(isGraphite ? 'graphite' : 'pencil', activeColor);
+      const spacing = Math.max(1, stroke.size * (isGraphite ? 0.14 : 0.12));
+      const dabs = resampleByDistance(curvePts, spacing);
+      for (let i = 0; i < dabs.length; i++) {
+        const pt = dabs[i];
+        const p = Math.max(0.05, Math.min(1, pt.pressure ?? 1));
+        const r = Math.max(1.2, calcRadius(p, i, dabs.length) * (isGraphite ? 1.18 : 1.05));
+        const rot = hash2d(i, Math.round(pt.x)) * Math.PI * 2;
+        ctx.save();
+        ctx.translate(pt.x, pt.y);
+        ctx.rotate(rot);
+        ctx.globalAlpha = Math.min(
+          1,
+          stroke.opacity * opacityMultiplier * (isGraphite ? 0.22 + 0.72 * p : 0.3 + 0.68 * p)
+        );
+        ctx.drawImage(tip, -r, -r, r * 2, r * 2);
+        ctx.restore();
+      }
     } else {
-      // SAI Pen, InkPen, and Eraser: ultra-smooth filled variable-width ribbon
+      // G-Pen, InkPen, and Eraser: ultra-smooth filled variable-width ribbon
       renderVariableWidthRibbon(ctx, curvePts, calcRadius);
     }
   } else if (stroke.tool === 'line' && pts.length >= 2) {
@@ -392,7 +820,7 @@ export function renderFrameToCanvas(
   if (!lctx) return;
 
   for (const layer of ordered) {
-    if (!layer.visible) continue;
+    if (!isLayerEffectivelyVisible(layer, layers)) continue;
     const strokes = getEffectiveFrameStrokes(layer, frame);
     if (strokes.length === 0) continue;
 

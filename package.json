@@ -37,6 +37,14 @@
   "build": {
     "appId": "com.guinogue.celsketch",
     "productName": "CelSketch",
+    "icon": "build/icon.png",
+    "fileAssociations": [
+      {
+        "ext": "celsketch",
+        "name": "CelSketch Project",
+        "description": "CelSketch 2D Animation Project"
+      }
+    ],
     "directories": {
       "output": "release-celsketch"
     },

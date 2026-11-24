@@ -55,31 +55,89 @@ export const WelcomeScreen: React.FC = () => {
   const { createNewScene, loadProjectData, setShowWelcome } = useHarmonyStore();
   const [recentProjects, setRecentProjects] = useState<string[]>(() => loadRecentPaths());
   const [recentThumbs, setRecentThumbs] = useState<Record<string, string>>(() => loadRecentThumbs());
+  const [recentAnimFrames, setRecentAnimFrames] = useState<Record<string, string[]>>({});
+  const [hoveredPath, setHoveredPath] = useState<string | null>(null);
+  const [hoverFrameIdx, setHoverFrameIdx] = useState(0);
 
-  // Auto-generate real thumbnails for any recent .celsketch project missing a cached preview
+  // Optimized hover animation playback for Recent Projects (8 fps)
+  useEffect(() => {
+    if (!hoveredPath) return;
+    const frames = recentAnimFrames[hoveredPath];
+    if (!frames || frames.length <= 1) return;
+    setHoverFrameIdx(0);
+    const id = window.setInterval(() => {
+      setHoverFrameIdx((prev) => (prev + 1) % frames.length);
+    }, 125);
+    return () => window.clearInterval(id);
+  }, [hoveredPath, recentAnimFrames]);
+
+  // Auto-generate real thumbnails + optimized animation preview frames (up to 12 frames)
   useEffect(() => {
     let cancelled = false;
     (async () => {
       if (!window.harmonyAPI) return;
       const currentThumbs = loadRecentThumbs();
+      const animMap: Record<string, string[]> = {};
       let changed = false;
+
       for (const fp of recentProjects) {
-        if (currentThumbs[fp]) continue;
         try {
           const res = await window.harmonyAPI.openProjectByPath(fp);
           if (!res.canceled && res.content) {
             const parsed = JSON.parse(res.content);
             if (parsed.layers && parsed.width && parsed.height) {
+              // Find all frames that have drawings (up to 12 evenly sampled)
+              let maxF = 1;
+              for (const l of parsed.layers) {
+                for (const [k, v] of Object.entries(l.frames || {})) {
+                  if (Array.isArray(v) && v.length > 0) {
+                    maxF = Math.max(maxF, Number(k));
+                  }
+                }
+              }
+              const step = Math.max(1, Math.ceil(maxF / 12));
+              const sampleFrames: string[] = [];
               const src = document.createElement('canvas');
-              renderFrameToCanvas(src, parsed.layers, 1, parsed.width, parsed.height, '#ffffff');
               const thumb = document.createElement('canvas');
               thumb.width = 240;
               thumb.height = Math.round((240 * parsed.height) / parsed.width) || 135;
               const tctx = thumb.getContext('2d');
+
               if (tctx) {
-                tctx.drawImage(src, 0, 0, thumb.width, thumb.height);
-                currentThumbs[fp] = thumb.toDataURL('image/jpeg', 0.8);
-                changed = true;
+                // Preload all Paint Bucket / imported image dataUrls so fills appear in previews!
+                const imgPromises: Promise<void>[] = [];
+                for (const l of parsed.layers) {
+                  for (const strokes of Object.values(l.frames || {})) {
+                    if (!Array.isArray(strokes)) continue;
+                    for (const st of strokes as { tool?: string; imageDataUrl?: string }[]) {
+                      if (st.tool === 'image' && st.imageDataUrl) {
+                        imgPromises.push(
+                          new Promise<void>((resolve) => {
+                            const im = new Image();
+                            im.onload = () => resolve();
+                            im.onerror = () => resolve();
+                            im.src = st.imageDataUrl!;
+                          })
+                        );
+                      }
+                    }
+                  }
+                }
+                if (imgPromises.length > 0) {
+                  await Promise.all(imgPromises);
+                }
+
+                for (let f = 1; f <= maxF; f += step) {
+                  renderFrameToCanvas(src, parsed.layers, f, parsed.width, parsed.height, '#ffffff');
+                  tctx.clearRect(0, 0, thumb.width, thumb.height);
+                  tctx.drawImage(src, 0, 0, thumb.width, thumb.height);
+                  sampleFrames.push(thumb.toDataURL('image/jpeg', 0.72));
+                }
+                if (sampleFrames.length > 0) {
+                  animMap[fp] = sampleFrames;
+                  currentThumbs[fp] = sampleFrames[0];
+                  changed = true;
+                }
               }
             }
           }
@@ -87,19 +145,33 @@ export const WelcomeScreen: React.FC = () => {
           // skip unreadable files
         }
       }
-      if (changed && !cancelled) {
-        try {
-          localStorage.setItem(THUMBS_KEY, JSON.stringify(currentThumbs));
-        } catch {
-          // ignore
+      if (!cancelled) {
+        if (changed) {
+          try {
+            localStorage.setItem(THUMBS_KEY, JSON.stringify(currentThumbs));
+          } catch {
+            // ignore
+          }
+          setRecentThumbs({ ...currentThumbs });
         }
-        setRecentThumbs({ ...currentThumbs });
+        setRecentAnimFrames(animMap);
       }
     })();
     return () => {
       cancelled = true;
     };
   }, [recentProjects]);
+
+  const handleRemoveRecent = (e: React.MouseEvent, fp: string) => {
+    e.stopPropagation();
+    const updated = recentProjects.filter((p) => p !== fp);
+    setRecentProjects(updated);
+    try {
+      localStorage.setItem(RECENT_KEY, JSON.stringify(updated));
+    } catch {
+      // ignore
+    }
+  };
   const [showNewModal, setShowNewModal] = useState(false);
   const [showShortcuts, setShowShortcuts] = useState(false);
   const [sceneName, setSceneName] = useState('Cena_01');
@@ -160,24 +232,13 @@ export const WelcomeScreen: React.FC = () => {
   return (
     <div style={{ width: '100vw', height: '100vh', background: '#2e2e2e', color: '#dcdcdc', display: 'flex', flexDirection: 'column' }}>
       {/* Top Window Bar */}
-      <div className="title-bar drag-region" style={{ background: '#222222' }}>
+      <div className="title-bar drag-region" style={{ background: '#161920' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <div
-            style={{
-              width: 18,
-              height: 18,
-              borderRadius: 3,
-              background: 'linear-gradient(135deg, #3a86ff, #1d4ed8)',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              fontWeight: 800,
-              fontSize: 11,
-              color: '#fff'
-            }}
-          >
-            C
-          </div>
+          <img
+            src="./icon.png"
+            alt="CelSketch"
+            style={{ width: 18, height: 18, borderRadius: 4, objectFit: 'cover' }}
+          />
           <span style={{ fontWeight: 600, color: '#e5e5e5' }}>CelSketch</span>
         </div>
         <div style={{ display: 'flex' }} className="no-drag">
@@ -189,6 +250,79 @@ export const WelcomeScreen: React.FC = () => {
           </button>
           <button className="win-ctrl-btn close" onClick={() => window.harmonyAPI?.close()} title="Close">
             <X size={14} />
+          </button>
+        </div>
+      </div>
+
+      {/* Original CelSketch Studio Hero Header */}
+      <div
+        style={{
+          background: 'linear-gradient(135deg, #161b26 0%, #1d2433 60%, #17202e 100%)',
+          borderBottom: '1px solid #2c3547',
+          padding: '22px 32px',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: 20
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+          <img
+            src="./icon.png"
+            alt="CelSketch"
+            style={{
+              width: 56,
+              height: 56,
+              borderRadius: 12,
+              boxShadow: '0 6px 20px rgba(58, 134, 255, 0.3)'
+            }}
+          />
+          <div>
+            <div style={{ fontSize: 22, fontWeight: 700, color: '#ffffff', letterSpacing: '-0.3px' }}>
+              CelSketch
+            </div>
+          </div>
+        </div>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <button
+            onClick={() => setShowNewModal(true)}
+            style={{
+              background: 'linear-gradient(135deg, #2563eb, #3a86ff)',
+              border: '1px solid #60a5fa',
+              color: '#fff',
+              padding: '9px 18px',
+              borderRadius: 6,
+              fontSize: 12.5,
+              fontWeight: 600,
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              gap: 8,
+              boxShadow: '0 4px 14px rgba(37, 99, 235, 0.35)'
+            }}
+          >
+            <FilePlus size={16} />
+            <span>Novo Projeto (Ctrl+N)</span>
+          </button>
+          <button
+            onClick={handleOpenExisting}
+            style={{
+              background: '#262f40',
+              border: '1px solid #3d4a63',
+              color: '#e2e8f0',
+              padding: '9px 16px',
+              borderRadius: 6,
+              fontSize: 12.5,
+              fontWeight: 500,
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              gap: 8
+            }}
+          >
+            <FolderOpen size={16} />
+            <span>Abrir .celsketch (Ctrl+O)</span>
           </button>
         </div>
       </div>
@@ -357,20 +491,27 @@ export const WelcomeScreen: React.FC = () => {
               <div
                 style={{
                   display: 'grid',
-                  gridTemplateColumns: 'repeat(auto-fill, minmax(126px, 1fr))',
-                  gap: 14
+                  gridTemplateColumns: 'repeat(auto-fill, minmax(186px, 1fr))',
+                  gap: 16
                 }}
               >
                 {recentProjects.map((fp) => {
                   const fileName = fp.split(/[\\/]/).pop() || fp;
+                  const animList = recentAnimFrames[fp];
+                  const activeSrc =
+                    hoveredPath === fp && animList && animList.length > 1
+                      ? animList[hoverFrameIdx % animList.length]
+                      : recentThumbs[fp];
+
                   return (
-                    <button
+                    <div
                       key={fp}
                       onClick={() => handleOpenRecent(fp)}
+                      onMouseEnter={() => setHoveredPath(fp)}
+                      onMouseLeave={() => setHoveredPath(null)}
                       title={fp}
                       style={{
-                        background: 'transparent',
-                        border: 'none',
+                        position: 'relative',
                         cursor: 'pointer',
                         display: 'flex',
                         flexDirection: 'column',
@@ -379,12 +520,36 @@ export const WelcomeScreen: React.FC = () => {
                         padding: 4
                       }}
                     >
+                      <button
+                        onClick={(e) => handleRemoveRecent(e, fp)}
+                        title="Remover dos recentes"
+                        style={{
+                          position: 'absolute',
+                          top: 8,
+                          right: 8,
+                          width: 20,
+                          height: 20,
+                          borderRadius: '50%',
+                          border: 'none',
+                          background: 'rgba(20,20,20,0.78)',
+                          color: '#fff',
+                          cursor: 'pointer',
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          zIndex: 5
+                        }}
+                      >
+                        <X size={12} />
+                      </button>
+
                       <div
                         style={{
-                          width: 118,
-                          height: 118,
+                          width: 180,
+                          height: 115,
                           background: '#3b3b3b',
-                          border: '1px solid #4d4d4d',
+                          border: `1.5px solid ${hoveredPath === fp ? '#3a86ff' : '#4d4d4d'}`,
+                          borderRadius: 4,
                           display: 'flex',
                           alignItems: 'center',
                           justifyContent: 'center',
@@ -392,22 +557,22 @@ export const WelcomeScreen: React.FC = () => {
                           overflow: 'hidden'
                         }}
                       >
-                        {recentThumbs[fp] ? (
+                        {activeSrc ? (
                           <img
-                            src={recentThumbs[fp]}
+                            src={activeSrc}
                             alt={fileName}
                             style={{ width: '100%', height: '100%', objectFit: 'contain', background: '#fff' }}
                           />
                         ) : (
-                          <FileImage size={38} strokeWidth={1.3} />
+                          <FileImage size={42} strokeWidth={1.3} />
                         )}
                       </div>
                       <span
                         style={{
-                          fontSize: 11,
+                          fontSize: 11.5,
                           color: '#d4d4d4',
                           textDecoration: 'underline',
-                          maxWidth: 118,
+                          maxWidth: 180,
                           overflow: 'hidden',
                           textOverflow: 'ellipsis',
                           whiteSpace: 'nowrap'
@@ -415,7 +580,7 @@ export const WelcomeScreen: React.FC = () => {
                       >
                         {fileName}
                       </span>
-                    </button>
+                    </div>
                   );
                 })}
               </div>
@@ -497,7 +662,7 @@ export const WelcomeScreen: React.FC = () => {
         >
           <div
             style={{
-              width: 360,
+              width: 400,
               background: '#2b2b2b',
               border: '1px solid #4a4a4a',
               borderRadius: 6,
@@ -549,30 +714,33 @@ export const WelcomeScreen: React.FC = () => {
                 ))}
               </div>
 
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 70px', gap: 6 }}>
-                <label style={{ display: 'flex', flexDirection: 'column', gap: 3, fontSize: 10.5, color: '#aaa' }}>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 74px', gap: 8 }}>
+                <label style={{ display: 'flex', flexDirection: 'column', gap: 3, fontSize: 10.5, color: '#aaa', minWidth: 0 }}>
                   Largura (px)
                   <input
                     type="number"
                     className="harmony-input"
+                    style={{ width: '100%', minWidth: 0 }}
                     value={width}
                     onChange={(e) => setWidth(Number(e.target.value) || 1920)}
                   />
                 </label>
-                <label style={{ display: 'flex', flexDirection: 'column', gap: 3, fontSize: 10.5, color: '#aaa' }}>
+                <label style={{ display: 'flex', flexDirection: 'column', gap: 3, fontSize: 10.5, color: '#aaa', minWidth: 0 }}>
                   Altura (px)
                   <input
                     type="number"
                     className="harmony-input"
+                    style={{ width: '100%', minWidth: 0 }}
                     value={height}
                     onChange={(e) => setHeight(Number(e.target.value) || 1080)}
                   />
                 </label>
-                <label style={{ display: 'flex', flexDirection: 'column', gap: 3, fontSize: 10.5, color: '#aaa' }}>
+                <label style={{ display: 'flex', flexDirection: 'column', gap: 3, fontSize: 10.5, color: '#aaa', minWidth: 0 }}>
                   FPS
                   <input
                     type="number"
                     className="harmony-input"
+                    style={{ width: '100%', minWidth: 0 }}
                     min={1}
                     max={120}
                     value={fps}

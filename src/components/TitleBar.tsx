@@ -84,7 +84,9 @@ export const TitleBar: React.FC = () => {
     autoSaveEnabled,
     autoSaveIntervalSec,
     timelapseRecording,
+    timelapseRootDir,
     timelapseFrames,
+    performanceMode,
     undoStack,
     redoStack,
     undo,
@@ -93,6 +95,8 @@ export const TitleBar: React.FC = () => {
     setAutoSaveEnabled,
     setAutoSaveIntervalSec,
     toggleTimelapseRecording,
+    setTimelapseRootDir,
+    setPerformanceMode,
     toggleSymmetry,
     setPerspectiveMode,
     setAudioTrack,
@@ -292,22 +296,11 @@ export const TitleBar: React.FC = () => {
       {/* Native-style Harmony 27.1 Title + Menu Bar */}
       <div className="title-bar drag-region">
         <div style={{ display: 'flex', alignItems: 'center', gap: 6 }} className="no-drag" ref={menuRef}>
-          <div
-            style={{
-              width: 18,
-              height: 18,
-              borderRadius: 3,
-              background: 'linear-gradient(135deg, #3a86ff, #1d4ed8)',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              fontWeight: 800,
-              fontSize: 11,
-              color: '#fff'
-            }}
-          >
-            C
-          </div>
+          <img
+            src="./icon.png"
+            alt="CelSketch"
+            style={{ width: 18, height: 18, borderRadius: 4, objectFit: 'cover' }}
+          />
           <span style={{ fontWeight: 600, color: '#e5e5e5', marginRight: 8 }}>
             CelSketch
           </span>
@@ -430,7 +423,7 @@ export const TitleBar: React.FC = () => {
                 </button>
                 <div className="dropdown-sep" />
                 <button className="dropdown-item" onClick={() => { resetView(); setOpenMenu(null); }}>
-                  <span>Reset View</span><span style={{ color: '#888' }}>Shift+M</span>
+                  <span>Reset View</span><span style={{ color: '#888' }}>5</span>
                 </button>
               </div>
             )}
@@ -534,7 +527,7 @@ export const TitleBar: React.FC = () => {
         <button className={`icon-btn ${showCameraFrame ? 'active' : ''}`} onClick={toggleCameraFrame} title="Camera Frame">
           <Camera size={14} />
         </button>
-        <button className="icon-btn" onClick={resetView} title="Reset View">
+        <button className="icon-btn" onClick={resetView} title="Reset View (5)">
           <RotateCcw size={14} />
         </button>
         <button
@@ -593,14 +586,50 @@ export const TitleBar: React.FC = () => {
 
         <div className="tb-sep" />
 
-        {/* Timelapse Recording (Process Recorder) */}
+        {/* Timelapse Recording (Auto-Rec Process Recorder) */}
         <button
           className={`icon-btn ${timelapseRecording ? 'active' : ''}`}
-          onClick={toggleTimelapseRecording}
+          onClick={async () => {
+            if (!timelapseRecording) {
+              if (!timelapseRootDir && window.harmonyAPI?.pickDirectory) {
+                const res = await window.harmonyAPI.pickDirectory('Escolha a pasta onde gravar os processos (Auto-Rec)');
+                if (res.canceled || !res.dirPath) return;
+                setTimelapseRootDir(res.dirPath);
+              }
+              toggleTimelapseRecording();
+            } else {
+              toggleTimelapseRecording();
+            }
+          }}
           style={timelapseRecording ? { background: '#b91c1c', borderColor: '#ef4444', color: '#fff' } : undefined}
-          title="Gravar Timelapse do processo de desenho"
+          title={
+            timelapseRootDir
+              ? `Auto-Rec (salva pasta organizada por cena em: ${timelapseRootDir})`
+              : 'Ativar Auto-Rec — pergunta onde salvar os processos organizados por cena'
+          }
         >
           <span>{timelapseRecording ? '● REC' : '○ REC'}</span>
+        </button>
+        <button
+          className="icon-btn"
+          onClick={async (e) => {
+            if (e.shiftKey || !timelapseRootDir) {
+              const res = await window.harmonyAPI?.pickDirectory('Escolha a pasta onde gravar os processos (Auto-Rec)');
+              if (res && !res.canceled && res.dirPath) {
+                setTimelapseRootDir(res.dirPath);
+              }
+            } else {
+              window.harmonyAPI?.openPath(timelapseRootDir);
+            }
+          }}
+          title={
+            timelapseRootDir
+              ? `Pasta do Auto-Rec: ${timelapseRootDir} (Clique para abrir • Shift+Clique para trocar pasta)`
+              : 'Escolher pasta de gravação do Auto-Rec'
+          }
+          style={{ padding: '0 5px' }}
+        >
+          <FolderOpen size={12} />
         </button>
         {timelapseFrames.length > 0 && (
           <button
@@ -611,6 +640,28 @@ export const TitleBar: React.FC = () => {
             <span>Timelapse ({timelapseFrames.length})</span>
           </button>
         )}
+
+        <div className="tb-sep" />
+
+        {/* Performance Mode Switcher (Auto / Eco for weak PCs / Ultra for GPU PCs) */}
+        <button
+          className={`icon-btn ${performanceMode !== 'auto' ? 'active' : ''}`}
+          onClick={() => {
+            const next =
+              performanceMode === 'auto' ? 'eco' : performanceMode === 'eco' ? 'ultra' : 'auto';
+            setPerformanceMode(next);
+          }}
+          title="Modo de Desempenho: Auto (detecta seu PC) • Eco (PC Fraco / sem GPU) • Ultra (GPU / alta definição)"
+          style={{ fontSize: 10.5 }}
+        >
+          <span>
+            {performanceMode === 'auto'
+              ? '⚡ Auto'
+              : performanceMode === 'eco'
+              ? '⚡ Eco'
+              : '⚡ Ultra'}
+          </span>
+        </button>
       </div>
     </>
   );
