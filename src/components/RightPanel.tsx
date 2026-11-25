@@ -91,6 +91,7 @@ export const RightPanel: React.FC = () => {
     bucketReference,
     bucketTolerance,
     bucketExpand,
+    bucketCloseGap,
     bucketBehind,
     onionPrev,
     onionNext,
@@ -108,6 +109,7 @@ export const RightPanel: React.FC = () => {
     setBucketReference,
     setBucketTolerance,
     setBucketExpand,
+    setBucketCloseGap,
     setBucketBehind,
     setOnionRange,
     layers,
@@ -285,6 +287,19 @@ export const RightPanel: React.FC = () => {
               />
 
               <div className="prop-label" style={{ marginTop: 8 }}>
+                <span>Fechar Lacunas (Close Gap)</span>
+                <span>{bucketCloseGap === 0 ? 'Off' : `${bucketCloseGap} px`}</span>
+              </div>
+              <input
+                type="range"
+                min={0}
+                max={24}
+                value={bucketCloseGap}
+                onChange={(e) => setBucketCloseGap(Number(e.target.value))}
+                className="harmony-slider"
+              />
+
+              <div className="prop-label" style={{ marginTop: 8 }}>
                 <span>Expandir Borda</span>
                 <span>{bucketExpand} px</span>
               </div>
@@ -296,6 +311,25 @@ export const RightPanel: React.FC = () => {
                 onChange={(e) => setBucketExpand(Number(e.target.value))}
                 className="harmony-slider"
               />
+
+              <label
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  marginTop: 10,
+                  fontSize: 11,
+                  color: '#bbb',
+                  cursor: 'pointer'
+                }}
+              >
+                <span>Pintar por Trás da Linha</span>
+                <input
+                  type="checkbox"
+                  checked={bucketBehind}
+                  onChange={(e) => setBucketBehind(e.target.checked)}
+                />
+              </label>
             </div>
           ) : (
             <div className="prop-group">

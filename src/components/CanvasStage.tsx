@@ -119,6 +119,7 @@ export const CanvasStage: React.FC = () => {
     bucketReference,
     bucketTolerance,
     bucketExpand,
+    bucketCloseGap,
     bucketBehind,
     swatches,
     activeSwatchId,
@@ -1534,10 +1535,10 @@ export const CanvasStage: React.FC = () => {
     const isStylusEraser = e.pointerType === 'pen' && e.buttons === 32;
     const effectiveTool = isStylusEraser ? 'eraser' : activeTool;
 
-    // Real Scanline Flood-Fill Paint Bucket (G)
+    // Real Scanline Flood-Fill Paint Bucket with Close Gap (G)
     if (effectiveTool === 'paint') {
       pushRecentColor(activeColor);
-      const fillUrl = performFloodFill(
+      const fillRes = performFloodFill(
         layers,
         activeLayerId,
         bucketReference,
@@ -1548,9 +1549,10 @@ export const CanvasStage: React.FC = () => {
         pt.y,
         activeColor,
         bucketTolerance,
-        bucketExpand
+        bucketExpand,
+        bucketCloseGap
       );
-      if (fillUrl) {
+      if (fillRes) {
         addStroke(
           {
             id: `st-bucket-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
@@ -1561,15 +1563,16 @@ export const CanvasStage: React.FC = () => {
             size: 1,
             opacity: brushOpacity,
             smoothing: 0,
-            points: [{ x: 0, y: 0 }],
-            imageDataUrl: fillUrl,
-            imageX: 0,
-            imageY: 0,
-            imageW: canvasWidth,
-            imageH: canvasHeight
+            points: [{ x: fillRes.x, y: fillRes.y }],
+            imageDataUrl: fillRes.dataUrl,
+            imageX: fillRes.x,
+            imageY: fillRes.y,
+            imageW: fillRes.w,
+            imageH: fillRes.h
           },
           bucketBehind
         );
+        captureTimelapseStep();
       }
       return;
     }

@@ -867,8 +867,9 @@ export function performFloodFill(
   startY: number,
   fillHex: string,
   tolerance = 32,
-  expandPx = 1
-): string | null {
+  expandPx = 1,
+  closeGapPx = 0
+): { dataUrl: string; x: number; y: number; w: number; h: number } | null {
   const sx = Math.round(startX);
   const sy = Math.round(startY);
   if (sx < 0 || sy < 0 || sx >= width || sy >= height) return null;
@@ -910,10 +911,8 @@ export function performFloodFill(
   const fg = parseInt(clean.substring(2, 4) || '00', 16);
   const fb = parseInt(clean.substring(4, 6) || '00', 16);
 
-  const visited = new Uint8Array(width * height);
-  const stack: number[] = [sx, sy];
-
-  const matches = (idx: number) => {
+  const totalPixels = width * height;
+  const rawMatches = (idx: number) => {
     const p = idx * 4;
     if (reference === 'active' && sa < 20) {
       // Filling transparent region on active layer: stop at any opaque stroke
@@ -927,7 +926,82 @@ export function performFloodFill(
     );
   };
 
+  // Optional Morphological Close Gap (Fechar Lacunas) — O(W*H) separable dilate + erode on barrier mask
+  let closedBarrier: Uint8Array | null = null;
+  if (closeGapPx > 0) {
+    const r = Math.max(1, Math.ceil(closeGapPx / 2));
+    const barrier = new Uint8Array(totalPixels);
+    for (let i = 0; i < totalPixels; i++) {
+      barrier[i] = rawMatches(i) ? 0 : 1;
+    }
+
+    // Separable O(W*H) 1D dilation (val=1 spreads by r)
+    const dilateH = new Uint8Array(totalPixels);
+    for (let y = 0; y < height; y++) {
+      const row = y * width;
+      let count = 0;
+      for (let x = 0; x <= Math.min(r, width - 1); x++) count += barrier[row + x];
+      for (let x = 0; x < width; x++) {
+        dilateH[row + x] = count > 0 ? 1 : 0;
+        const rem = x - r;
+        const add = x + r + 1;
+        if (rem >= 0) count -= barrier[row + rem];
+        if (add < width) count += barrier[row + add];
+      }
+    }
+    const dilateV = new Uint8Array(totalPixels);
+    for (let x = 0; x < width; x++) {
+      let count = 0;
+      for (let y = 0; y <= Math.min(r, height - 1); y++) count += dilateH[y * width + x];
+      for (let y = 0; y < height; y++) {
+        dilateV[y * width + x] = count > 0 ? 1 : 0;
+        const rem = y - r;
+        const add = y + r + 1;
+        if (rem >= 0) count -= dilateH[rem * width + x];
+        if (add < height) count += dilateH[add * width + x];
+      }
+    }
+
+    // Separable O(W*H) 1D erosion (val=0 spreads by r, restoring original line thickness while keeping gaps sealed!)
+    const erodeH = new Uint8Array(totalPixels);
+    for (let y = 0; y < height; y++) {
+      const row = y * width;
+      let zeros = 0;
+      for (let x = 0; x <= Math.min(r, width - 1); x++) zeros += dilateV[row + x] === 0 ? 1 : 0;
+      for (let x = 0; x < width; x++) {
+        erodeH[row + x] = zeros === 0 ? 1 : 0;
+        const rem = x - r;
+        const add = x + r + 1;
+        if (rem >= 0 && dilateV[row + rem] === 0) zeros--;
+        if (add < width && dilateV[row + add] === 0) zeros++;
+      }
+    }
+    const erodeV = new Uint8Array(totalPixels);
+    for (let x = 0; x < width; x++) {
+      let zeros = 0;
+      for (let y = 0; y <= Math.min(r, height - 1); y++) zeros += erodeH[y * width + x] === 0 ? 1 : 0;
+      for (let y = 0; y < height; y++) {
+        erodeV[y * width + x] = zeros === 0 ? 1 : 0;
+        const rem = y - r;
+        const add = y + r + 1;
+        if (rem >= 0 && erodeH[rem * width + x] === 0) zeros--;
+        if (add < height && erodeH[add * width + x] === 0) zeros++;
+      }
+    }
+
+    // Only use closed barrier if the clicked seed pixel wasn't inside a tight corner closed by dilation
+    if (erodeV[sy * width + sx] === 0) {
+      closedBarrier = erodeV;
+    }
+  }
+
+  const visited = new Uint8Array(totalPixels);
+  const stack: number[] = [sx, sy];
+
+  const matches = (idx: number) => (closedBarrier ? closedBarrier[idx] === 0 : rawMatches(idx));
+
   let filledCount = 0;
+  let minX = width, minY = height, maxX = -1, maxY = -1;
   while (stack.length > 0) {
     const y = stack.pop()!;
     const x = stack.pop()!;
@@ -941,6 +1015,13 @@ export function performFloodFill(
       rx++;
     }
     rx--;
+
+    if (lx <= rx) {
+      if (lx < minX) minX = lx;
+      if (rx > maxX) maxX = rx;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
 
     let spanAbove = false;
     let spanBelow = false;
@@ -972,15 +1053,24 @@ export function performFloodFill(
     }
   }
 
-  if (filledCount === 0) return null;
+  if (filledCount === 0 || maxX < minX || maxY < minY) return null;
 
   // Optional edge expansion (1px-4px) to eliminate anti-aliased white halos around lineart
   let mask = visited;
+  const exMinX = Math.max(0, minX - expandPx);
+  const exMinY = Math.max(0, minY - expandPx);
+  const exMaxX = Math.min(width - 1, maxX + expandPx);
+  const exMaxY = Math.min(height - 1, maxY + expandPx);
+
   for (let pass = 0; pass < expandPx; pass++) {
     const nextMask = new Uint8Array(mask);
-    for (let y = 1; y < height - 1; y++) {
+    const yStart = Math.max(1, exMinY);
+    const yEnd = Math.min(height - 2, exMaxY);
+    const xStart = Math.max(1, exMinX);
+    const xEnd = Math.min(width - 2, exMaxX);
+    for (let y = yStart; y <= yEnd; y++) {
       const row = y * width;
-      for (let x = 1; x < width - 1; x++) {
+      for (let x = xStart; x <= xEnd; x++) {
         const i = row + x;
         if (mask[i]) {
           nextMask[i - 1] = 1;
@@ -993,24 +1083,37 @@ export function performFloodFill(
     mask = nextMask;
   }
 
+  // Export ONLY the tight cropped bounding box (saves ~95% RAM & file size!)
+  const bw = exMaxX - exMinX + 1;
+  const bh = exMaxY - exMinY + 1;
   const outCanvas = document.createElement('canvas');
-  outCanvas.width = width;
-  outCanvas.height = height;
+  outCanvas.width = bw;
+  outCanvas.height = bh;
   const octx = outCanvas.getContext('2d');
   if (!octx) return null;
-  const outImg = octx.createImageData(width, height);
+  const outImg = octx.createImageData(bw, bh);
   const outData = outImg.data;
 
-  for (let i = 0; i < mask.length; i++) {
-    if (mask[i]) {
-      const p = i * 4;
-      outData[p] = fr;
-      outData[p + 1] = fg;
-      outData[p + 2] = fb;
-      outData[p + 3] = 255;
+  for (let y = 0; y < bh; y++) {
+    const srcRow = (exMinY + y) * width + exMinX;
+    const dstRow = y * bw;
+    for (let x = 0; x < bw; x++) {
+      if (mask[srcRow + x]) {
+        const p = (dstRow + x) * 4;
+        outData[p] = fr;
+        outData[p + 1] = fg;
+        outData[p + 2] = fb;
+        outData[p + 3] = 255;
+      }
     }
   }
 
   octx.putImageData(outImg, 0, 0);
-  return outCanvas.toDataURL('image/png');
+  return {
+    dataUrl: outCanvas.toDataURL('image/png'),
+    x: exMinX,
+    y: exMinY,
+    w: bw,
+    h: bh
+  };
 }

@@ -115,6 +115,7 @@ interface HarmonyState {
   bucketReference: 'all' | 'active';
   bucketTolerance: number;
   bucketExpand: number;
+  bucketCloseGap: number;
   bucketBehind: boolean;
 
   // Timelapse recording
@@ -180,6 +181,7 @@ interface HarmonyState {
   setBucketReference: (ref: 'all' | 'active') => void;
   setBucketTolerance: (tol: number) => void;
   setBucketExpand: (px: number) => void;
+  setBucketCloseGap: (px: number) => void;
   setBucketBehind: (behind: boolean) => void;
 
   setZoom: (zoom: number) => void;
@@ -411,6 +413,7 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
   bucketReference: savedPrefs.bucketReference === 'all' ? 'all' : 'active',
   bucketTolerance: typeof savedPrefs.bucketTolerance === 'number' ? savedPrefs.bucketTolerance : 32,
   bucketExpand: typeof savedPrefs.bucketExpand === 'number' ? savedPrefs.bucketExpand : 1,
+  bucketCloseGap: typeof savedPrefs.bucketCloseGap === 'number' ? savedPrefs.bucketCloseGap : 4,
   bucketBehind: typeof savedPrefs.bucketBehind === 'boolean' ? savedPrefs.bucketBehind : false,
 
   timelapseRecording: false,
@@ -533,6 +536,7 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
   setBucketReference: (bucketReference) => set({ bucketReference }),
   setBucketTolerance: (bucketTolerance) => set({ bucketTolerance: Math.max(0, Math.min(150, bucketTolerance)) }),
   setBucketExpand: (bucketExpand) => set({ bucketExpand: Math.max(0, Math.min(4, bucketExpand)) }),
+  setBucketCloseGap: (bucketCloseGap) => set({ bucketCloseGap: Math.max(0, Math.min(24, Math.round(bucketCloseGap))) }),
   setBucketBehind: (bucketBehind) => set({ bucketBehind }),
 
   setZoom: (zoom) => set({ zoom: Math.max(0.1, Math.min(8, zoom)) }),
@@ -1796,6 +1800,7 @@ useHarmonyStore.subscribe((s) => {
         bucketReference: s.bucketReference,
         bucketTolerance: s.bucketTolerance,
         bucketExpand: s.bucketExpand,
+        bucketCloseGap: s.bucketCloseGap,
         bucketBehind: s.bucketBehind,
         showGrid: s.showGrid,
         showCameraFrame: s.showCameraFrame,
