@@ -168,7 +168,11 @@ export const RightPanel: React.FC = () => {
       activeSelectionInverted: s.activeSelectionInverted,
       layers: s.layers,
       activeLayerId: s.activeLayerId,
-      currentFrame: s.currentFrame,
+      // Only re-render RightPanel on frame change when paused on a Camera layer (ZERO re-renders during Play!)
+      currentFrame:
+        !s.isPlaying && s.layers.find((l) => l.id === s.activeLayerId)?.type === 'camera'
+          ? s.currentFrame
+          : 0,
       cameraViewMode: s.cameraViewMode,
       cameraGuides: s.cameraGuides
     }))

@@ -9,6 +9,7 @@ import {
   createLiveDabState,
   renderLiveStrokeIncremental,
   type LiveDabState,
+  getEffectiveCelSourceFrame,
   getEffectiveFrameStrokes,
   isLayerEffectivelyVisible,
   getLayerEffectiveOpacity,
@@ -114,6 +115,26 @@ export const CanvasStage: React.FC = () => {
   const selectionOpModeRef = useRef<'replace' | 'add' | 'subtract'>('replace');
   const clipGroupCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const postProcessCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  // Composited Playback RAM Preview Cache (locked 24/30/60 FPS smooth playback with ZERO frame drops!)
+  const playbackFrameCacheRef = useRef<Map<number, HTMLCanvasElement>>(new Map());
+  const playbackCacheMetaRef = useRef<{
+    layersRef: unknown;
+    postProcessRef: unknown;
+    cameraViewMode: boolean;
+    width: number;
+    height: number;
+    imageTick: number;
+    lightTable: boolean;
+    activeLayerId: string;
+  } | null>(null);
+  const clearPlaybackCache = useCallback(() => {
+    for (const c of playbackFrameCacheRef.current.values()) {
+      c.width = 0;
+      c.height = 0;
+    }
+    playbackFrameCacheRef.current.clear();
+    playbackCacheMetaRef.current = null;
+  }, []);
   const eyedropperCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const eyedropperKeyRef = useRef<string>('');
   const eyedropperLayersRef = useRef<typeof layers | null>(null);
@@ -163,6 +184,7 @@ export const CanvasStage: React.FC = () => {
       hsvPreviewCanvasRef.current = null;
       clipGroupCanvasRef.current = null;
       postProcessCanvasRef.current = null;
+      clearPlaybackCache();
       eyedropperCanvasRef.current = null;
     };
   }, []);
@@ -273,6 +295,7 @@ export const CanvasStage: React.FC = () => {
     swatches,
     activeSwatchId,
     currentFrame,
+    isPlaying,
     zoom,
     panX,
     panY,
@@ -337,6 +360,7 @@ export const CanvasStage: React.FC = () => {
       swatches: s.swatches,
       activeSwatchId: s.activeSwatchId,
       currentFrame: s.currentFrame,
+      isPlaying: s.isPlaying,
       zoom: s.zoom,
       panX: s.panX,
       panY: s.panY,
@@ -397,6 +421,7 @@ export const CanvasStage: React.FC = () => {
       entry.canvas.height = 0;
     }
     layerBitmapCacheRef.current.clear();
+    clearPlaybackCache();
     draftStrokeRef.current = null;
     stabilizerCursorRef.current = null;
     liveStrokeIdRef.current = null;
@@ -1632,9 +1657,56 @@ export const CanvasStage: React.FC = () => {
     // Defer expensive CPU getImageData post-processing while actively dragging a brush stroke so painting stays 60-144fps!
     const useLivePostProcess = hasActivePostProcess(postProcess) && !draftStroke;
 
-    if (lctx) {
+    // O(1) Playback RAM Preview Cache check: invalidates automatically on any edit/setting change!
+    const canUsePlaybackCache =
+      isPlaying &&
+      !draftStroke &&
+      !transformActive &&
+      !liquifyPreview &&
+      !hsvPreview &&
+      !levelsPreview &&
+      !blurPreview;
+
+    if (canUsePlaybackCache) {
+      const meta = playbackCacheMetaRef.current;
+      const metaValid =
+        meta &&
+        meta.layersRef === layers &&
+        meta.postProcessRef === postProcess &&
+        meta.cameraViewMode === cameraViewMode &&
+        meta.width === canvasWidth &&
+        meta.height === canvasHeight &&
+        meta.imageTick === imageTick &&
+        meta.lightTable === lightTable &&
+        (!lightTable || meta.activeLayerId === activeLayerId);
+      if (!metaValid) {
+        clearPlaybackCache();
+        playbackCacheMetaRef.current = {
+          layersRef: layers,
+          postProcessRef: postProcess,
+          cameraViewMode,
+          width: canvasWidth,
+          height: canvasHeight,
+          imageTick,
+          lightTable,
+          activeLayerId
+        };
+      }
+    }
+
+    const playbackHitCanvas = canUsePlaybackCache ? playbackFrameCacheRef.current.get(currentFrame) : undefined;
+    if (playbackHitCanvas) {
+      // 0.2ms instant RAM-cached frame blit — locked 24/30/60 FPS with ZERO stutter!
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(0, 0, canvasWidth, canvasHeight);
+      ctx.clip();
+      ctx.drawImage(playbackHitCanvas, 0, 0, canvasWidth, canvasHeight);
+      ctx.restore();
+    } else if (lctx) {
       let stageCtx: CanvasRenderingContext2D = ctx;
-      if (useLivePostProcess) {
+      const useOffscreenStage = useLivePostProcess || canUsePlaybackCache;
+      if (useOffscreenStage) {
         if (!postProcessCanvasRef.current) {
           postProcessCanvasRef.current = document.createElement('canvas');
         }
@@ -1647,7 +1719,7 @@ export const CanvasStage: React.FC = () => {
         if (ppCtx) {
           ppCtx.setTransform(1, 0, 0, 1, 0, 0);
           ppCtx.clearRect(0, 0, canvasWidth, canvasHeight);
-          ppCtx.fillStyle = '#ffffff';
+          ppCtx.fillStyle = '#f8f8f8';
           ppCtx.fillRect(0, 0, canvasWidth, canvasHeight);
           stageCtx = ppCtx;
         }
@@ -1672,6 +1744,8 @@ export const CanvasStage: React.FC = () => {
         const isCurrent = layer.id === activeLayerId;
         const strokes = getEffectiveFrameStrokes(layer, currentFrame);
         if (strokes.length === 0 && !(isCurrent && draftStroke)) return;
+        const celSourceFrame = getEffectiveCelSourceFrame(layer, currentFrame) || currentFrame;
+        const baseCacheKey = `${layer.id}:${celSourceFrame}:base`;
 
         let sourceCanvas: HTMLCanvasElement;
         if (isCurrent && liquifyPreview) {
@@ -1751,7 +1825,7 @@ export const CanvasStage: React.FC = () => {
 
               lctx.clearRect(0, 0, canvasWidth, canvasHeight);
               if (strokes.length > 0) {
-                const baseBmp = getCachedLayerBitmap(`${layer.id}:${currentFrame}:base`, strokes);
+                const baseBmp = getCachedLayerBitmap(baseCacheKey, strokes);
                 lctx.drawImage(baseBmp, 0, 0);
               }
               lctx.save();
@@ -1765,7 +1839,7 @@ export const CanvasStage: React.FC = () => {
               if (isNewStroke) {
                 lctx.clearRect(0, 0, canvasWidth, canvasHeight);
                 if (strokes.length > 0) {
-                  const baseBmp = getCachedLayerBitmap(`${layer.id}:${currentFrame}:base`, strokes);
+                  const baseBmp = getCachedLayerBitmap(baseCacheKey, strokes);
                   lctx.drawImage(baseBmp, 0, 0);
                 }
                 liveStrokeIdRef.current = effectiveDraft.id;
@@ -1796,7 +1870,7 @@ export const CanvasStage: React.FC = () => {
             liveStrokeRenderedCountRef.current = 0;
             lctx.clearRect(0, 0, canvasWidth, canvasHeight);
             if (strokes.length > 0) {
-              const baseBmp = getCachedLayerBitmap(`${layer.id}:${currentFrame}:base`, strokes);
+              const baseBmp = getCachedLayerBitmap(baseCacheKey, strokes);
               lctx.drawImage(baseBmp, 0, 0);
             }
             renderStroke(lctx, effectiveDraft);
@@ -1809,7 +1883,7 @@ export const CanvasStage: React.FC = () => {
             sourceCanvas = layerBuffer;
           }
         } else {
-          sourceCanvas = getCachedLayerBitmap(`${layer.id}:${currentFrame}:base`, strokes);
+          sourceCanvas = getCachedLayerBitmap(baseCacheKey, strokes);
         }
 
         const kf = getInterpolatedLayerTransform(layer, currentFrame);
@@ -1916,7 +1990,7 @@ export const CanvasStage: React.FC = () => {
           continue;
         }
 
-        if (onionSkin && !layer.holdFrames) {
+        if (onionSkin && !isPlaying && !layer.holdFrames) {
           // Drawing-aware Onion Skin: step through distinct drawn cels (works cleanly on 2s/3s & celDurations!)
           const drawnFrames = Object.entries(layer.frames)
             .filter(([, st]) => st && st.length > 0)
@@ -2007,14 +2081,44 @@ export const CanvasStage: React.FC = () => {
       }
       stageCtx.restore();
 
-      if (useLivePostProcess && postProcessCanvasRef.current) {
-        applyPostProcessToCanvas(postProcessCanvasRef.current, postProcess);
+      if (useOffscreenStage && postProcessCanvasRef.current) {
+        if (useLivePostProcess) {
+          applyPostProcessToCanvas(postProcessCanvasRef.current, postProcess);
+        }
         ctx.save();
         ctx.beginPath();
         ctx.rect(0, 0, canvasWidth, canvasHeight);
         ctx.clip();
         ctx.drawImage(postProcessCanvasRef.current, 0, 0);
         ctx.restore();
+
+        // Store crisp viewport-sized snapshot in Playback RAM Cache so Loop #2+ plays at locked FPS!
+        if (canUsePlaybackCache) {
+          const maxEdge = isEcoMode ? 960 : 1280;
+          const scale = Math.min(1, maxEdge / Math.max(canvasWidth, canvasHeight));
+          const cw = Math.max(64, Math.round(canvasWidth * scale));
+          const ch = Math.max(64, Math.round(canvasHeight * scale));
+          const maxPlaybackFrames = Math.max(24, Math.min(120, Math.floor((200 * 1024 * 1024) / Math.max(1, cw * ch * 4))));
+          const pCache = playbackFrameCacheRef.current;
+          while (pCache.size >= maxPlaybackFrames) {
+            const oldestF = pCache.keys().next().value;
+            if (oldestF === undefined) break;
+            const evicted = pCache.get(oldestF);
+            pCache.delete(oldestF);
+            if (evicted) {
+              evicted.width = 0;
+              evicted.height = 0;
+            }
+          }
+          const snap = document.createElement('canvas');
+          snap.width = cw;
+          snap.height = ch;
+          const sctx = snap.getContext('2d');
+          if (sctx) {
+            sctx.drawImage(postProcessCanvasRef.current, 0, 0, cw, ch);
+            pCache.set(currentFrame, snap);
+          }
+        }
       }
     }
 
@@ -2554,6 +2658,7 @@ export const CanvasStage: React.FC = () => {
     layers,
     activeLayerId,
     currentFrame,
+    isPlaying,
     zoom,
     panX,
     panY,

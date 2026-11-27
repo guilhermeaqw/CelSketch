@@ -71,6 +71,17 @@ export async function decodeAudioBufferTrack(
   }
 }
 
+const StatusBarFrame: React.FC = () => {
+  const { fps, currentFrame } = useHarmonyStore(
+    useShallow((s) => ({ fps: s.fps, currentFrame: s.currentFrame }))
+  );
+  return (
+    <>
+      CelSketch (Windows x64) &nbsp;|&nbsp; {fps} FPS &nbsp;|&nbsp; Frame {currentFrame}
+    </>
+  );
+};
+
 export const App: React.FC = () => {
   const [recoveryOffer, setRecoveryOffer] = useState<{ content: string; mtimeMs: number } | null>(null);
   const [closeConfirmOpen, setCloseConfirmOpen] = useState(false);
@@ -95,8 +106,6 @@ export const App: React.FC = () => {
     activeTool,
     activeLayerId,
     layers,
-    fps,
-    currentFrame,
     lastAutoSaveTime,
     autoSaveEnabled,
     autoSaveIntervalSec,
@@ -113,8 +122,6 @@ export const App: React.FC = () => {
       activeTool: s.activeTool,
       activeLayerId: s.activeLayerId,
       layers: s.layers,
-      fps: s.fps,
-      currentFrame: s.currentFrame,
       lastAutoSaveTime: s.lastAutoSaveTime,
       autoSaveEnabled: s.autoSaveEnabled,
       autoSaveIntervalSec: s.autoSaveIntervalSec,
@@ -620,7 +627,7 @@ export const App: React.FC = () => {
           {lastAutoSaveTime && (
             <span style={{ color: '#4ade80', marginRight: 10 }}>AutoSaved {lastAutoSaveTime}</span>
           )}
-          CelSketch (Windows x64) &nbsp;|&nbsp; {fps} FPS &nbsp;|&nbsp; Frame {currentFrame}
+          <StatusBarFrame />
         </span>
       </div>
     </div>

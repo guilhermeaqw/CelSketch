@@ -331,6 +331,28 @@ export function getLayerEffectiveOpacity(layer: DrawingLayer, allLayers: Drawing
   return Math.max(0, Math.min(1, opacity));
 }
 
+/**
+ * Returns the source start frame number whose strokes array is active on `frame`
+ * (or 0 if empty). Allows bitmap caching to deduplicate held cels & holdFrames across frames!
+ */
+export function getEffectiveCelSourceFrame(layer: DrawingLayer, frame: number): number {
+  if (layer.frames[frame] !== undefined) return frame;
+  if (layer.celDurations) {
+    for (let f = frame - 1; f >= 1; f--) {
+      if (layer.frames[f] !== undefined) {
+        const dur = layer.celDurations[f] || 1;
+        if (dur > 1 && frame < f + dur) return f;
+        break;
+      }
+    }
+  }
+  if (!layer.holdFrames) return 0;
+  for (let f = frame - 1; f >= 1; f--) {
+    if (layer.frames[f] !== undefined) return f;
+  }
+  return 0;
+}
+
 export function getEffectiveFrameStrokes(layer: DrawingLayer, frame: number): Stroke[] {
   const direct = layer.frames[frame];
   // Explicit frame entry (even `[]` blank Cel!) takes precedence and stops earlier hold/celDurations

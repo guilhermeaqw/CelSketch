@@ -27,7 +27,7 @@ import {
 } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { useHarmonyStore } from '../store/useHarmonyStore';
-import { getEffectiveFrameStrokes, renderStroke } from '../utils/canvasRenderer';
+import { getEffectiveFrameStrokes, preloadFrameImages, renderStroke } from '../utils/canvasRenderer';
 import { CAMERA_EFFECT_PRESETS } from '../utils/cameraUtils';
 import { DrawingLayer, PoseTag } from '../types/harmony';
 
@@ -421,18 +421,38 @@ export const TimelinePanel: React.FC = () => {
     };
   }, [frameMenu]);
 
-  // Playback timer
+  // High-precision VSync-synced playback loop (requestAnimationFrame + drift clamp — eliminates setInterval stutter!)
   useEffect(() => {
     if (!isPlaying) return;
-    const interval = window.setInterval(() => {
-      const state = useHarmonyStore.getState();
-      if (state.currentFrame >= state.playEnd && !state.loopPlayback) {
-        setIsPlaying(false);
-      } else {
+    const initState = useHarmonyStore.getState();
+    preloadFrameImages(initState.layers, initState.playStart, initState.playEnd).catch(() => {});
+
+    const frameMs = 1000 / Math.max(1, fps);
+    let lastTime = performance.now();
+    let acc = 0;
+    let rafId = 0;
+
+    const tick = (now: number) => {
+      const dt = Math.min(frameMs * 2.5, Math.max(0, now - lastTime));
+      lastTime = now;
+      acc += dt;
+
+      if (acc >= frameMs) {
+        // Advance 1 frame cleanly per display refresh (never stutter-burst multiple frames at once)
+        acc = acc % frameMs;
+        const state = useHarmonyStore.getState();
+        if (!state.isPlaying) return;
+        if (state.currentFrame >= state.playEnd && !state.loopPlayback) {
+          setIsPlaying(false);
+          return;
+        }
         state.nextFrame();
       }
-    }, 1000 / fps);
-    return () => window.clearInterval(interval);
+      rafId = window.requestAnimationFrame(tick);
+    };
+
+    rafId = window.requestAnimationFrame(tick);
+    return () => window.cancelAnimationFrame(rafId);
   }, [isPlaying, fps, setIsPlaying]);
 
   // Global mouse move/up for Scrubbing, Onion Handles, and Cel Resize/Move
@@ -533,20 +553,24 @@ export const TimelinePanel: React.FC = () => {
     moveCelFrame
   ]);
 
-  // Auto-Scroll Timeline horizontally to keep the red Playhead visible during Play / stepping
+  // Auto-Scroll Timeline horizontally via rAF to keep the red Playhead visible with ZERO synchronous layout thrash
   useEffect(() => {
-    const scroller = scrollContainerRef.current;
-    if (!scroller || isScrubbing) return;
-    const stickyLayerColWidth = 262;
-    const playheadX = (currentFrame - 1) * timelineCellWidth;
-    const visibleTrackWidth = Math.max(60, scroller.clientWidth - stickyLayerColWidth);
-    const margin = Math.min(48, visibleTrackWidth * 0.2);
+    if (isScrubbing) return;
+    const id = window.requestAnimationFrame(() => {
+      const scroller = scrollContainerRef.current;
+      if (!scroller) return;
+      const stickyLayerColWidth = 262;
+      const playheadX = (currentFrame - 1) * timelineCellWidth;
+      const visibleTrackWidth = Math.max(60, scroller.clientWidth - stickyLayerColWidth);
+      const margin = Math.min(48, visibleTrackWidth * 0.2);
 
-    if (playheadX < scroller.scrollLeft + margin) {
-      scroller.scrollLeft = Math.max(0, playheadX - margin);
-    } else if (playheadX + timelineCellWidth > scroller.scrollLeft + visibleTrackWidth - margin) {
-      scroller.scrollLeft = playheadX + timelineCellWidth - visibleTrackWidth + margin;
-    }
+      if (playheadX < scroller.scrollLeft + margin) {
+        scroller.scrollLeft = Math.max(0, playheadX - margin);
+      } else if (playheadX + timelineCellWidth > scroller.scrollLeft + visibleTrackWidth - margin) {
+        scroller.scrollLeft = playheadX + timelineCellWidth - visibleTrackWidth + margin;
+      }
+    });
+    return () => window.cancelAnimationFrame(id);
   }, [currentFrame, timelineCellWidth, isScrubbing]);
 
   // Clear timeline focus when user clicks outside the Timeline panel
@@ -1419,20 +1443,30 @@ export const TimelinePanel: React.FC = () => {
                     position: 'relative'
                   }}
                 >
-                  {/* Background Grid Cells */}
-                  {framesArray.map((f) => {
-                    const hasDirectDrawing = (layer.frames[f]?.length || 0) > 0;
-                    const isExplicitBlank = !hasDirectDrawing && layer.frames[f] !== undefined;
-                    const hasHeldDrawing =
-                      !hasDirectDrawing && !isExplicitBlank && getEffectiveFrameStrokes(layer, f).length > 0;
-                    const isCurr = f === currentFrame;
-                    const isInSel =
-                      selRange &&
-                      selRange.layerId === layer.id &&
-                      f >= Math.min(selRange.start, selRange.end) &&
-                      f <= Math.max(selRange.start, selRange.end);
+                  {/* Background Grid Cells — O(N) forward exposure scan instead of O(N^2) per cell! */}
+                  {(() => {
+                    let holdUntil = 0;
+                    let heldByFlag = false;
+                    return framesArray.map((f) => {
+                      const hasDirectDrawing = (layer.frames[f]?.length || 0) > 0;
+                      const isExplicitBlank = !hasDirectDrawing && layer.frames[f] !== undefined;
+                      if (hasDirectDrawing) {
+                        const dur = layer.celDurations?.[f] || 1;
+                        holdUntil = dur > 1 ? f + dur - 1 : 0;
+                        heldByFlag = Boolean(layer.holdFrames);
+                      } else if (isExplicitBlank) {
+                        holdUntil = 0;
+                        heldByFlag = false;
+                      }
+                      const hasHeldDrawing = !hasDirectDrawing && !isExplicitBlank && (f <= holdUntil || heldByFlag);
+                      const isCurr = f === currentFrame;
+                      const isInSel =
+                        selRange &&
+                        selRange.layerId === layer.id &&
+                        f >= Math.min(selRange.start, selRange.end) &&
+                        f <= Math.max(selRange.start, selRange.end);
 
-                    return (
+                      return (
                       <div
                         key={f}
                         onPointerEnter={() => setHoveredCell({ layerId: layer.id, frame: f })}
@@ -1542,7 +1576,8 @@ export const TimelinePanel: React.FC = () => {
                         )}
                       </div>
                     );
-                  })}
+                    });
+                  })()}
 
                   {/* Continuous Cyan Span Bar between Camera Keyframes */}
                   {layer.type === 'camera' &&
