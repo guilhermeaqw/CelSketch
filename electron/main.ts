@@ -2,6 +2,15 @@ import { app, BrowserWindow, ipcMain, dialog, Menu, shell } from 'electron';
 import * as path from 'path';
 import * as fs from 'fs';
 import { execFile } from 'child_process';
+import {
+  checkForUpdates,
+  downloadUpdate,
+  cancelActiveDownload,
+  installDownloadedUpdate,
+  detectInstallMode,
+  type UpdateCheckResult,
+  type InstallMode
+} from './updater';
 
 const fsp = fs.promises;
 
@@ -11,10 +20,46 @@ app.commandLine.appendSwitch('enable-zero-copy');
 app.commandLine.appendSwitch('enable-accelerated-2d-canvas');
 app.commandLine.appendSwitch('disable-renderer-backgrounding');
 
+let launcherWindow: BrowserWindow | null = null;
 let mainWindow: BrowserWindow | null = null;
 let hasUnsavedChanges = false;
 let forceClosing = false;
 let pendingLaunchFile: string | null = null;
+let lastUpdateCheck: UpdateCheckResult | null = null;
+
+interface LauncherPrefs {
+  autoLaunchIfUpToDate: boolean;
+}
+
+function getLauncherPrefsPath(): string {
+  return path.join(app.getPath('userData'), 'launcher_prefs.json');
+}
+
+async function readLauncherPrefs(): Promise<LauncherPrefs> {
+  try {
+    const raw = await fsp.readFile(getLauncherPrefsPath(), 'utf-8');
+    const parsed = JSON.parse(raw);
+    return {
+      autoLaunchIfUpToDate: Boolean(parsed?.autoLaunchIfUpToDate)
+    };
+  } catch {
+    return { autoLaunchIfUpToDate: false };
+  }
+}
+
+async function writeLauncherPrefs(prefs: Partial<LauncherPrefs>): Promise<LauncherPrefs> {
+  const current = await readLauncherPrefs();
+  const next: LauncherPrefs = {
+    autoLaunchIfUpToDate:
+      typeof prefs.autoLaunchIfUpToDate === 'boolean' ? prefs.autoLaunchIfUpToDate : current.autoLaunchIfUpToDate
+  };
+  try {
+    await writeFileAtomic(getLauncherPrefsPath(), JSON.stringify(next, null, 2));
+  } catch {
+    // ignore
+  }
+  return next;
+}
 
 const PROJECT_EXTS = new Set(['.celsketch', '.nexo', '.hrm']);
 
@@ -63,18 +108,28 @@ if (!gotTheLock) {
 } else {
   app.on('second-instance', (_event, commandLine) => {
     const filePath = extractProjectPathFromArgv(commandLine);
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore();
-      mainWindow.focus();
-      if (filePath) {
+    if (filePath) {
+      if (mainWindow) {
+        if (mainWindow.isMinimized()) mainWindow.restore();
+        mainWindow.focus();
         if (mainWindow.webContents.isLoading()) {
           pendingLaunchFile = filePath;
         } else {
           mainWindow.webContents.send('file:openExternalPath', filePath);
         }
+      } else {
+        createEditorWindow(filePath);
       }
-    } else if (filePath) {
-      pendingLaunchFile = filePath;
+      return;
+    }
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+    } else if (launcherWindow) {
+      if (launcherWindow.isMinimized()) launcherWindow.restore();
+      launcherWindow.focus();
+    } else {
+      createLauncherWindow();
     }
   });
 }
@@ -83,17 +138,99 @@ app.on('open-file', (event, filePath) => {
   event.preventDefault();
   if (mainWindow && !mainWindow.webContents.isLoading()) {
     mainWindow.webContents.send('file:openExternalPath', filePath);
-  } else {
+  } else if (mainWindow) {
     pendingLaunchFile = filePath;
+  } else {
+    createEditorWindow(filePath);
   }
 });
 
-function createWindow() {
+function createLauncherWindow() {
+  if (launcherWindow) {
+    if (launcherWindow.isMinimized()) launcherWindow.restore();
+    launcherWindow.focus();
+    return;
+  }
+
+  launcherWindow = new BrowserWindow({
+    width: 900,
+    height: 580,
+    resizable: false,
+    maximizable: false,
+    center: true,
+    show: false,
+    title: 'CelSketch Launcher',
+    icon: path.join(__dirname, '../dist/icon.png'),
+    backgroundColor: '#16181d',
+    frame: false,
+    titleBarStyle: 'hidden',
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true
+    }
+  });
+
+  Menu.setApplicationMenu(null);
+
+  launcherWindow.webContents.on('will-navigate', (event, url) => {
+    const isDevLocal = !app.isPackaged && url.startsWith('http://localhost:5173');
+    if (!isDevLocal) {
+      event.preventDefault();
+    }
+  });
+  launcherWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (url.startsWith('https://') || url.startsWith('http://')) {
+      shell.openExternal(url).catch(() => {});
+    }
+    return { action: 'deny' };
+  });
+
+  launcherWindow.once('ready-to-show', () => {
+    launcherWindow?.show();
+  });
+
+  const isDev = !app.isPackaged;
+  if (isDev) {
+    launcherWindow.loadURL('http://localhost:5173/?mode=launcher');
+  } else {
+    launcherWindow.loadFile(path.join(__dirname, '../dist/index.html'), {
+      query: { mode: 'launcher' }
+    });
+  }
+
+  launcherWindow.on('closed', () => {
+    launcherWindow = null;
+  });
+}
+
+function createEditorWindow(initialFile?: string | null) {
+  if (initialFile) {
+    pendingLaunchFile = initialFile;
+  }
+
+  if (mainWindow) {
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.focus();
+    if (initialFile) {
+      if (!mainWindow.webContents.isLoading()) {
+        mainWindow.webContents.send('file:openExternalPath', initialFile);
+        pendingLaunchFile = null;
+      }
+    }
+    if (launcherWindow) {
+      launcherWindow.close();
+    }
+    return;
+  }
+
   mainWindow = new BrowserWindow({
     width: 1440,
     height: 900,
     minWidth: 1024,
     minHeight: 680,
+    show: false,
     title: 'CelSketch',
     icon: path.join(__dirname, '../dist/icon.png'),
     backgroundColor: '#232323',
@@ -107,7 +244,6 @@ function createWindow() {
     }
   });
 
-  mainWindow.maximize();
   Menu.setApplicationMenu(null);
 
   // Prevent accidental drag-and-drop navigation away from CelSketch
@@ -123,6 +259,20 @@ function createWindow() {
     }
     return { action: 'deny' };
   });
+
+  let shown = false;
+  const revealEditor = () => {
+    if (shown || !mainWindow) return;
+    shown = true;
+    mainWindow.maximize();
+    mainWindow.show();
+    if (launcherWindow) {
+      launcherWindow.close();
+    }
+  };
+
+  mainWindow.once('ready-to-show', revealEditor);
+  setTimeout(revealEditor, 3500);
 
   const isDev = !app.isPackaged;
   if (isDev) {
@@ -143,15 +293,20 @@ function createWindow() {
   mainWindow.on('closed', () => {
     mainWindow = null;
     forceClosing = false;
+    hasUnsavedChanges = false;
   });
 }
 
 app.whenReady().then(() => {
   if (!gotTheLock) return;
-  createWindow();
+  if (pendingLaunchFile) {
+    createEditorWindow(pendingLaunchFile);
+  } else {
+    createLauncherWindow();
+  }
 
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    if (BrowserWindow.getAllWindows().length === 0) createLauncherWindow();
   });
 });
 
@@ -159,18 +314,29 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
 
-// Window controls & dirty state
-ipcMain.handle('window:minimize', () => mainWindow?.minimize());
-ipcMain.handle('window:maximize', () => {
-  if (mainWindow?.isMaximized()) {
-    mainWindow.unmaximize();
-  } else {
-    mainWindow?.maximize();
-  }
-  return mainWindow?.isMaximized() ?? false;
+// Window controls & dirty state (targets whichever window sent the IPC: Launcher or Editor)
+ipcMain.handle('window:minimize', (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender) || mainWindow || launcherWindow;
+  win?.minimize();
 });
-ipcMain.handle('window:close', () => mainWindow?.close());
-ipcMain.handle('window:isMaximized', () => mainWindow?.isMaximized() ?? false);
+ipcMain.handle('window:maximize', (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender) || mainWindow;
+  if (!win || !win.isMaximizable()) return false;
+  if (win.isMaximized()) {
+    win.unmaximize();
+  } else {
+    win.maximize();
+  }
+  return win.isMaximized();
+});
+ipcMain.handle('window:close', (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender) || mainWindow || launcherWindow;
+  win?.close();
+});
+ipcMain.handle('window:isMaximized', (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender) || mainWindow;
+  return win?.isMaximized() ?? false;
+});
 ipcMain.handle('window:setDirty', (_event, dirty: boolean) => {
   hasUnsavedChanges = Boolean(dirty);
 });
@@ -185,6 +351,95 @@ ipcMain.handle('window:confirmClose', (_event, discardRecovery: boolean) => {
   }
   mainWindow?.close();
 });
+
+// App metadata, Launcher navigation & Auto-Updater IPCs
+ipcMain.handle('app:getInfo', () => ({
+  version: app.getVersion(),
+  installMode: detectInstallMode(),
+  platform: process.platform,
+  editorOpen: Boolean(mainWindow)
+}));
+
+ipcMain.handle('launcher:getPrefs', async () => readLauncherPrefs());
+ipcMain.handle('launcher:setPrefs', async (_event, prefs: Partial<LauncherPrefs>) => writeLauncherPrefs(prefs));
+
+ipcMain.handle('launcher:launchEditor', (_event, opts?: { projectPath?: string | null }) => {
+  createEditorWindow(opts?.projectPath || null);
+  return { ok: true };
+});
+
+ipcMain.handle('launcher:openLauncher', () => {
+  createLauncherWindow();
+  return { ok: true };
+});
+
+ipcMain.handle('launcher:pickProjectFile', async (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender) || launcherWindow || mainWindow;
+  if (!win) return { canceled: true };
+  try {
+    const result = await dialog.showOpenDialog(win, {
+      title: 'Abrir Projeto CelSketch',
+      filters: [{ name: 'CelSketch Project', extensions: ['celsketch', 'nexo', 'hrm'] }],
+      properties: ['openFile']
+    });
+    if (result.canceled || result.filePaths.length === 0) return { canceled: true };
+    return { canceled: false, filePath: result.filePaths[0] };
+  } catch (err: any) {
+    return { canceled: true, error: err?.message || 'Erro ao escolher arquivo' };
+  }
+});
+
+ipcMain.handle('updater:check', async () => {
+  const res = await checkForUpdates();
+  lastUpdateCheck = res;
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('updater:statusChanged', res);
+  }
+  return res;
+});
+
+ipcMain.handle('updater:getLastCheck', () => lastUpdateCheck);
+
+ipcMain.handle(
+  'updater:download',
+  async (
+    event,
+    { assetUrl, assetName, expectedSha256 }: { assetUrl: string; assetName: string; expectedSha256: string | null }
+  ) => {
+    const sender = event.sender;
+    return downloadUpdate(assetUrl, assetName, expectedSha256, (progress) => {
+      if (!sender.isDestroyed()) {
+        sender.send('updater:progress', progress);
+      }
+    });
+  }
+);
+
+ipcMain.handle('updater:cancelDownload', () => {
+  cancelActiveDownload();
+  return { ok: true };
+});
+
+ipcMain.handle(
+  'updater:install',
+  async (_event, { filePath, installMode }: { filePath: string; installMode: InstallMode }) => {
+    if (mainWindow && hasUnsavedChanges) {
+      return {
+        ok: false,
+        needsSave: true,
+        error: 'Você tem alterações não salvas no editor do CelSketch. Salve seu projeto antes de instalar a atualização.'
+      };
+    }
+    const res = await installDownloadedUpdate(filePath, installMode);
+    if (res.ok) {
+      forceClosing = true;
+      setTimeout(() => {
+        app.quit();
+      }, 250);
+    }
+    return res;
+  }
+);
 
 // Launch file (double-click .celsketch)
 ipcMain.handle('file:getLaunchFile', () => {

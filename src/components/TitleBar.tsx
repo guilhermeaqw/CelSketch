@@ -83,7 +83,28 @@ export const TitleBar: React.FC = () => {
   const [openMenu, setOpenMenu] = useState<string | null>(null);
   const [recentProjects, setRecentProjects] = useState<string[]>(() => loadRecentPaths());
   const [timelapseBusy, setTimelapseBusy] = useState(false);
+  const [appVersion, setAppVersion] = useState<string>('');
+  const [availableUpdateVer, setAvailableUpdateVer] = useState<string | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    let active = true;
+    const api = window.harmonyAPI;
+    api?.getAppInfo?.().then((info) => {
+      if (active && info?.version) setAppVersion(info.version);
+    });
+    api?.getLastUpdateCheck?.().then((res) => {
+      if (active && res?.updateAvailable) setAvailableUpdateVer(res.latestVersion);
+    });
+    const unsub = api?.onUpdateStatusChanged?.((res) => {
+      if (!active) return;
+      setAvailableUpdateVer(res?.updateAvailable ? res.latestVersion : null);
+    });
+    return () => {
+      active = false;
+      unsub?.();
+    };
+  }, []);
 
   // Refresh Recent Projects whenever File menu opens so Ctrl+S / Ctrl+O / Explorer opens show up immediately
   useEffect(() => {
@@ -598,8 +619,40 @@ export const TitleBar: React.FC = () => {
           {projectName}.celsketch — {canvasWidth}×{canvasHeight}
         </div>
 
-        {/* Windows Window Controls */}
-        <div style={{ display: 'flex' }} className="no-drag">
+        {/* Windows Window Controls + Launcher / Update Pill */}
+        <div style={{ display: 'flex', alignItems: 'center' }} className="no-drag">
+          <button
+            onClick={() => window.harmonyAPI?.openLauncher?.()}
+            title={
+              availableUpdateVer
+                ? `Nova versão v${availableUpdateVer} disponível — clique para abrir o Launcher e atualizar`
+                : 'Abrir CelSketch Launcher / Verificar Atualizações'
+            }
+            style={{
+              height: 20,
+              marginRight: 8,
+              padding: '0 8px',
+              borderRadius: 99,
+              border: availableUpdateVer ? '1px solid rgba(56, 189, 248, 0.5)' : '1px solid rgba(255,255,255,0.1)',
+              background: availableUpdateVer ? 'rgba(14, 165, 233, 0.22)' : 'rgba(255,255,255,0.04)',
+              color: availableUpdateVer ? '#7dd3fc' : '#9ca3af',
+              fontSize: 10,
+              fontWeight: 600,
+              cursor: 'pointer',
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 4
+            }}
+          >
+            <Download size={10} />
+            <span>
+              {availableUpdateVer
+                ? `Atualizar v${availableUpdateVer}`
+                : appVersion
+                ? `Launcher • v${appVersion}`
+                : 'Launcher'}
+            </span>
+          </button>
           <button className="win-ctrl-btn" onClick={() => window.harmonyAPI?.minimize()} title="Minimize">
             <Minus size={13} />
           </button>

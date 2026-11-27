@@ -42,5 +42,30 @@ contextBridge.exposeInMainWorld('harmonyAPI', {
     ipcRenderer.invoke('file:saveBinaryFile', { defaultName, filterName, extensions, bytes }),
   openPath: (targetPath: string) => ipcRenderer.invoke('shell:openPath', targetPath),
   openExternal: (url: string) => ipcRenderer.invoke('shell:openExternal', url),
-  listFonts: () => ipcRenderer.invoke('system:listFonts')
+  listFonts: () => ipcRenderer.invoke('system:listFonts'),
+
+  // Launcher & Auto-Updater APIs
+  getAppInfo: () => ipcRenderer.invoke('app:getInfo'),
+  getLauncherPrefs: () => ipcRenderer.invoke('launcher:getPrefs'),
+  setLauncherPrefs: (prefs: { autoLaunchIfUpToDate?: boolean }) => ipcRenderer.invoke('launcher:setPrefs', prefs),
+  launchEditor: (opts?: { projectPath?: string | null }) => ipcRenderer.invoke('launcher:launchEditor', opts),
+  openLauncher: () => ipcRenderer.invoke('launcher:openLauncher'),
+  pickProjectFile: () => ipcRenderer.invoke('launcher:pickProjectFile'),
+  checkForUpdates: () => ipcRenderer.invoke('updater:check'),
+  getLastUpdateCheck: () => ipcRenderer.invoke('updater:getLastCheck'),
+  downloadUpdate: (assetUrl: string, assetName: string, expectedSha256: string | null) =>
+    ipcRenderer.invoke('updater:download', { assetUrl, assetName, expectedSha256 }),
+  cancelDownload: () => ipcRenderer.invoke('updater:cancelDownload'),
+  installUpdate: (filePath: string, installMode: string) =>
+    ipcRenderer.invoke('updater:install', { filePath, installMode }),
+  onUpdateProgress: (callback: (progress: any) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, progress: any) => callback(progress);
+    ipcRenderer.on('updater:progress', listener);
+    return () => ipcRenderer.removeListener('updater:progress', listener);
+  },
+  onUpdateStatusChanged: (callback: (result: any) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, result: any) => callback(result);
+    ipcRenderer.on('updater:statusChanged', listener);
+    return () => ipcRenderer.removeListener('updater:statusChanged', listener);
+  }
 });

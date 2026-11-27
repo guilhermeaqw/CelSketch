@@ -197,6 +197,32 @@ export interface HarmonyProjectData {
   layers: DrawingLayer[];
 }
 
+export type InstallMode = 'installed' | 'portable' | 'unpacked' | 'dev';
+
+export interface UpdateCheckResult {
+  currentVersion: string;
+  latestVersion: string;
+  updateAvailable: boolean;
+  installMode: InstallMode;
+  releaseName: string;
+  releaseNotes: string;
+  publishedAt: string;
+  htmlUrl: string;
+  assetName: string | null;
+  assetUrl: string | null;
+  assetSize: number;
+  assetSha256: string | null;
+  error?: string;
+}
+
+export interface UpdateDownloadProgress {
+  percent: number;
+  downloadedBytes: number;
+  totalBytes: number;
+  speedBytesPerSec: number;
+  stage: 'downloading' | 'verifying';
+}
+
 declare global {
   interface Window {
     harmonyAPI?: {
@@ -239,6 +265,26 @@ declare global {
       openPath: (targetPath: string) => Promise<void>;
       openExternal: (url: string) => Promise<void>;
       listFonts: () => Promise<string[]>;
+      getAppInfo?: () => Promise<{ version: string; installMode: InstallMode; platform: string; editorOpen: boolean }>;
+      getLauncherPrefs?: () => Promise<{ autoLaunchIfUpToDate: boolean }>;
+      setLauncherPrefs?: (prefs: { autoLaunchIfUpToDate?: boolean }) => Promise<{ autoLaunchIfUpToDate: boolean }>;
+      launchEditor?: (opts?: { projectPath?: string | null }) => Promise<{ ok: boolean }>;
+      openLauncher?: () => Promise<{ ok: boolean }>;
+      pickProjectFile?: () => Promise<{ canceled: boolean; filePath?: string; error?: string }>;
+      checkForUpdates?: () => Promise<UpdateCheckResult>;
+      getLastUpdateCheck?: () => Promise<UpdateCheckResult | null>;
+      downloadUpdate?: (
+        assetUrl: string,
+        assetName: string,
+        expectedSha256: string | null
+      ) => Promise<{ ok: boolean; canceled?: boolean; filePath?: string; sha256Verified?: boolean; error?: string }>;
+      cancelDownload?: () => Promise<{ ok: boolean }>;
+      installUpdate?: (
+        filePath: string,
+        installMode: InstallMode
+      ) => Promise<{ ok: boolean; needsSave?: boolean; error?: string }>;
+      onUpdateProgress?: (callback: (progress: UpdateDownloadProgress) => void) => () => void;
+      onUpdateStatusChanged?: (callback: (result: UpdateCheckResult) => void) => () => void;
     };
   }
 }
