@@ -26,6 +26,7 @@ import {
 } from '../utils/selectionUtils';
 import {
   applyCameraTransformToCtx,
+  cameraViewToArtwork,
   getActiveCameraLayer,
   getCameraFrameCorners,
   getInterpolatedCamera,
@@ -1323,11 +1324,23 @@ export const CanvasStage: React.FC = () => {
       const rx = dx * cos - dy * sin;
       const ry = dx * sin + dy * cos;
 
-      const x = (rx / zoom) * (flipX ? -1 : 1) + canvasWidth / 2;
-      const y = ry / zoom + canvasHeight / 2;
+      let x = (rx / zoom) * (flipX ? -1 : 1) + canvasWidth / 2;
+      let y = ry / zoom + canvasHeight / 2;
+
+      // When viewing through the 2D Camera, invert the camera lens transform so drawing/selecting lands exactly under the pen!
+      if (cameraViewMode) {
+        const camLayer = getActiveCameraLayer(layers);
+        if (camLayer) {
+          const camState = getInterpolatedCamera(camLayer, currentFrame);
+          const mapped = cameraViewToArtwork(x, y, camState, canvasWidth, canvasHeight);
+          x = mapped.x;
+          y = mapped.y;
+        }
+      }
+
       return { x, y };
     },
-    [panX, panY, rotation, zoom, flipX, canvasWidth, canvasHeight]
+    [panX, panY, rotation, zoom, flipX, canvasWidth, canvasHeight, cameraViewMode, layers, currentFrame]
   );
 
   // Main render loop (also exposed via drawStageRef for zero-React-re-render rAF pen painting!)
@@ -1691,13 +1704,13 @@ export const CanvasStage: React.FC = () => {
             if (!prevStrokes || prevStrokes.length === 0) continue;
             const bmp = getCachedLayerBitmap(`${layer.id}:${f}:prev`, prevStrokes, '#e04848');
             const okf = getInterpolatedLayerTransform(layer, f);
-            ctx.save();
-            ctx.globalAlpha = 0.45 / stepDist;
-            ctx.translate(canvasWidth / 2 + okf.x, canvasHeight / 2 + okf.y);
-            ctx.rotate((okf.rotation * Math.PI) / 180);
-            ctx.scale(okf.scale, okf.scale);
-            ctx.drawImage(bmp, -canvasWidth / 2, -canvasHeight / 2);
-            ctx.restore();
+            stageCtx.save();
+            stageCtx.globalAlpha = 0.45 / stepDist;
+            stageCtx.translate(canvasWidth / 2 + okf.x, canvasHeight / 2 + okf.y);
+            stageCtx.rotate((okf.rotation * Math.PI) / 180);
+            stageCtx.scale(okf.scale, okf.scale);
+            stageCtx.drawImage(bmp, -canvasWidth / 2, -canvasHeight / 2);
+            stageCtx.restore();
           }
           const nextSlice = nextDrawn.slice(0, onionNext);
           for (let i = 0; i < nextSlice.length; i++) {
@@ -1707,13 +1720,13 @@ export const CanvasStage: React.FC = () => {
             if (!nextStrokes || nextStrokes.length === 0) continue;
             const bmp = getCachedLayerBitmap(`${layer.id}:${f}:next`, nextStrokes, '#32b85c');
             const okf = getInterpolatedLayerTransform(layer, f);
-            ctx.save();
-            ctx.globalAlpha = 0.45 / stepDist;
-            ctx.translate(canvasWidth / 2 + okf.x, canvasHeight / 2 + okf.y);
-            ctx.rotate((okf.rotation * Math.PI) / 180);
-            ctx.scale(okf.scale, okf.scale);
-            ctx.drawImage(bmp, -canvasWidth / 2, -canvasHeight / 2);
-            ctx.restore();
+            stageCtx.save();
+            stageCtx.globalAlpha = 0.45 / stepDist;
+            stageCtx.translate(canvasWidth / 2 + okf.x, canvasHeight / 2 + okf.y);
+            stageCtx.rotate((okf.rotation * Math.PI) / 180);
+            stageCtx.scale(okf.scale, okf.scale);
+            stageCtx.drawImage(bmp, -canvasWidth / 2, -canvasHeight / 2);
+            stageCtx.restore();
           }
         }
 
@@ -1766,6 +1779,13 @@ export const CanvasStage: React.FC = () => {
         ctx.drawImage(postProcessCanvasRef.current, 0, 0);
         ctx.restore();
       }
+    }
+
+    // Artwork-space overlays (Gradient guide, Symmetry, Perspective, Selection, Stabilizer, Free Transform)
+    // Must apply the 2D Camera lens transform too when viewing through the Camera!
+    ctx.save();
+    if (isThroughCamera && activeCamState) {
+      applyCameraTransformToCtx(ctx, activeCamState, canvasWidth, canvasHeight);
     }
 
     // Live Gradient Tool drag guide line (start -> end handle)
@@ -2025,6 +2045,9 @@ export const CanvasStage: React.FC = () => {
       }
       ctx.restore();
     }
+
+    // End artwork-space overlays camera transform wrapper
+    ctx.restore();
 
     // Canvas Crop / Resize Overlay (C key — Clip Studio style)
     if (cropMode) {
@@ -3548,9 +3571,16 @@ export const CanvasStage: React.FC = () => {
     !isRotating &&
     (activeTool === 'brush' || activeTool === 'pencil' || activeTool === 'eraser' || activeTool === 'liquify');
 
+  const activeCamForCursor = cameraViewMode ? getActiveCameraLayer(layers) : null;
+  const activeCamZoomForCursor = activeCamForCursor
+    ? Math.max(0.2, Math.min(8, getInterpolatedCamera(activeCamForCursor, currentFrame).zoom || 1))
+    : 1;
+
   const brushRingDiameter = Math.max(
     4,
-    (activeTool === 'liquify' ? liquifySize : activeTool === 'eraser' ? eraserSize : brushSize) * zoom
+    (activeTool === 'liquify' ? liquifySize : activeTool === 'eraser' ? eraserSize : brushSize) *
+      zoom *
+      activeCamZoomForCursor
   );
 
   const eyedropperCursor = `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%23ffffff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m2 22 1-1h3l9-9' stroke='%23000000' stroke-width='3.5'/%3E%3Cpath d='m2 22 1-1h3l9-9'/%3E%3Cpath d='M3 21v-3l9-9' stroke='%23000000' stroke-width='3.5'/%3E%3Cpath d='M3 21v-3l9-9'/%3E%3Cpath d='m15 6 3.4-3.4a2.1 2.1 0 1 1 3 3L18 9l.4.4a2.1 2.1 0 1 1-3 3l-3.8-3.8a2.1 2.1 0 1 1 3-3l.4.4Z' fill='%233a86ff' stroke='%23000000' stroke-width='1.5'/%3E%3C/svg%3E") 2 22, crosshair`;

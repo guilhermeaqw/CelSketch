@@ -359,6 +359,32 @@ export function applyCameraTransformToCtx(
 }
 
 /**
+ * Exact inverse of applyCameraTransformToCtx:
+ * maps a point in camera-viewed output canvas space back into true artwork canvas space
+ * so drawing, erasing, selecting, and transforming work accurately while in Camera View Mode.
+ */
+export function cameraViewToArtwork(
+  x: number,
+  y: number,
+  cam: Pick<CameraKeyframe, 'x' | 'y' | 'zoom' | 'rotation'>,
+  canvasWidth: number,
+  canvasHeight: number
+): { x: number; y: number } {
+  const z = Math.max(0.2, Math.min(8, cam.zoom || 1));
+  const sx = (x - canvasWidth / 2) / z;
+  const sy = (y - canvasHeight / 2) / z;
+  const invRad = ((cam.rotation || 0) * Math.PI) / 180;
+  const cos = Math.cos(invRad);
+  const sin = Math.sin(invRad);
+  const rx = sx * cos - sy * sin;
+  const ry = sx * sin + sy * cos;
+  return {
+    x: rx + canvasWidth / 2 + (cam.x || 0),
+    y: ry + canvasHeight / 2 + (cam.y || 0)
+  };
+}
+
+/**
  * Computes the 4 corners (in canvas coordinates) of the 2D Camera framing rectangle.
  */
 export function getCameraFrameCorners(
