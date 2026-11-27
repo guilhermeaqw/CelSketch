@@ -6,7 +6,17 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import { spawn } from 'child_process';
 
-const fsp = fs.promises;
+// Use Electron's built-in 'original-fs' so .asar files are treated as ordinary files on disk
+// (Node's patched fs in Electron intercepts .asar paths as virtual read-only directories and throws EPERM!)
+const rawFs: typeof fs = (() => {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    return require('original-fs');
+  } catch {
+    return fs;
+  }
+})();
+const fsp = rawFs.promises;
 
 export const GITHUB_OWNER = 'guilhermeaqw';
 export const GITHUB_REPO = 'CelSketch';
@@ -53,7 +63,7 @@ export function detectInstallMode(): InstallMode {
   const exeDir = path.dirname(process.execPath);
   // electron-builder NSIS places "Uninstall CelSketch.exe" in the installation root
   try {
-    const entries = fs.readdirSync(exeDir);
+    const entries = rawFs.readdirSync(exeDir);
     if (entries.some((name) => /^uninstall.*\.exe$/i.test(name))) {
       return 'installed';
     }
@@ -187,7 +197,7 @@ function pickBestAsset(assets: GithubAsset[], installMode: InstallMode): GithubA
     // Prefer ultra-fast 1.4MB hot app.asar update for installed/unpacked apps (ZERO setup wizard, ~1s update!)
     if (installMode === 'installed' || installMode === 'unpacked') {
       const localAsar = path.join(path.dirname(process.execPath), 'resources', 'app.asar');
-      if (fs.existsSync(localAsar)) {
+      if (rawFs.existsSync(localAsar)) {
         const asarAsset = assets.find((a) => /\.asar$/i.test(a.name) && a.browser_download_url);
         if (asarAsset) return asarAsset;
       }
@@ -289,12 +299,14 @@ export async function downloadUpdate(
 
   const updatesDir = path.join(app.getPath('temp'), 'CelSketch-Updates');
   await fsp.mkdir(updatesDir, { recursive: true });
-  const safeName = sanitizeAssetFilename(assetName);
+  const rawSafeName = sanitizeAssetFilename(assetName);
+  // Never store downloaded temp file ending with '.asar' so nothing in Electron or AV hooks intercepts it
+  const safeName = /\.asar$/i.test(rawSafeName) ? `${rawSafeName}-pkg` : rawSafeName;
   const finalPath = path.join(updatesDir, safeName);
   const partPath = `${finalPath}.part`;
 
   // If already downloaded and SHA-256 matches, reuse immediately!
-  if (expectedSha256 && fs.existsSync(finalPath)) {
+  if (expectedSha256 && rawFs.existsSync(finalPath)) {
     try {
       const existingHash = await computeFileSha256(finalPath);
       if (existingHash === expectedSha256.toLowerCase()) {
@@ -361,13 +373,14 @@ export async function downloadUpdate(
           const totalBytes = parseInt(String(res.headers['content-length'] || '0'), 10) || 0;
           let downloadedBytes = 0;
           const hash = crypto.createHash('sha256');
-          const fileStream = fs.createWriteStream(partPath);
+          const fileStream = rawFs.createWriteStream(partPath);
 
           let lastEmitTime = Date.now();
           let lastSampleTime = Date.now();
           let lastSampleBytes = 0;
           let speedBytesPerSec = 0;
           let finished = false;
+          let streamErrored = false;
 
           const cleanupPart = () => {
             try {
@@ -376,7 +389,7 @@ export async function downloadUpdate(
               // ignore
             }
             try {
-              if (fs.existsSync(partPath)) fs.unlinkSync(partPath);
+              if (rawFs.existsSync(partPath)) rawFs.unlinkSync(partPath);
             } catch {
               // ignore
             }
@@ -422,7 +435,9 @@ export async function downloadUpdate(
 
           res.pipe(fileStream);
 
-          fileStream.on('finish', async () => {
+          // Wait for 'close' (not 'finish') so Windows has 100% released the file handle before rename!
+          fileStream.on('close', async () => {
+            if (streamErrored || finished) return;
             if (activeDownloadCanceled) {
               cleanupPart();
               finishWith({ ok: false, canceled: true });
@@ -450,11 +465,29 @@ export async function downloadUpdate(
                 sha256Verified = true;
               }
               try {
-                if (fs.existsSync(finalPath)) await fsp.unlink(finalPath);
+                if (rawFs.existsSync(finalPath)) await fsp.unlink(finalPath);
               } catch {
                 // ignore
               }
-              await fsp.rename(partPath, finalPath);
+              // Retry rename briefly in case Windows Defender scans the newly closed .part file
+              let renamed = false;
+              for (let attempt = 0; attempt < 6; attempt++) {
+                try {
+                  await fsp.rename(partPath, finalPath);
+                  renamed = true;
+                  break;
+                } catch {
+                  await new Promise((r) => setTimeout(r, 120));
+                }
+              }
+              if (!renamed) {
+                await fsp.copyFile(partPath, finalPath);
+                try {
+                  await fsp.unlink(partPath);
+                } catch {
+                  // ignore
+                }
+              }
               finishWith({ ok: true, filePath: finalPath, sha256Verified });
             } catch (err: any) {
               cleanupPart();
@@ -463,11 +496,13 @@ export async function downloadUpdate(
           });
 
           fileStream.on('error', (err) => {
+            streamErrored = true;
             cleanupPart();
             finishWith({ ok: false, error: err?.message || 'Erro ao gravar atualização no disco.' });
           });
 
           res.on('error', (err) => {
+            streamErrored = true;
             cleanupPart();
             if (activeDownloadCanceled) {
               finishWith({ ok: false, canceled: true });
@@ -499,7 +534,7 @@ export async function downloadUpdate(
 function computeFileSha256(filePath: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const hash = crypto.createHash('sha256');
-    const stream = fs.createReadStream(filePath);
+    const stream = rawFs.createReadStream(filePath);
     stream.on('data', (d) => hash.update(d));
     stream.on('end', () => resolve(hash.digest('hex').toLowerCase()));
     stream.on('error', reject);
@@ -514,7 +549,7 @@ export async function installDownloadedUpdate(
   downloadedFilePath: string,
   installMode: InstallMode
 ): Promise<{ ok: boolean; error?: string }> {
-  if (!downloadedFilePath || !fs.existsSync(downloadedFilePath)) {
+  if (!downloadedFilePath || !rawFs.existsSync(downloadedFilePath)) {
     return { ok: false, error: 'Arquivo de atualização não encontrado.' };
   }
 
@@ -529,7 +564,7 @@ export async function installDownloadedUpdate(
   const pid = process.pid;
 
   // 1. Ultra-fast hot app.asar swap (1.4MB, ZERO setup wizard, ~1s relaunch — only asks UAC if in Program Files!)
-  if (/\.asar$/i.test(path.basename(downloadedFilePath))) {
+  if (/\.asar(-pkg)?$/i.test(path.basename(downloadedFilePath))) {
     const currentExe = process.execPath;
     const resourcesDir = path.join(path.dirname(currentExe), 'resources');
     const targetAsar = path.join(resourcesDir, 'app.asar');
