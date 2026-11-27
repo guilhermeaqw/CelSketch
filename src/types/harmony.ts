@@ -285,6 +285,15 @@ declare global {
       ) => Promise<{ ok: boolean; needsSave?: boolean; error?: string }>;
       onUpdateProgress?: (callback: (progress: UpdateDownloadProgress) => void) => () => void;
       onUpdateStatusChanged?: (callback: (result: UpdateCheckResult) => void) => () => void;
+      refOpenPopout?: () => Promise<{ ok: boolean }>;
+      refClosePopout?: () => Promise<{ ok: boolean }>;
+      refSetAlwaysOnTop?: (flag: boolean) => Promise<{ ok: boolean }>;
+      refSetWindowOpacity?: (alpha: number) => Promise<{ ok: boolean }>;
+      refPickColor?: (hex: string) => Promise<{ ok: boolean }>;
+      refSetBoardState?: (json: string) => Promise<{ ok: boolean }>;
+      refGetBoardState?: () => Promise<string | null>;
+      onRefColorPicked?: (callback: (hex: string) => void) => () => void;
+      onRefPopoutClosed?: (callback: () => void) => () => void;
     };
   }
 }

@@ -21,6 +21,8 @@ app.commandLine.appendSwitch('disable-renderer-backgrounding');
 
 let launcherWindow: BrowserWindow | null = null;
 let mainWindow: BrowserWindow | null = null;
+let refWindow: BrowserWindow | null = null;
+let sharedRefBoardJson: string | null = null;
 let hasUnsavedChanges = false;
 let forceClosing = false;
 let pendingLaunchFile: string | null = null;
@@ -293,6 +295,70 @@ function createEditorWindow(initialFile?: string | null) {
     mainWindow = null;
     forceClosing = false;
     hasUnsavedChanges = false;
+    if (refWindow && !refWindow.isDestroyed()) {
+      refWindow.close();
+    }
+  });
+}
+
+function createReferenceWindow() {
+  if (refWindow && !refWindow.isDestroyed()) {
+    if (refWindow.isMinimized()) refWindow.restore();
+    refWindow.focus();
+    return;
+  }
+
+  refWindow = new BrowserWindow({
+    width: 560,
+    height: 640,
+    minWidth: 300,
+    minHeight: 240,
+    show: false,
+    title: 'CelSketch — Referência',
+    icon: path.join(__dirname, '../dist/icon.png'),
+    backgroundColor: '#181a20',
+    frame: false,
+    titleBarStyle: 'hidden',
+    alwaysOnTop: true,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true
+    }
+  });
+
+  refWindow.webContents.on('will-navigate', (event, url) => {
+    const isDevLocal = !app.isPackaged && url.startsWith('http://localhost:5173');
+    if (!isDevLocal) {
+      event.preventDefault();
+    }
+  });
+  refWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (url.startsWith('https://') || url.startsWith('http://')) {
+      shell.openExternal(url).catch(() => {});
+    }
+    return { action: 'deny' };
+  });
+
+  refWindow.once('ready-to-show', () => {
+    refWindow?.show();
+  });
+
+  const isDev = !app.isPackaged;
+  if (isDev) {
+    refWindow.loadURL('http://localhost:5173/?mode=reference');
+  } else {
+    refWindow.loadFile(path.join(__dirname, '../dist/index.html'), {
+      query: { mode: 'reference' }
+    });
+  }
+
+  refWindow.on('closed', () => {
+    refWindow = null;
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('ref:popoutClosed');
+    }
   });
 }
 
@@ -721,6 +787,52 @@ ipcMain.handle('shell:openPath', async (_event, targetPath: string) => {
 ipcMain.handle('shell:openExternal', async (_event, url: string) => {
   if (!url || !/^https?:\/\//i.test(url)) return;
   await shell.openExternal(url);
+});
+
+// PureRef-style Standalone Multi-Monitor Reference Window IPCs
+ipcMain.handle('ref:openPopout', () => {
+  createReferenceWindow();
+  return { ok: true };
+});
+
+ipcMain.handle('ref:closePopout', () => {
+  if (refWindow && !refWindow.isDestroyed()) {
+    refWindow.close();
+  }
+  return { ok: true };
+});
+
+ipcMain.handle('ref:setAlwaysOnTop', (_event, flag: boolean) => {
+  if (refWindow && !refWindow.isDestroyed()) {
+    refWindow.setAlwaysOnTop(Boolean(flag));
+  }
+  return { ok: true };
+});
+
+ipcMain.handle('ref:setWindowOpacity', (_event, alpha: number) => {
+  if (refWindow && !refWindow.isDestroyed()) {
+    const clamped = Math.max(0.2, Math.min(1, Number(alpha) || 1));
+    refWindow.setOpacity(clamped);
+  }
+  return { ok: true };
+});
+
+ipcMain.handle('ref:pickColor', (_event, hex: string) => {
+  if (typeof hex === 'string' && mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('ref:colorPicked', hex);
+  }
+  return { ok: true };
+});
+
+ipcMain.handle('ref:setBoardState', (_event, json: string) => {
+  if (typeof json === 'string') {
+    sharedRefBoardJson = json;
+  }
+  return { ok: true };
+});
+
+ipcMain.handle('ref:getBoardState', () => {
+  return sharedRefBoardJson;
 });
 
 // List installed system font families on the user's PC (cached!)

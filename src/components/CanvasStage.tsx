@@ -86,6 +86,17 @@ export const CanvasStage: React.FC = () => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [canvasRecoveryKey, setCanvasRecoveryKey] = useState(0);
   const brushRingRef = useRef<HTMLDivElement>(null);
+  const lastCursorLocalRef = useRef<{ x: number; y: number } | null>(null);
+  const cursorInsideCanvasRef = useRef<boolean>(false);
+  const [brushSizeHud, setBrushSizeHud] = useState<{
+    label: string;
+    px: number;
+    diameter: number;
+    x: number;
+    y: number;
+  } | null>(null);
+  const brushSizeHudTimerRef = useRef<number | null>(null);
+  const prevToolSizesRef = useRef<{ brush: number; eraser: number; liquify: number } | null>(null);
   const eyedropperSwatchRef = useRef<HTMLDivElement>(null);
   const penHudSpanRef = useRef<HTMLSpanElement>(null);
   const penHudTimerRef = useRef<number>(0);
@@ -166,6 +177,7 @@ export const CanvasStage: React.FC = () => {
     return () => {
       if (liveRafRef.current !== null) window.cancelAnimationFrame(liveRafRef.current);
       if (pickedToastTimerRef.current !== null) window.clearTimeout(pickedToastTimerRef.current);
+      if (brushSizeHudTimerRef.current !== null) window.clearTimeout(brushSizeHudTimerRef.current);
       for (const entry of layerBitmapCacheRef.current.values()) {
         entry.canvas.width = 0;
         entry.canvas.height = 0;
@@ -321,6 +333,7 @@ export const CanvasStage: React.FC = () => {
     activeSceneId,
     timelapseRecording,
     performanceMode,
+    showBrushSizeHud,
     invertSelectionTrigger
   } = useHarmonyStore(
     useShallow((s) => ({
@@ -386,6 +399,7 @@ export const CanvasStage: React.FC = () => {
       activeSceneId: s.activeSceneId,
       timelapseRecording: s.timelapseRecording,
       performanceMode: s.performanceMode,
+      showBrushSizeHud: s.showBrushSizeHud,
       invertSelectionTrigger: s.invertSelectionTrigger
     }))
   );
@@ -3256,6 +3270,8 @@ export const CanvasStage: React.FC = () => {
     if (containerRect) {
       const mx = e.clientX - containerRect.left;
       const my = e.clientY - containerRect.top;
+      lastCursorLocalRef.current = { x: mx, y: my };
+      cursorInsideCanvasRef.current = true;
       if (brushRingRef.current) {
         brushRingRef.current.style.transform = `translate3d(${mx - brushRingDiameter / 2}px, ${my - brushRingDiameter / 2}px, 0)`;
         brushRingRef.current.style.opacity = '1';
@@ -3954,6 +3970,58 @@ export const CanvasStage: React.FC = () => {
       activeCamZoomForCursor
   );
 
+  // Keep live brush cursor ring concentrically centered when resizing via [ / ] without moving pointer
+  useEffect(() => {
+    if (brushRingRef.current && cursorInsideCanvasRef.current && lastCursorLocalRef.current) {
+      const { x, y } = lastCursorLocalRef.current;
+      brushRingRef.current.style.transform = `translate3d(${x - brushRingDiameter / 2}px, ${y - brushRingDiameter / 2}px, 0)`;
+    }
+  }, [brushRingDiameter]);
+
+  // Clear visual feedback HUD (scaled ring + pixel size badge) whenever brush/eraser/liquify size changes
+  useEffect(() => {
+    const prev = prevToolSizesRef.current;
+    prevToolSizesRef.current = { brush: brushSize, eraser: eraserSize, liquify: liquifySize };
+    if (!prev || !showBrushSizeHud) return;
+
+    let label = 'Pincel';
+    let px = brushSize;
+    if (liquifySize !== prev.liquify) {
+      label = 'Liquify';
+      px = liquifySize;
+    } else if (eraserSize !== prev.eraser) {
+      label = 'Borracha';
+      px = eraserSize;
+    } else if (brushSize !== prev.brush) {
+      label = activeTool === 'pencil' ? 'Lápis' : 'Pincel';
+      px = brushSize;
+    } else {
+      return;
+    }
+
+    const rect = containerRef.current?.getBoundingClientRect();
+    const w = rect?.width || 800;
+    const h = rect?.height || 600;
+    const pos =
+      cursorInsideCanvasRef.current && lastCursorLocalRef.current
+        ? lastCursorLocalRef.current
+        : { x: w / 2, y: h / 2 };
+    const diameter = Math.max(4, px * zoom * activeCamZoomForCursor);
+
+    setBrushSizeHud({
+      label,
+      px: Math.round(px),
+      diameter,
+      x: pos.x,
+      y: pos.y
+    });
+    if (brushSizeHudTimerRef.current !== null) window.clearTimeout(brushSizeHudTimerRef.current);
+    brushSizeHudTimerRef.current = window.setTimeout(() => {
+      setBrushSizeHud(null);
+      brushSizeHudTimerRef.current = null;
+    }, 850);
+  }, [brushSize, eraserSize, liquifySize, showBrushSizeHud, zoom, activeCamZoomForCursor, activeTool]);
+
   const eyedropperCursor = `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%23ffffff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m2 22 1-1h3l9-9' stroke='%23000000' stroke-width='3.5'/%3E%3Cpath d='m2 22 1-1h3l9-9'/%3E%3Cpath d='M3 21v-3l9-9' stroke='%23000000' stroke-width='3.5'/%3E%3Cpath d='M3 21v-3l9-9'/%3E%3Cpath d='m15 6 3.4-3.4a2.1 2.1 0 1 1 3 3L18 9l.4.4a2.1 2.1 0 1 1-3 3l-3.8-3.8a2.1 2.1 0 1 1 3-3l.4.4Z' fill='%233a86ff' stroke='%23000000' stroke-width='1.5'/%3E%3C/svg%3E") 2 22, crosshair`;
 
   const getTransformCursor = (h: TransformHandle | null) => {
@@ -4019,6 +4087,7 @@ export const CanvasStage: React.FC = () => {
         onPointerUp={handlePointerUp}
         onPointerCancel={handlePointerCancel}
         onPointerLeave={() => {
+          cursorInsideCanvasRef.current = false;
           if (brushRingRef.current) brushRingRef.current.style.opacity = '0';
         }}
         onDoubleClick={handleDoubleClick}
@@ -4094,6 +4163,65 @@ export const CanvasStage: React.FC = () => {
             zIndex: 60
           }}
         />
+      )}
+
+      {/* Visual Brush Size Feedback HUD (shows live scaled circle + px badge on resize) */}
+      {brushSizeHud && (
+        <div
+          style={{
+            position: 'absolute',
+            left: 0,
+            top: 0,
+            inset: 0,
+            pointerEvents: 'none',
+            zIndex: 75
+          }}
+        >
+          {/* Scaled Preview Ring */}
+          <div
+            style={{
+              position: 'absolute',
+              left: brushSizeHud.x - Math.min(brushSizeHud.diameter, 520) / 2,
+              top: brushSizeHud.y - Math.min(brushSizeHud.diameter, 520) / 2,
+              width: Math.min(brushSizeHud.diameter, 520),
+              height: Math.min(brushSizeHud.diameter, 520),
+              borderRadius: '50%',
+              border: '1.5px solid rgba(96, 165, 250, 0.95)',
+              boxShadow: '0 0 0 1px rgba(0, 0, 0, 0.7), inset 0 0 0 1px rgba(255, 255, 255, 0.35)',
+              background: 'rgba(58, 134, 255, 0.08)'
+            }}
+          />
+          {/* Crisp Numeric Size Pill */}
+          <div
+            style={{
+              position: 'absolute',
+              left: brushSizeHud.x,
+              top: Math.max(
+                18,
+                Math.min(
+                  (containerRef.current?.clientHeight || 600) - 36,
+                  brushSizeHud.y + Math.min(brushSizeHud.diameter, 520) / 2 + 12
+                )
+              ),
+              transform: 'translateX(-50%)',
+              background: 'rgba(20, 23, 30, 0.92)',
+              border: '1px solid rgba(96, 165, 250, 0.45)',
+              borderRadius: 99,
+              padding: '3px 10px',
+              fontSize: 11.5,
+              fontWeight: 600,
+              color: '#f3f4f6',
+              whiteSpace: 'nowrap',
+              boxShadow: '0 6px 18px rgba(0,0,0,0.5)',
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 6
+            }}
+          >
+            <span style={{ color: '#9ca3af', fontWeight: 500 }}>{brushSizeHud.label}</span>
+            <span style={{ fontFamily: 'monospace', color: '#93c5fd' }}>{brushSizeHud.px} px</span>
+          </div>
+        </div>
       )}
 
       {/* Floating Free Transform / Perspective Action Bar (Ctrl+T) */}

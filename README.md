@@ -6,22 +6,25 @@
 
 ## Download Rápido (Windows)
 
-> **[Baixar Instalador — CelSketch Setup 1.2.12.exe (Recomendado)](https://github.com/guilhermeaqw/CelSketch/releases/download/v1.2.12/CelSketch.Setup.1.2.12.exe)**
+> **[Baixar Instalador — CelSketch Setup 1.3.0.exe (Recomendado)](https://github.com/guilhermeaqw/CelSketch/releases/download/v1.3.0/CelSketch.Setup.1.3.0.exe)**
 
 | Versão | Arquivo | Descrição |
 | :--- | :--- | :--- |
-| **Instalador Windows (Recomendado)** | [CelSketch.Setup.1.2.12.exe](https://github.com/guilhermeaqw/CelSketch/releases/download/v1.2.12/CelSketch.Setup.1.2.12.exe) | Instala uma única vez com **CelSketch Launcher** integrado — futuras atualizações (~1,5 MB) são aplicadas automaticamente pelo Launcher em segundos, sem nenhum instalador! |
-| **Windows Portátil (Sem instalação)** | [CelSketch.1.2.12.exe](https://github.com/guilhermeaqw/CelSketch/releases/download/v1.2.12/CelSketch.1.2.12.exe) | Basta clicar duas vezes para abrir (também inclui o Launcher com auto-atualização). |
+| **Instalador Windows (Recomendado)** | [CelSketch.Setup.1.3.0.exe](https://github.com/guilhermeaqw/CelSketch/releases/download/v1.3.0/CelSketch.Setup.1.3.0.exe) | Instala uma única vez com **CelSketch Launcher** integrado — futuras atualizações (~1,5 MB) são aplicadas automaticamente pelo Launcher em segundos, sem nenhum instalador! |
+| **Windows Portátil (Sem instalação)** | [CelSketch.1.3.0.exe](https://github.com/guilhermeaqw/CelSketch/releases/download/v1.3.0/CelSketch.1.3.0.exe) | Basta clicar duas vezes para abrir (também inclui o Launcher com auto-atualização). |
 | **Todas as Versões / Histórico** | [GitHub Releases](https://github.com/guilhermeaqw/CelSketch/releases/latest) | Página oficial de lançamentos. |
 
 ### Como instalar (só precisa baixar 1 vez!)
-1. Clique em **[CelSketch.Setup.1.2.12.exe](https://github.com/guilhermeaqw/CelSketch/releases/download/v1.2.12/CelSketch.Setup.1.2.12.exe)** para baixar.
+1. Clique em **[CelSketch.Setup.1.3.0.exe](https://github.com/guilhermeaqw/CelSketch/releases/download/v1.3.0/CelSketch.Setup.1.3.0.exe)** para baixar.
 2. Execute o instalador e siga os passos na tela *(se o Windows SmartScreen exibir um aviso por ser um app open-source sem certificado pago, clique em **Mais informações → Executar assim mesmo**)*.
 3. Abra o **CelSketch** pelo atalho criado na Área de Trabalho ou Menu Iniciar — o **CelSketch Launcher** abrirá primeiro, verificará automaticamente se existe nova versão no GitHub, mostrará as novidades e atualizará o app automaticamente quando você clicar em **Baixar Atualização**.
 
 ---
 
-## Principais Recursos (v1.2.0)
+## Principais Recursos (v1.3.0)
+
+- **Interface Limpa, Filtros, Opções e Atalhos Personalizáveis**: Barra superior reorganizada com novas categorias **`Filtros`** e **`Opções`**, menu unificado **`REC ▾`** e **`Guias ▾`**, painel completo de **Configurações & Atalhos Personalizáveis**, **feedback visual ao vivo do tamanho do pincel** (`px` + anel em escala real) e painel de **Pós-Produção** redesenhado para ser calmo e intuitivo.
+- **Janela de Referência Estilo PureRef (Multi-Monitor + GIF/MP4)**: Suporte a **Imagens, GIFs animados e Vídeos MP4/WebM** com controle **quadro a quadro** (Play/Pause, `<`/`>`, velocidade `0.25×`/`0.5×`/`1×`, scrubber e conta-gotas direto no frame!), **notas de texto**, **`Ctrl+C` / `Ctrl+V`**, **`Ctrl+G` Agrupar**, seleção múltipla, modo P&B, organizar em grade e botão **Destacar** (ou arrastar além da borda) para levar a referência livremente para **outro monitor** fora do software!
 
 - **CelSketch Launcher com Auto-Atualização**: Abre primeiro ao iniciar o app, verifica automaticamente novas versões oficiais no GitHub Releases, mostra o changelog completo, baixa com barra de progresso e verificação **SHA-256**, instala e reinicia automaticamente (sem precisar voltar ao GitHub!). Inclui acesso rápido a **Projetos Recentes** e opção de pular o launcher quando já estiver atualizado.
 

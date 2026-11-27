@@ -22,6 +22,25 @@ import {
 } from 'lucide-react';
 import { useHarmonyStore } from '../store/useHarmonyStore';
 import { ToolId } from '../types/harmony';
+import { formatShortcutLabel, type ShortcutActionId } from '../utils/shortcuts';
+
+const TOOL_SHORTCUT_ACTION: Partial<Record<ToolId, ShortcutActionId>> = {
+  lasso: 'tool_lasso',
+  magicwand: 'tool_magicwand',
+  brush: 'tool_brush',
+  pencil: 'tool_pencil',
+  eraser: 'tool_eraser',
+  liquify: 'tool_liquify',
+  paint: 'tool_paint',
+  gradient: 'tool_gradient',
+  line: 'tool_line',
+  rectangle: 'tool_rectangle',
+  ellipse: 'tool_ellipse',
+  text: 'tool_text',
+  eyedropper: 'tool_eyedropper',
+  hand: 'tool_hand',
+  zoom: 'tool_zoom'
+};
 
 const SELECTION_TOOLS: { id: ToolId; label: string; shortcut: string; icon: React.ReactNode }[] = [
   { id: 'lasso', label: 'Laço Livre (Alt = Poligonal)', shortcut: 'Q', icon: <Lasso size={16} /> },
@@ -53,9 +72,15 @@ export const ToolsBar: React.FC = () => {
   const activeTool = useHarmonyStore((s) => s.activeTool);
   const lastSelectionTool = useHarmonyStore((s) => s.lastSelectionTool);
   const setTool = useHarmonyStore((s) => s.setTool);
+  const customShortcuts = useHarmonyStore((s) => s.customShortcuts);
   const [flyoutPos, setFlyoutPos] = useState<{ left: number; top: number } | null>(null);
   const closeTimerRef = useRef<number | null>(null);
   const triggerRef = useRef<HTMLDivElement>(null);
+
+  const getToolShortcut = (toolId: ToolId, fallback: string) => {
+    const actionId = TOOL_SHORTCUT_ACTION[toolId];
+    return actionId ? formatShortcutLabel(customShortcuts[actionId]) : fallback;
+  };
 
   const isSelectActive = SELECTION_TOOLS.some((t) => t.id === activeTool);
   const currentSelectObj =
@@ -129,7 +154,7 @@ export const ToolsBar: React.FC = () => {
             e.preventDefault();
             openFlyout();
           }}
-          title={`${currentSelectObj.label} (${currentSelectObj.shortcut} • Shift+M alterna • Botão direito abre lista)`}
+          title={`${currentSelectObj.label} (${getToolShortcut(currentSelectObj.id, currentSelectObj.shortcut)} • Botão direito abre lista)`}
         >
           {currentSelectObj.icon}
           <span
@@ -195,7 +220,7 @@ export const ToolsBar: React.FC = () => {
                 >
                   {st.icon}
                   <span style={{ flex: 1 }}>{st.label}</span>
-                  <span style={{ fontSize: 10, color: '#9ca3af', fontFamily: 'monospace' }}>{st.shortcut}</span>
+                  <span style={{ fontSize: 10, color: '#9ca3af', fontFamily: 'monospace' }}>{getToolShortcut(st.id, st.shortcut)}</span>
                 </button>
               ))}
             </div>,
@@ -208,7 +233,7 @@ export const ToolsBar: React.FC = () => {
           key={t.id}
           className={`tool-btn ${activeTool === t.id ? 'active' : ''}`}
           onClick={() => setTool(t.id)}
-          title={`${t.label} (${t.shortcut})`}
+          title={`${t.label} (${getToolShortcut(t.id, t.shortcut)})`}
         >
           {t.icon}
         </button>

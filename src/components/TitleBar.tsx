@@ -1,4 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
+import { createPortal } from 'react-dom';
 import {
   Minus,
   Square,
@@ -15,7 +16,10 @@ import {
   RotateCcw,
   Camera,
   Sparkles,
-  Wind
+  ChevronDown,
+  Settings,
+  Trash2,
+  Video
 } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { useHarmonyStore } from '../store/useHarmonyStore';
@@ -81,11 +85,14 @@ function saveRecentPath(filePath: string): string[] {
 
 export const TitleBar: React.FC = () => {
   const [openMenu, setOpenMenu] = useState<string | null>(null);
+  const [openPopover, setOpenPopover] = useState<{ kind: 'guides' | 'rec'; left: number; top: number } | null>(null);
   const [recentProjects, setRecentProjects] = useState<string[]>(() => loadRecentPaths());
   const [timelapseBusy, setTimelapseBusy] = useState(false);
   const [appVersion, setAppVersion] = useState<string>('');
   const [availableUpdateVer, setAvailableUpdateVer] = useState<string | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+  const guidesBtnRef = useRef<HTMLButtonElement>(null);
+  const recBtnRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     let active = true;
@@ -141,6 +148,7 @@ export const TitleBar: React.FC = () => {
     timelapseCount,
     performanceMode,
     referenceWindowOpen,
+    showBrushSizeHud,
     canUndo,
     canRedo
   } = useHarmonyStore(
@@ -172,6 +180,7 @@ export const TitleBar: React.FC = () => {
       timelapseCount: s.timelapseFrames.length,
       performanceMode: s.performanceMode,
       referenceWindowOpen: s.referenceWindowOpen,
+      showBrushSizeHud: s.showBrushSizeHud,
       canUndo: s.undoStack.length > 0,
       canRedo: s.redoStack.length > 0
     }))
@@ -184,7 +193,6 @@ export const TitleBar: React.FC = () => {
     setBrushOpacity,
     setEraserOpacity,
     setAutoSaveEnabled,
-    setAutoSaveIntervalSec,
     toggleTimelapseRecording,
     setTimelapseRootDir,
     setPerformanceMode,
@@ -204,6 +212,8 @@ export const TitleBar: React.FC = () => {
     setLevelsModalOpen,
     setBlurModalOpen,
     setPostProcessModalOpen,
+    setSettingsModalOpen,
+    setShowBrushSizeHud,
     setExportModalOpen,
     setShowWelcome,
     resetView,
@@ -219,20 +229,46 @@ export const TitleBar: React.FC = () => {
     togglePlay
   } = useHarmonyStore.getState();
 
-  const [autoSaveDraft, setAutoSaveDraft] = useState(String(autoSaveIntervalSec));
-  useEffect(() => {
-    setAutoSaveDraft(String(autoSaveIntervalSec));
-  }, [autoSaveIntervalSec]);
-
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+      const target = e.target as HTMLElement | null;
+      if (menuRef.current && target && !menuRef.current.contains(target)) {
         setOpenMenu(null);
+      }
+      if (
+        target &&
+        !target.closest('[data-tb-popover]') &&
+        !(guidesBtnRef.current && guidesBtnRef.current.contains(target)) &&
+        !(recBtnRef.current && recBtnRef.current.contains(target))
+      ) {
+        setOpenPopover(null);
+      }
+    };
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setOpenMenu(null);
+        setOpenPopover(null);
       }
     };
     window.addEventListener('mousedown', handleClickOutside);
-    return () => window.removeEventListener('mousedown', handleClickOutside);
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.removeEventListener('mousedown', handleClickOutside);
+      window.removeEventListener('keydown', handleKeyDown);
+    };
   }, []);
+
+  const toggleToolbarPopover = (kind: 'guides' | 'rec', btnEl: HTMLButtonElement | null, width: number) => {
+    setOpenMenu(null);
+    if (openPopover?.kind === kind) {
+      setOpenPopover(null);
+      return;
+    }
+    const rect = btnEl?.getBoundingClientRect();
+    if (!rect) return;
+    const left = Math.max(8, Math.min(rect.left, window.innerWidth - width - 8));
+    setOpenPopover({ kind, left, top: rect.bottom + 4 });
+  };
 
   const handleNewScene = () => {
     setOpenMenu(null);
@@ -543,18 +579,6 @@ export const TitleBar: React.FC = () => {
                 >
                   <span>Redo</span><span style={{ color: '#888' }}>Ctrl+Shift+Z</span>
                 </button>
-                <button className="dropdown-item" onClick={() => { setHsvModalOpen(true); setOpenMenu(null); }}>
-                  <span>Hue / Saturation / Value...</span><span style={{ color: '#888' }}>Ctrl+U</span>
-                </button>
-                <button className="dropdown-item" onClick={() => { setLevelsModalOpen(true); setOpenMenu(null); }}>
-                  <span>Níveis / Brilho & Contraste...</span><span style={{ color: '#888' }}>Ctrl+L</span>
-                </button>
-                <button className="dropdown-item" onClick={() => { setBlurModalOpen(true); setOpenMenu(null); }}>
-                  <span>Desfoque (Movimento / Gaussiano / Radial)...</span><span style={{ color: '#888' }}>Ctrl+Shift+B</span>
-                </button>
-                <button className="dropdown-item" onClick={() => { setPostProcessModalOpen(true); setOpenMenu(null); }}>
-                  <span>Pós-Produção / Look de Anime...</span><span style={{ color: '#c084fc' }}>FX</span>
-                </button>
                 <div className="dropdown-sep" />
                 <button className="dropdown-item" onClick={() => { clearCurrentFrame(); setOpenMenu(null); }}>
                   <span>Clear Current Frame</span><span style={{ color: '#888' }}>Del</span>
@@ -572,25 +596,47 @@ export const TitleBar: React.FC = () => {
               View
             </button>
             {openMenu === 'view' && (
-              <div className="dropdown-menu">
-                <button className="dropdown-item" onClick={() => { toggleGrid(); setOpenMenu(null); }}>
-                  <span>12-Field Grid</span><span>{showGrid ? '✓' : ''}</span>
-                </button>
-                <button className="dropdown-item" onClick={() => { toggleCameraFrame(); setOpenMenu(null); }}>
-                  <span>Camera Mask</span><span>{showCameraFrame ? '✓' : ''}</span>
-                </button>
+              <div className="dropdown-menu" style={{ minWidth: 230 }}>
                 <button className="dropdown-item" onClick={() => { toggleOnionSkin(); setOpenMenu(null); }}>
                   <span>Onion Skin</span><span>{onionSkin ? '✓' : ''}</span>
                 </button>
                 <button className="dropdown-item" onClick={() => { toggleLightTable(); setOpenMenu(null); }}>
                   <span>Light Table</span><span>{lightTable ? '✓' : ''}</span>
                 </button>
+                <button className="dropdown-item" onClick={() => { toggleGrid(); setOpenMenu(null); }}>
+                  <span>Grade 12-Field</span><span>{showGrid ? '✓' : ''}</span>
+                </button>
+                <button className="dropdown-item" onClick={() => { toggleSymmetry(); setOpenMenu(null); }}>
+                  <span>Simetria Vertical</span><span>{symmetryMode === 'vertical' ? '✓' : ''}</span>
+                </button>
+                <button
+                  className="dropdown-item"
+                  onClick={() => {
+                    setPerspectiveMode(((perspectiveMode + 1) % 5) as 0 | 1 | 2 | 3 | 4);
+                    setOpenMenu(null);
+                  }}
+                >
+                  <span>Régua de Perspectiva</span>
+                  <span style={{ color: perspectiveMode > 0 ? '#60a5fa' : '#888' }}>
+                    {perspectiveMode === 0 ? 'Off' : perspectiveMode === 4 ? 'Fisheye' : `${perspectiveMode}P`}
+                  </span>
+                </button>
+                <div className="dropdown-sep" />
+                <button className="dropdown-item" onClick={() => { toggleCameraFrame(); setOpenMenu(null); }}>
+                  <span>Moldura de Câmera</span><span>{showCameraFrame ? '✓' : ''}</span>
+                </button>
+                <button className="dropdown-item" onClick={() => { toggleReferenceWindow(); setOpenMenu(null); }}>
+                  <span>Janela de Referência</span><span>{referenceWindowOpen ? '✓' : ''}</span>
+                </button>
                 <button className="dropdown-item" onClick={() => { toggleGrayscaleMode(); setOpenMenu(null); }}>
-                  <span>Grayscale Proof (Ctrl+Y)</span><span>{grayscaleMode ? '✓' : ''}</span>
+                  <span>Visualizar P&B (Ctrl+Y)</span><span>{grayscaleMode ? '✓' : ''}</span>
                 </button>
                 <div className="dropdown-sep" />
                 <button className="dropdown-item" onClick={() => { resetView(); setOpenMenu(null); }}>
                   <span>Reset View</span><span style={{ color: '#888' }}>5</span>
+                </button>
+                <button className="dropdown-item" onClick={() => { resetRotation(); setOpenMenu(null); }}>
+                  <span>Zerar Rotação</span><span style={{ color: '#888' }}>0°</span>
                 </button>
               </div>
             )}
@@ -602,12 +648,87 @@ export const TitleBar: React.FC = () => {
               Insert
             </button>
             {openMenu === 'insert' && (
-              <div className="dropdown-menu">
+              <div className="dropdown-menu" style={{ minWidth: 215 }}>
                 <button className="dropdown-item" onClick={() => { addLayer(); setOpenMenu(null); }}>
-                  <span>New Drawing Layer</span><span style={{ color: '#888' }}>Ctrl+R</span>
+                  <span>Nova Camada de Desenho</span><span style={{ color: '#888' }}>Ctrl+R</span>
                 </button>
+                <button className="dropdown-item" onClick={() => { addCameraLayer(); setOpenMenu(null); }}>
+                  <span>Câmera 2D Animável</span><span style={{ color: '#888' }}>{hasCameraLayer ? 'Selecionar' : '+'}</span>
+                </button>
+                <div className="dropdown-sep" />
                 <button className="dropdown-item" onClick={() => { togglePlay(); setOpenMenu(null); }}>
                   <span>Play / Stop</span><span style={{ color: '#888' }}>Shift+Space</span>
+                </button>
+              </div>
+            )}
+          </div>
+
+          {/* Filtros & Efeitos Menu */}
+          <div style={{ position: 'relative' }}>
+            <button className="menu-btn" onClick={() => setOpenMenu(openMenu === 'filters' ? null : 'filters')}>
+              Filtros
+            </button>
+            {openMenu === 'filters' && (
+              <div className="dropdown-menu" style={{ minWidth: 260 }}>
+                <button className="dropdown-item" onClick={() => { setHsvModalOpen(true); setOpenMenu(null); }}>
+                  <span>Matiz / Saturação / Luminosidade...</span><span style={{ color: '#888' }}>Ctrl+U</span>
+                </button>
+                <button className="dropdown-item" onClick={() => { setLevelsModalOpen(true); setOpenMenu(null); }}>
+                  <span>Níveis / Brilho & Contraste...</span><span style={{ color: '#888' }}>Ctrl+L</span>
+                </button>
+                <button className="dropdown-item" onClick={() => { setBlurModalOpen(true); setOpenMenu(null); }}>
+                  <span>Desfoque (Movimento / Gaussiano / Radial)...</span><span style={{ color: '#888' }}>Ctrl+Shift+B</span>
+                </button>
+                <div className="dropdown-sep" />
+                <button className="dropdown-item" onClick={() => { setPostProcessModalOpen(true); setOpenMenu(null); }}>
+                  <span>Pós-Produção (Look de Anime)...</span>
+                  <span style={{ color: postProcessActive ? '#60a5fa' : '#888', fontWeight: postProcessActive ? 600 : 400 }}>
+                    {postProcessActive ? 'ON' : 'FX'}
+                  </span>
+                </button>
+              </div>
+            )}
+          </div>
+
+          {/* Opções / Preferences Menu */}
+          <div style={{ position: 'relative' }}>
+            <button className="menu-btn" onClick={() => setOpenMenu(openMenu === 'options' ? null : 'options')}>
+              Opções
+            </button>
+            {openMenu === 'options' && (
+              <div className="dropdown-menu" style={{ minWidth: 250 }}>
+                <button className="dropdown-item" onClick={() => { setSettingsModalOpen(true); setOpenMenu(null); }}>
+                  <span>Configurações e Atalhos...</span><span style={{ color: '#60a5fa' }}>⚙</span>
+                </button>
+                <div className="dropdown-sep" />
+                <button className="dropdown-item" onClick={() => { setShowBrushSizeHud(!showBrushSizeHud); setOpenMenu(null); }}>
+                  <span>Feedback Visual do Pincel</span><span>{showBrushSizeHud ? '✓' : ''}</span>
+                </button>
+                <button className="dropdown-item" onClick={() => { setAutoSaveEnabled(!autoSaveEnabled); setOpenMenu(null); }}>
+                  <span>Auto-Save ({autoSaveIntervalSec}s)</span><span>{autoSaveEnabled ? '✓' : ''}</span>
+                </button>
+                <div className="dropdown-sep" />
+                <div style={{ padding: '3px 14px', fontSize: 10, color: '#888', textTransform: 'uppercase' }}>
+                  Modo de Desempenho
+                </div>
+                <button className="dropdown-item" onClick={() => { setPerformanceMode('auto'); setOpenMenu(null); }}>
+                  <span>Auto (Recomendado)</span><span>{performanceMode === 'auto' ? '●' : ''}</span>
+                </button>
+                <button className="dropdown-item" onClick={() => { setPerformanceMode('eco'); setOpenMenu(null); }}>
+                  <span>Eco (PC Fraco / Leve)</span><span>{performanceMode === 'eco' ? '●' : ''}</span>
+                </button>
+                <button className="dropdown-item" onClick={() => { setPerformanceMode('ultra'); setOpenMenu(null); }}>
+                  <span>Ultra (Máxima Definição)</span><span>{performanceMode === 'ultra' ? '●' : ''}</span>
+                </button>
+                <div className="dropdown-sep" />
+                <button
+                  className="dropdown-item"
+                  onClick={() => {
+                    setOpenMenu(null);
+                    window.harmonyAPI?.openLauncher?.();
+                  }}
+                >
+                  <span>CelSketch Launcher / Atualizações</span>
                 </button>
               </div>
             )}
@@ -665,71 +786,55 @@ export const TitleBar: React.FC = () => {
         </div>
       </div>
 
-      {/* Top Quick Toolbar */}
+      {/* Top Quick Toolbar (clean, uncluttered) */}
       <div className="top-toolbar">
-        <button className="icon-btn" onClick={handleNewScene} title="New Scene">
+        <button className="icon-btn" onClick={handleNewScene} title="Nova Cena (Ctrl+N)">
           <FilePlus size={14} />
         </button>
-        <button className="icon-btn" onClick={handleOpen} title="Open Project">
+        <button className="icon-btn" onClick={handleOpen} title="Abrir Projeto (Ctrl+O)">
           <FolderOpen size={14} />
         </button>
-        <button className="icon-btn" onClick={handleSave} title="Save Project (Ctrl+S)">
+        <button className="icon-btn" onClick={handleSave} title="Salvar Projeto (Ctrl+S)">
           <Save size={14} />
         </button>
-        <button className="icon-btn" onClick={() => setExportModalOpen(true)} title="Export Animation / Image">
+        <button className="icon-btn" onClick={() => setExportModalOpen(true)} title="Exportar Animação / Imagem">
           <Download size={14} />
-          <span>Export</span>
+          <span>Exportar</span>
         </button>
 
         <div className="tb-sep" />
 
-        <button className="icon-btn" onClick={undo} disabled={!canUndo} title="Undo (Ctrl+Z)">
+        <button className="icon-btn" onClick={undo} disabled={!canUndo} title="Desfazer (Ctrl+Z)">
           <Undo2 size={14} />
         </button>
-        <button className="icon-btn" onClick={redo} disabled={!canRedo} title="Redo (Ctrl+Shift+Z)">
+        <button className="icon-btn" onClick={redo} disabled={!canRedo} title="Refazer (Ctrl+Shift+Z)">
           <Redo2 size={14} />
         </button>
 
         <div className="tb-sep" />
 
-        <button className={`icon-btn ${onionSkin ? 'active' : ''}`} onClick={toggleOnionSkin} title="Toggle Onion Skin">
+        <button className={`icon-btn ${onionSkin ? 'active' : ''}`} onClick={toggleOnionSkin} title="Onion Skin">
           <Layers size={14} />
-          <span>Onion Skin</span>
+          <span>Onion</span>
         </button>
         <button className={`icon-btn ${lightTable ? 'active' : ''}`} onClick={toggleLightTable} title="Light Table">
           <Sun size={14} />
-          <span>Light Table</span>
+          <span>Light</span>
         </button>
-        <button className={`icon-btn ${showGrid ? 'active' : ''}`} onClick={toggleGrid} title="12-Field Grid">
-          <Grid3X3 size={14} />
-        </button>
+
+        {/* Compact Guides Dropdown (Grid, Perspective, Symmetry) */}
         <button
-          className={`icon-btn ${perspectiveMode > 0 ? 'active' : ''}`}
-          onClick={() => setPerspectiveMode(((perspectiveMode + 1) % 5) as 0 | 1 | 2 | 3 | 4)}
-          title="Régua de Perspectiva (Off / 1P / 2P / 3P / Fisheye)"
+          ref={guidesBtnRef}
+          className={`icon-btn ${showGrid || perspectiveMode > 0 || symmetryMode === 'vertical' || openPopover?.kind === 'guides' ? 'active' : ''}`}
+          onClick={() => toggleToolbarPopover('guides', guidesBtnRef.current, 215)}
+          title="Guias de Desenho (Grade 12-Field, Perspectiva, Simetria)"
+          style={{ gap: 3 }}
         >
-          <span>
-            {perspectiveMode === 0
-              ? 'Persp: Off'
-              : perspectiveMode === 4
-              ? 'Persp: Fisheye'
-              : `Persp: ${perspectiveMode}P`}
-          </span>
+          <Grid3X3 size={13} />
+          <span>Guias</span>
+          <ChevronDown size={11} style={{ opacity: 0.7 }} />
         </button>
-        <button
-          className={`icon-btn ${symmetryMode === 'vertical' ? 'active' : ''}`}
-          onClick={toggleSymmetry}
-          title="Régua de Simetria Vertical ao vivo"
-        >
-          <span>Simetria</span>
-        </button>
-        <button
-          className={`icon-btn ${referenceWindowOpen ? 'active' : ''}`}
-          onClick={toggleReferenceWindow}
-          title="Janela de Referência estilo PureRef (arraste imagens ou Ctrl+V)"
-        >
-          <span>Ref</span>
-        </button>
+
         <button
           className={`icon-btn ${hasCameraLayer ? (cameraViewMode ? 'active' : '') : showCameraFrame ? 'active' : ''}`}
           onClick={() => {
@@ -746,55 +851,61 @@ export const TitleBar: React.FC = () => {
           title={
             hasCameraLayer
               ? cameraViewMode
-                ? 'Sair da Visão da Câmera (voltar para edição livre)'
-                : 'Ver pela Câmera 2D (enquadramento exato do vídeo final)'
+                ? 'Sair da Visão da Câmera'
+                : 'Ver pela Câmera 2D'
               : 'Adicionar Câmera 2D Animável à cena'
           }
         >
-          <Camera size={14} />
-          <span>{hasCameraLayer ? (cameraViewMode ? 'Câmera ON' : 'Ver Câmera') : 'Câmera 2D'}</span>
+          <Camera size={13} />
+          <span>{hasCameraLayer ? (cameraViewMode ? 'Câmera ON' : 'Câmera') : 'Câmera'}</span>
         </button>
+
         <button
-          className="icon-btn"
-          onClick={() => setBlurModalOpen(true)}
-          style={{ gap: 4 }}
-          title="Desfoque na Camada / Quadro / Seleção (Movimento Direcional, Gaussiano, Radial — Ctrl+Shift+B)"
+          className={`icon-btn ${referenceWindowOpen ? 'active' : ''}`}
+          onClick={toggleReferenceWindow}
+          title="Janela de Referência estilo PureRef (Imagens, GIFs, MP4, Notas e Multi-Monitor)"
         >
-          <Wind size={13} color="#38bdf8" />
-          <span>Desfoque</span>
+          <span>Ref</span>
         </button>
-        <button
-          className={`icon-btn ${postProcessModalOpen || postProcessActive ? 'active' : ''}`}
-          onClick={() => setPostProcessModalOpen(!postProcessModalOpen)}
-          style={
-            postProcessActive
-              ? { background: 'rgba(168, 85, 247, 0.25)', borderColor: '#a855f7', color: '#e9d5ff', gap: 4 }
-              : { gap: 4 }
-          }
-          title="Pós-Produção / Look de Anime (Bloom, Aberração Cromática, Motion Blur, Vinheta, Grão)"
-        >
-          <Sparkles size={13} />
-          <span>Pós-Prod</span>
+
+        {postProcessActive && (
+          <button
+            className={`icon-btn ${postProcessModalOpen ? 'active' : ''}`}
+            onClick={() => setPostProcessModalOpen(!postProcessModalOpen)}
+            style={{
+              background: 'rgba(58, 134, 255, 0.16)',
+              borderColor: 'rgba(96, 165, 250, 0.5)',
+              color: '#bfdbfe',
+              gap: 4
+            }}
+            title="Pós-Produção ativa — clique para ajustar"
+          >
+            <Sparkles size={12} />
+            <span>Pós-Prod</span>
+          </button>
+        )}
+
+        <button className="icon-btn" onClick={resetView} title="Resetar Visualização (5)">
+          <RotateCcw size={13} />
         </button>
-        <button className="icon-btn" onClick={resetView} title="Reset View (5)">
-          <RotateCcw size={14} />
-        </button>
-        <button
-          className={`icon-btn ${Math.round(rotation) !== 0 ? 'active' : ''}`}
-          onClick={resetRotation}
-          title="Redefinir Rotação da Tela (0°)"
-        >
-          <span>{Math.round(rotation)}°</span>
-        </button>
+        {Math.round(rotation) !== 0 && (
+          <button
+            className="icon-btn active"
+            onClick={resetRotation}
+            title="Zerar Rotação da Tela (0°)"
+          >
+            <span>{Math.round(rotation)}°</span>
+          </button>
+        )}
 
         <div className="tb-sep" />
 
         {/* Brush Stabilizer */}
         <label
-          style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, color: '#ccc' }}
+          style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, color: '#bbb' }}
           title="Estabilizador de Traço"
         >
-          <span>Stabilizer:</span>
+          <span>Estab.</span>
           <input
             type="range"
             min={0}
@@ -802,17 +913,17 @@ export const TitleBar: React.FC = () => {
             value={brushSmoothing}
             onChange={(e) => setBrushSmoothing(Number(e.target.value))}
             onPointerUp={(e) => (e.currentTarget as HTMLInputElement).blur()}
-            style={{ width: 76, accentColor: '#3a86ff', cursor: 'pointer' }}
+            style={{ width: 70, accentColor: '#3a86ff', cursor: 'pointer' }}
           />
-          <span style={{ width: 30, color: '#fff', fontWeight: 600 }}>{brushSmoothing}%</span>
+          <span style={{ width: 28, color: '#eee', fontWeight: 600, fontSize: 10.5 }}>{brushSmoothing}%</span>
         </label>
 
-        {/* Brush / Eraser Opacity right next to Stabilizer */}
+        {/* Brush / Eraser Opacity */}
         <label
-          style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, color: '#ccc' }}
-          title={activeTool === 'eraser' ? 'Opacidade da Borracha (E)' : 'Opacidade do Pincel'}
+          style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, color: '#bbb' }}
+          title={activeTool === 'eraser' ? 'Opacidade da Borracha' : 'Opacidade do Pincel'}
         >
-          <span>{activeTool === 'eraser' ? 'Opac. (E):' : 'Opacidade:'}</span>
+          <span>{activeTool === 'eraser' ? 'Opac. (E)' : 'Opac.'}</span>
           <input
             type="range"
             min={5}
@@ -824,139 +935,204 @@ export const TitleBar: React.FC = () => {
               else setBrushOpacity(v);
             }}
             onPointerUp={(e) => (e.currentTarget as HTMLInputElement).blur()}
-            style={{ width: 76, accentColor: '#3a86ff', cursor: 'pointer' }}
+            style={{ width: 70, accentColor: '#3a86ff', cursor: 'pointer' }}
           />
-          <span style={{ width: 30, color: '#fff', fontWeight: 600 }}>
+          <span style={{ width: 28, color: '#eee', fontWeight: 600, fontSize: 10.5 }}>
             {Math.round((activeTool === 'eraser' ? eraserOpacity : brushOpacity) * 100)}%
           </span>
         </label>
 
-        <div className="tb-sep" />
+        <div style={{ flex: 1, minWidth: 8 }} />
 
-        {/* Auto-Save Controls */}
-        <label
-          style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: '#ccc', cursor: 'pointer' }}
-          title="Ativar/Desativar Auto-Save automático"
-        >
-          <input
-            type="checkbox"
-            checked={autoSaveEnabled}
-            onChange={(e) => setAutoSaveEnabled(e.target.checked)}
-          />
-          <span>AutoSave:</span>
-        </label>
-        <input
-          type="text"
-          inputMode="numeric"
-          value={autoSaveDraft}
-          disabled={!autoSaveEnabled}
-          onChange={(e) => setAutoSaveDraft(e.target.value.replace(/[^0-9]/g, ''))}
-          onBlur={() => {
-            const v = parseInt(autoSaveDraft, 10);
-            const clamped = Number.isFinite(v) ? Math.max(5, Math.min(3600, v)) : autoSaveIntervalSec;
-            setAutoSaveIntervalSec(clamped);
-            setAutoSaveDraft(String(clamped));
-          }}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') e.currentTarget.blur();
-          }}
-          className="harmony-input timeline-num-input"
-          style={{ width: 44, opacity: autoSaveEnabled ? 1 : 0.45 }}
-          title="Intervalo do Auto-Save em segundos (5 a 3600)"
-        />
-        <span style={{ fontSize: 10.5, color: '#888' }}>s</span>
-
-        <div className="tb-sep" />
-
-        {/* Timelapse Recording (Auto-Rec Process Recorder) */}
+        {/* Unified Single REC Dropdown Button */}
         <button
-          className={`icon-btn ${timelapseRecording ? 'active' : ''}`}
-          onClick={async () => {
-            if (!timelapseRecording) {
-              if (!timelapseRootDir && window.harmonyAPI?.pickDirectory) {
-                const res = await window.harmonyAPI.pickDirectory('Escolha a pasta onde gravar os processos (Auto-Rec)');
-                if (res.canceled || !res.dirPath) return;
-                setTimelapseRootDir(res.dirPath);
-              }
-              toggleTimelapseRecording();
-            } else {
-              toggleTimelapseRecording();
-            }
-          }}
-          style={timelapseRecording ? { background: '#b91c1c', borderColor: '#ef4444', color: '#fff' } : undefined}
-          title={
-            timelapseRootDir
-              ? `Auto-Rec (salva pasta organizada por cena em: ${timelapseRootDir})`
-              : 'Ativar Auto-Rec — pergunta onde salvar os processos organizados por cena'
+          ref={recBtnRef}
+          className={`icon-btn ${timelapseRecording || openPopover?.kind === 'rec' ? 'active' : ''}`}
+          onClick={() => toggleToolbarPopover('rec', recBtnRef.current, 250)}
+          style={
+            timelapseRecording
+              ? { background: '#b91c1c', borderColor: '#ef4444', color: '#fff', gap: 4 }
+              : { gap: 4 }
           }
+          title="Gravação de Processo / Timelapse (Auto-Rec)"
         >
           <span>{timelapseRecording ? '● REC' : '○ REC'}</span>
+          {timelapseCount > 0 && (
+            <span
+              style={{
+                fontSize: 9.5,
+                padding: '0 4px',
+                borderRadius: 99,
+                background: timelapseRecording ? 'rgba(0,0,0,0.3)' : 'rgba(255,255,255,0.12)',
+                color: '#fff'
+              }}
+            >
+              {timelapseCount}
+            </span>
+          )}
+          <ChevronDown size={11} style={{ opacity: 0.75 }} />
         </button>
+
         <button
           className="icon-btn"
-          onClick={async (e) => {
-            if (e.shiftKey || !timelapseRootDir) {
-              const res = await window.harmonyAPI?.pickDirectory('Escolha a pasta onde gravar os processos (Auto-Rec)');
-              if (res && !res.canceled && res.dirPath) {
-                setTimelapseRootDir(res.dirPath);
-              }
-            } else {
-              window.harmonyAPI?.openPath(timelapseRootDir);
-            }
-          }}
-          title={
-            timelapseRootDir
-              ? `Pasta do Auto-Rec: ${timelapseRootDir} (Clique para abrir • Shift+Clique para trocar pasta)`
-              : 'Escolher pasta de gravação do Auto-Rec'
-          }
-          style={{ padding: '0 5px' }}
+          onClick={() => setSettingsModalOpen(true)}
+          title="Configurações e Atalhos do Teclado"
         >
-          <FolderOpen size={12} />
-        </button>
-        {timelapseCount > 0 && (
-          <div style={{ display: 'inline-flex', alignItems: 'center', gap: 2 }}>
-            <button
-              className="icon-btn"
-              onClick={handleExportTimelapse}
-              disabled={timelapseBusy}
-              title="Exportar vídeo do Timelapse gravado"
-            >
-              <span>{timelapseBusy ? 'Exportando...' : `Timelapse (${timelapseCount})`}</span>
-            </button>
-            <button
-              className="icon-btn"
-              onClick={() => clearTimelapse()}
-              disabled={timelapseBusy}
-              title="Limpar frames de Timelapse em memória"
-              style={{ minWidth: 18, padding: '0 4px', color: '#9ca3af' }}
-            >
-              ×
-            </button>
-          </div>
-        )}
-
-        <div className="tb-sep" />
-
-        {/* Performance Mode Switcher (Auto / Eco for weak PCs / Ultra for GPU PCs) */}
-        <button
-          className={`icon-btn ${performanceMode !== 'auto' ? 'active' : ''}`}
-          onClick={() => {
-            const next =
-              performanceMode === 'auto' ? 'eco' : performanceMode === 'eco' ? 'ultra' : 'auto';
-            setPerformanceMode(next);
-          }}
-          title="Modo de Desempenho: Auto (detecta seu PC) • Eco (PC Fraco / sem GPU) • Ultra (GPU / alta definição)"
-          style={{ fontSize: 10.5 }}
-        >
-          <span>
-            {performanceMode === 'auto'
-              ? '⚡ Auto'
-              : performanceMode === 'eco'
-              ? '⚡ Eco'
-              : '⚡ Ultra'}
-          </span>
+          <Settings size={14} />
         </button>
       </div>
+
+      {/* Portal Popovers for Toolbar (Guias & REC) so overflow-x never clips them */}
+      {openPopover &&
+        createPortal(
+          <div
+            data-tb-popover="true"
+            style={{
+              position: 'fixed',
+              left: openPopover.left,
+              top: openPopover.top,
+              width: openPopover.kind === 'rec' ? 250 : 215,
+              background: '#252830',
+              border: '1px solid #3f4452',
+              borderRadius: 8,
+              padding: 6,
+              boxShadow: '0 10px 28px rgba(0,0,0,0.55)',
+              zIndex: 9999,
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 3
+            }}
+          >
+            {openPopover.kind === 'guides' && (
+              <>
+                <div style={{ padding: '3px 8px', fontSize: 10, color: '#8e96a8', textTransform: 'uppercase', letterSpacing: 0.5 }}>
+                  Guias de Desenho
+                </div>
+                <button className="dropdown-item" onClick={() => toggleGrid()}>
+                  <span>Grade 12-Field</span>
+                  <span style={{ color: '#60a5fa' }}>{showGrid ? '✓' : ''}</span>
+                </button>
+                <button className="dropdown-item" onClick={() => toggleSymmetry()}>
+                  <span>Simetria Vertical</span>
+                  <span style={{ color: '#60a5fa' }}>{symmetryMode === 'vertical' ? '✓' : ''}</span>
+                </button>
+                <div className="dropdown-sep" />
+                <div style={{ padding: '3px 8px', fontSize: 10, color: '#8e96a8', textTransform: 'uppercase', letterSpacing: 0.5 }}>
+                  Régua de Perspectiva
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 4, padding: '2px 6px 4px' }}>
+                  {([
+                    { v: 0, l: 'Off' },
+                    { v: 1, l: '1P' },
+                    { v: 2, l: '2P' },
+                    { v: 3, l: '3P' },
+                    { v: 4, l: 'Eye' }
+                  ] as const).map((opt) => (
+                    <button
+                      key={opt.v}
+                      onClick={() => setPerspectiveMode(opt.v)}
+                      style={{
+                        padding: '4px 0',
+                        borderRadius: 4,
+                        border: perspectiveMode === opt.v ? '1px solid #3a86ff' : '1px solid #3d4250',
+                        background: perspectiveMode === opt.v ? 'rgba(58,134,255,0.22)' : '#1d2027',
+                        color: perspectiveMode === opt.v ? '#dbeafe' : '#bbb',
+                        fontSize: 10.5,
+                        cursor: 'pointer'
+                      }}
+                    >
+                      {opt.l}
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
+
+            {openPopover.kind === 'rec' && (
+              <>
+                <div style={{ padding: '3px 8px', fontSize: 10, color: '#8e96a8', textTransform: 'uppercase', letterSpacing: 0.5 }}>
+                  Gravação / Timelapse
+                </div>
+                <button
+                  className="dropdown-item"
+                  onClick={async () => {
+                    if (!timelapseRecording) {
+                      if (!timelapseRootDir && window.harmonyAPI?.pickDirectory) {
+                        const res = await window.harmonyAPI.pickDirectory('Escolha a pasta onde gravar os processos (Auto-Rec)');
+                        if (res.canceled || !res.dirPath) return;
+                        setTimelapseRootDir(res.dirPath);
+                      }
+                      toggleTimelapseRecording();
+                    } else {
+                      toggleTimelapseRecording();
+                    }
+                    setOpenPopover(null);
+                  }}
+                  style={{ color: timelapseRecording ? '#fca5a5' : '#e5e7eb', fontWeight: 600 }}
+                >
+                  <span>{timelapseRecording ? '■ Parar Gravação (Auto-Rec)' : '● Iniciar Gravação (Auto-Rec)'}</span>
+                </button>
+                <button
+                  className="dropdown-item"
+                  onClick={async () => {
+                    const res = await window.harmonyAPI?.pickDirectory('Escolha a pasta onde gravar os processos (Auto-Rec)');
+                    if (res && !res.canceled && res.dirPath) {
+                      setTimelapseRootDir(res.dirPath);
+                    }
+                  }}
+                >
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                    <FolderOpen size={12} /> {timelapseRootDir ? 'Trocar Pasta do Auto-Rec...' : 'Escolher Pasta...'}
+                  </span>
+                </button>
+                {timelapseRootDir && (
+                  <button
+                    className="dropdown-item"
+                    onClick={() => {
+                      window.harmonyAPI?.openPath(timelapseRootDir);
+                      setOpenPopover(null);
+                    }}
+                    title={timelapseRootDir}
+                  >
+                    <span style={{ fontSize: 10.5, color: '#9ca3af', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      Abrir: {timelapseRootDir}
+                    </span>
+                  </button>
+                )}
+                <div className="dropdown-sep" />
+                <button
+                  className="dropdown-item"
+                  disabled={timelapseCount === 0 || timelapseBusy}
+                  style={{ opacity: timelapseCount === 0 || timelapseBusy ? 0.45 : 1 }}
+                  onClick={() => {
+                    setOpenPopover(null);
+                    handleExportTimelapse();
+                  }}
+                >
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                    <Video size={12} /> {timelapseBusy ? 'Exportando...' : `Exportar Timelapse (${timelapseCount})`}
+                  </span>
+                </button>
+                {timelapseCount > 0 && (
+                  <button
+                    className="dropdown-item"
+                    disabled={timelapseBusy}
+                    onClick={() => {
+                      clearTimelapse();
+                      setOpenPopover(null);
+                    }}
+                    style={{ color: '#f87171' }}
+                  >
+                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                      <Trash2 size={12} /> Limpar Frames Gravados
+                    </span>
+                  </button>
+                )}
+              </>
+            )}
+          </div>,
+          document.body
+        )}
     </>
   );
 };

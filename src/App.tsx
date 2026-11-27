@@ -12,10 +12,12 @@ import { HsvModal } from './components/HsvModal';
 import { LevelsModal } from './components/LevelsModal';
 import { BlurModal } from './components/BlurModal';
 import { PostProcessModal } from './components/PostProcessModal';
+import { SettingsModal } from './components/SettingsModal';
 import { ExportModal } from './components/ExportModal';
 import { ReferenceWindow } from './components/ReferenceWindow';
 import { UnsavedCloseModal } from './components/UnsavedCloseModal';
 import { useHarmonyStore } from './store/useHarmonyStore';
+import { matchesShortcutCombo } from './utils/shortcuts';
 
 const TEXT_INPUT_TYPES = new Set(['text', 'search', 'number', 'email', 'password', 'url', 'tel']);
 
@@ -90,8 +92,15 @@ export const App: React.FC = () => {
     const unsub = window.harmonyAPI?.onRequestClose?.(() => {
       setCloseConfirmOpen(true);
     });
+    const unsubRefColor = window.harmonyAPI?.onRefColorPicked?.((hex) => {
+      if (!hex) return;
+      const st = useHarmonyStore.getState();
+      st.setActiveColor(hex);
+      st.pushRecentColor(hex);
+    });
     return () => {
       if (unsub) unsub();
+      if (unsubRefColor) unsubRefColor();
     };
   }, []);
 
@@ -218,7 +227,7 @@ export const App: React.FC = () => {
   useEffect(() => {
     const onKeyDown = async (e: KeyboardEvent) => {
       const s = useHarmonyStore.getState();
-      if (s.showWelcome || s.hsvModalOpen || s.levelsModalOpen || s.blurModalOpen || s.exportModalOpen) return;
+      if (s.showWelcome || s.hsvModalOpen || s.levelsModalOpen || s.blurModalOpen || s.exportModalOpen || s.settingsModalOpen) return;
       if (isTextEditingTarget(e.target)) return;
 
       if (e.ctrlKey || e.metaKey) {
@@ -350,21 +359,85 @@ export const App: React.FC = () => {
         return;
       }
 
-      // Brush / Eraser / Liquify size shortcuts — physical BracketRight increases, BracketLeft decreases (works on US & ABNT2!)
-      if (e.code === 'BracketRight') {
+      // Customizable shortcuts (Settings -> Atalhos)
+      const sc = s.customShortcuts;
+      if (matchesShortcutCombo(e, sc.brush_size_inc)) {
         e.preventDefault();
         if (s.activeTool === 'eraser') s.setEraserSize(s.eraserSize + (s.eraserSize >= 20 ? 4 : 2));
         else if (s.activeTool === 'liquify') s.setLiquifySize(s.liquifySize + 10);
         else s.setBrushSize(s.brushSize + (s.brushSize >= 20 ? 4 : 2));
         return;
       }
-      if (e.code === 'BracketLeft') {
+      if (matchesShortcutCombo(e, sc.brush_size_dec)) {
         e.preventDefault();
         if (s.activeTool === 'eraser') s.setEraserSize(s.eraserSize - (s.eraserSize > 20 ? 4 : 2));
         else if (s.activeTool === 'liquify') s.setLiquifySize(s.liquifySize - 10);
         else s.setBrushSize(s.brushSize - (s.brushSize > 20 ? 4 : 2));
         return;
       }
+      if (matchesShortcutCombo(e, sc.toggle_play)) {
+        if (!e.repeat) {
+          e.preventDefault();
+          s.togglePlay();
+        }
+        return;
+      }
+      if (matchesShortcutCombo(e, sc.toggle_onion)) {
+        if (!e.repeat) {
+          e.preventDefault();
+          s.toggleOnionSkin();
+        }
+        return;
+      }
+      if (matchesShortcutCombo(e, sc.toggle_light_table)) {
+        if (!e.repeat) {
+          e.preventDefault();
+          s.toggleLightTable();
+        }
+        return;
+      }
+      if (matchesShortcutCombo(e, sc.toggle_ref)) {
+        if (!e.repeat) {
+          e.preventDefault();
+          s.toggleReferenceWindow();
+        }
+        return;
+      }
+      if (matchesShortcutCombo(e, sc.flip_x)) {
+        if (!e.repeat) {
+          e.preventDefault();
+          s.toggleFlipX();
+        }
+        return;
+      }
+      if (matchesShortcutCombo(e, sc.reset_view)) {
+        e.preventDefault();
+        s.resetView();
+        return;
+      }
+      if (matchesShortcutCombo(e, sc.swap_colors)) {
+        if (!e.repeat) s.swapColors();
+        return;
+      }
+      if (matchesShortcutCombo(e, sc.crop_mode)) {
+        if (!e.repeat) s.setCropMode(!s.cropMode);
+        return;
+      }
+      if (matchesShortcutCombo(e, sc.tool_brush)) { s.setTool('brush'); return; }
+      if (matchesShortcutCombo(e, sc.tool_eraser)) { s.setTool('eraser'); return; }
+      if (matchesShortcutCombo(e, sc.tool_pencil)) { s.setTool('pencil'); return; }
+      if (matchesShortcutCombo(e, sc.tool_paint)) { s.setTool('paint'); return; }
+      if (matchesShortcutCombo(e, sc.tool_gradient)) { s.setTool('gradient'); return; }
+      if (matchesShortcutCombo(e, sc.tool_lasso)) { s.setTool('lasso'); return; }
+      if (matchesShortcutCombo(e, sc.tool_magicwand)) { s.setTool('magicwand'); return; }
+      if (matchesShortcutCombo(e, sc.tool_liquify)) { s.setTool('liquify'); return; }
+      if (matchesShortcutCombo(e, sc.tool_line)) { s.setTool('line'); return; }
+      if (matchesShortcutCombo(e, sc.tool_rectangle)) { s.activateShapeGroup(false); return; }
+      if (matchesShortcutCombo(e, sc.tool_ellipse)) { s.setTool('ellipse'); return; }
+      if (matchesShortcutCombo(e, sc.tool_text)) { s.setTool('text'); return; }
+      if (matchesShortcutCombo(e, sc.tool_eyedropper)) { s.setTool('eyedropper'); return; }
+      if (matchesShortcutCombo(e, sc.tool_hand)) { s.setTool('hand'); return; }
+      if (matchesShortcutCombo(e, sc.tool_zoom)) { s.setTool('zoom'); return; }
 
       const lower = e.key.toLowerCase();
       // Special Alt+G shortcut for Polygonal Lasso Fill; ignore other Alt+key combos so menu/Alt-picker never triggers tools!
@@ -377,43 +450,10 @@ export const App: React.FC = () => {
       }
 
       switch (lower) {
-        case 'q': s.setTool(e.shiftKey ? 'polylasso' : 'lasso'); break;
+        case 'q': if (e.shiftKey) s.setTool('polylasso'); break;
         case 'm': s.activateSelectionGroup(e.shiftKey); break;
-        case 'w': s.setTool('magicwand'); break;
-        case 'j': s.setTool('liquify'); break;
-        case 't': s.setTool('text'); break;
-        case 'b': s.setTool('brush'); break;
-        case 'c':
-          if (!e.repeat) s.setCropMode(!s.cropMode);
-          break;
-        case 'p': s.setTool('pencil'); break;
-        case 'e': s.setTool('eraser'); break;
-        case 'g': s.setTool(e.shiftKey ? 'lassofill' : 'paint'); break;
-        case 'l': s.setTool('line'); break;
-        case 'u': s.activateShapeGroup(e.shiftKey); break;
-        case 'o': s.setTool('ellipse'); break;
-        case 'i': s.setTool('eyedropper'); break;
-        case 'x':
-          if (!e.repeat) s.swapColors();
-          break;
-        case 'h': s.setTool('hand'); break;
-        case 'z': s.setTool('zoom'); break;
-        case '5':
-          e.preventDefault();
-          s.resetView();
-          break;
-        case ' ':
-          if (e.shiftKey && !e.repeat) {
-            e.preventDefault();
-            s.togglePlay();
-          }
-          break;
-        case 'f1':
-          if (!e.repeat) {
-            e.preventDefault();
-            s.toggleFlipX();
-          }
-          break;
+        case 'g': if (e.shiftKey) s.setTool('lassofill'); break;
+        case 'u': if (e.shiftKey) s.activateShapeGroup(true); break;
         case '.':
           s.nextFrame();
           break;
@@ -613,6 +653,7 @@ export const App: React.FC = () => {
       <LevelsModal />
       <BlurModal />
       <PostProcessModal />
+      <SettingsModal />
       <ExportModal />
       <ReferenceWindow />
       <UnsavedCloseModal open={closeConfirmOpen} onClose={() => setCloseConfirmOpen(false)} />

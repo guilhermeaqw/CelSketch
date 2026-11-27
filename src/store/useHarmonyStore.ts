@@ -4,6 +4,13 @@ import { adjustHexHsl } from '../utils/hsvUtils';
 import { adjustHexLevels, isNoopLevels, LevelsAdjustment } from '../utils/levelsUtils';
 import { applyBlurToCanvas, BlurSettings, isNoopBlur } from '../utils/blurUtils';
 import { DEFAULT_POST_PROCESS } from '../utils/postProcessUtils';
+import {
+  getDefaultShortcuts,
+  loadCustomShortcuts,
+  saveCustomShortcuts,
+  type ShortcutActionId,
+  type ShortcutMap
+} from '../utils/shortcuts';
 import { renderFrameToCanvas, renderStroke } from '../utils/canvasRenderer';
 import { CAMERA_EFFECT_PRESETS, getInterpolatedCamera } from '../utils/cameraUtils';
 import {
@@ -168,6 +175,9 @@ interface HarmonyState {
   blurPreview: (BlurSettings & { allFrames: boolean }) | null;
   postProcessModalOpen: boolean;
   postProcess: PostProcessSettings;
+  settingsModalOpen: boolean;
+  showBrushSizeHud: boolean;
+  customShortcuts: ShortcutMap;
   exportModalOpen: boolean;
   cropMode: boolean;
   showGrid: boolean;
@@ -253,6 +263,10 @@ interface HarmonyState {
   applyLayerLevels: (adj: LevelsAdjustment, allFrames: boolean) => void;
   setBlurModalOpen: (open: boolean) => void;
   setBlurPreview: (preview: (BlurSettings & { allFrames: boolean }) | null) => void;
+  setSettingsModalOpen: (open: boolean) => void;
+  setShowBrushSizeHud: (show: boolean) => void;
+  setCustomShortcut: (actionId: ShortcutActionId, combo: string) => void;
+  resetCustomShortcuts: () => void;
   applyLayerBlur: (cfg: BlurSettings, allFrames: boolean) => void;
   setPostProcessModalOpen: (open: boolean) => void;
   setPostProcess: (patch: Partial<PostProcessSettings>) => void;
@@ -677,6 +691,9 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
   blurPreview: null,
   postProcessModalOpen: false,
   postProcess: { ...DEFAULT_POST_PROCESS },
+  settingsModalOpen: false,
+  showBrushSizeHud: typeof savedPrefs.showBrushSizeHud === 'boolean' ? savedPrefs.showBrushSizeHud : true,
+  customShortcuts: loadCustomShortcuts(),
   exportModalOpen: false,
   cropMode: false,
   showGrid: typeof savedPrefs.showGrid === 'boolean' ? savedPrefs.showGrid : false,
@@ -818,6 +835,19 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
       zoom: Number.isFinite(zoom) ? Math.max(0.1, Math.min(8, zoom)) : s.zoom
     })),
   setShowWelcome: (showWelcome) => set({ showWelcome }),
+  setSettingsModalOpen: (settingsModalOpen) => set({ settingsModalOpen }),
+  setShowBrushSizeHud: (showBrushSizeHud) => set({ showBrushSizeHud }),
+  setCustomShortcut: (actionId, combo) =>
+    set((s) => {
+      const next: ShortcutMap = { ...s.customShortcuts, [actionId]: combo };
+      saveCustomShortcuts(next);
+      return { customShortcuts: next };
+    }),
+  resetCustomShortcuts: () => {
+    const defaults = getDefaultShortcuts();
+    saveCustomShortcuts(defaults);
+    set({ customShortcuts: defaults });
+  },
   createNewScene: (name, width, height, fps) =>
     set((s) => {
       const id = `scene-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`;
@@ -3182,7 +3212,8 @@ const PREF_KEYS = [
   'autoSaveEnabled',
   'autoSaveIntervalSec',
   'timelapseRootDir',
-  'performanceMode'
+  'performanceMode',
+  'showBrushSizeHud'
 ] as const;
 
 let prefsSaveTimer: number | null = null;

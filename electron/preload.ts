@@ -67,5 +67,24 @@ contextBridge.exposeInMainWorld('harmonyAPI', {
     const listener = (_event: Electron.IpcRendererEvent, result: any) => callback(result);
     ipcRenderer.on('updater:statusChanged', listener);
     return () => ipcRenderer.removeListener('updater:statusChanged', listener);
+  },
+
+  // Multi-monitor Reference Window APIs
+  refOpenPopout: () => ipcRenderer.invoke('ref:openPopout'),
+  refClosePopout: () => ipcRenderer.invoke('ref:closePopout'),
+  refSetAlwaysOnTop: (flag: boolean) => ipcRenderer.invoke('ref:setAlwaysOnTop', flag),
+  refSetWindowOpacity: (alpha: number) => ipcRenderer.invoke('ref:setWindowOpacity', alpha),
+  refPickColor: (hex: string) => ipcRenderer.invoke('ref:pickColor', hex),
+  refSetBoardState: (json: string) => ipcRenderer.invoke('ref:setBoardState', json),
+  refGetBoardState: () => ipcRenderer.invoke('ref:getBoardState'),
+  onRefColorPicked: (callback: (hex: string) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, hex: string) => callback(hex);
+    ipcRenderer.on('ref:colorPicked', listener);
+    return () => ipcRenderer.removeListener('ref:colorPicked', listener);
+  },
+  onRefPopoutClosed: (callback: () => void) => {
+    const listener = () => callback();
+    ipcRenderer.on('ref:popoutClosed', listener);
+    return () => ipcRenderer.removeListener('ref:popoutClosed', listener);
   }
 });
