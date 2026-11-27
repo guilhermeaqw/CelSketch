@@ -5,7 +5,10 @@ import { ArtLayerId, Point, Stroke } from '../types/harmony';
 import {
   renderStroke,
   canRenderLiveIncremental,
-  renderLiveStrokeSegment,
+  liveIncrementalUsesScratch,
+  createLiveDabState,
+  renderLiveStrokeIncremental,
+  type LiveDabState,
   getEffectiveFrameStrokes,
   isLayerEffectivelyVisible,
   getLayerEffectiveOpacity,
@@ -88,6 +91,8 @@ export const CanvasStage: React.FC = () => {
   const layerBufferRef = useRef<HTMLCanvasElement | null>(null);
   const liveStrokeCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const liveStrokeIdRef = useRef<string | null>(null);
+  const liveDabStateRef = useRef<LiveDabState>(createLiveDabState());
+  const liveDabMirrorStateRef = useRef<LiveDabState>(createLiveDabState());
   const liveStrokeRenderedCountRef = useRef<number>(0);
   const layerBitmapCacheRef = useRef<
     Map<
@@ -1693,84 +1698,113 @@ export const CanvasStage: React.FC = () => {
           }
           sourceCanvas = layerBuffer;
         } else if (isCurrent && draftStroke) {
-          const canIncremental = canRenderLiveIncremental(draftStroke) && !shiftLineAxisRef.current;
+          const effectiveDraft =
+            layer.alphaLock && draftStroke.tool !== 'eraser' && draftStroke.tool !== 'erase_poly'
+              ? { ...draftStroke, alphaLock: true }
+              : draftStroke;
+          const canIncremental = canRenderLiveIncremental(effectiveDraft) && !shiftLineAxisRef.current;
+
           if (canIncremental) {
-            // O(1) INCREMENTAL LIVE STROKE RENDERING: stamps ONLY the newly added 2-5 points per frame!
-            if (!liveStrokeCanvasRef.current) {
-              liveStrokeCanvasRef.current = document.createElement('canvas');
-            }
-            const lsCanvas = liveStrokeCanvasRef.current;
-            if (lsCanvas.width !== canvasWidth || lsCanvas.height !== canvasHeight) {
-              lsCanvas.width = canvasWidth;
-              lsCanvas.height = canvasHeight;
-              liveStrokeIdRef.current = null;
-              liveStrokeRenderedCountRef.current = 0;
-            }
-            const lsCtx = lsCanvas.getContext('2d');
-            if (lsCtx) {
-              if (
-                liveStrokeIdRef.current !== draftStroke.id ||
-                liveStrokeRenderedCountRef.current > draftStroke.points.length
-              ) {
-                lsCtx.clearRect(0, 0, canvasWidth, canvasHeight);
-                liveStrokeIdRef.current = draftStroke.id;
+            const usesScratch = liveIncrementalUsesScratch(effectiveDraft);
+            const isNewStroke =
+              liveStrokeIdRef.current !== effectiveDraft.id ||
+              liveStrokeRenderedCountRef.current > effectiveDraft.points.length;
+
+            if (usesScratch) {
+              // Non-compounding incremental brushes (Line.sut / Binary with opacity < 1):
+              // stamp incrementally at alpha=1 on liveStrokeCanvas, then composite ONCE at stroke.opacity!
+              if (!liveStrokeCanvasRef.current) {
+                liveStrokeCanvasRef.current = document.createElement('canvas');
+              }
+              const lsCanvas = liveStrokeCanvasRef.current;
+              if (lsCanvas.width !== canvasWidth || lsCanvas.height !== canvasHeight) {
+                lsCanvas.width = canvasWidth;
+                lsCanvas.height = canvasHeight;
+                liveStrokeIdRef.current = null;
                 liveStrokeRenderedCountRef.current = 0;
               }
-              if (draftStroke.points.length > liveStrokeRenderedCountRef.current) {
-                const fromIdx = liveStrokeRenderedCountRef.current;
-                const toIdx = draftStroke.points.length - 1;
-                renderLiveStrokeSegment(lsCtx, draftStroke, fromIdx, toIdx);
-                if (symmetryMode === 'vertical' && draftStroke.points.length > 0) {
-                  const mirroredStroke: Stroke = {
-                    ...draftStroke,
-                    points: draftStroke.points.map((p) => ({ ...p, x: canvasWidth - p.x }))
-                  };
-                  renderLiveStrokeSegment(lsCtx, mirroredStroke, fromIdx, toIdx);
+              const lsCtx = lsCanvas.getContext('2d');
+              if (lsCtx) {
+                if (isNewStroke || liveStrokeIdRef.current !== effectiveDraft.id) {
+                  lsCtx.clearRect(0, 0, canvasWidth, canvasHeight);
+                  liveStrokeIdRef.current = effectiveDraft.id;
+                  liveDabStateRef.current = createLiveDabState();
+                  liveDabMirrorStateRef.current = createLiveDabState();
+                  liveStrokeRenderedCountRef.current = 0;
                 }
-                liveStrokeRenderedCountRef.current = draftStroke.points.length;
+                if (effectiveDraft.points.length > liveStrokeRenderedCountRef.current) {
+                  renderLiveStrokeIncremental(lsCtx, effectiveDraft, liveDabStateRef.current, true);
+                  if (symmetryMode === 'vertical' && effectiveDraft.points.length > 0) {
+                    renderLiveStrokeIncremental(
+                      lsCtx,
+                      {
+                        ...effectiveDraft,
+                        points: effectiveDraft.points.map((p) => ({ ...p, x: canvasWidth - p.x }))
+                      },
+                      liveDabMirrorStateRef.current,
+                      true
+                    );
+                  }
+                  liveStrokeRenderedCountRef.current = effectiveDraft.points.length;
+                }
+              }
+
+              lctx.clearRect(0, 0, canvasWidth, canvasHeight);
+              if (strokes.length > 0) {
+                const baseBmp = getCachedLayerBitmap(`${layer.id}:${currentFrame}:base`, strokes);
+                lctx.drawImage(baseBmp, 0, 0);
+              }
+              lctx.save();
+              lctx.globalAlpha = effectiveDraft.opacity;
+              lctx.globalCompositeOperation = layer.alphaLock ? 'source-atop' : 'source-over';
+              if (effectiveDraft.preset === 'sai_binary') lctx.imageSmoothingEnabled = false;
+              lctx.drawImage(lsCanvas, 0, 0);
+              lctx.restore();
+            } else {
+              // Direct O(1) incremental stamping onto layerBuffer (ZERO per-frame clear/base-copy, 100% pixel-identical!)
+              if (isNewStroke) {
+                lctx.clearRect(0, 0, canvasWidth, canvasHeight);
+                if (strokes.length > 0) {
+                  const baseBmp = getCachedLayerBitmap(`${layer.id}:${currentFrame}:base`, strokes);
+                  lctx.drawImage(baseBmp, 0, 0);
+                }
+                liveStrokeIdRef.current = effectiveDraft.id;
+                liveDabStateRef.current = createLiveDabState();
+                liveDabMirrorStateRef.current = createLiveDabState();
+                liveStrokeRenderedCountRef.current = 0;
+              }
+              if (effectiveDraft.points.length > liveStrokeRenderedCountRef.current) {
+                renderLiveStrokeIncremental(lctx, effectiveDraft, liveDabStateRef.current, false);
+                if (symmetryMode === 'vertical' && effectiveDraft.points.length > 0) {
+                  renderLiveStrokeIncremental(
+                    lctx,
+                    {
+                      ...effectiveDraft,
+                      points: effectiveDraft.points.map((p) => ({ ...p, x: canvasWidth - p.x }))
+                    },
+                    liveDabMirrorStateRef.current,
+                    false
+                  );
+                }
+                liveStrokeRenderedCountRef.current = effectiveDraft.points.length;
               }
             }
-
-            lctx.clearRect(0, 0, canvasWidth, canvasHeight);
-            if (strokes.length > 0) {
-              const baseBmp = getCachedLayerBitmap(`${layer.id}:${currentFrame}:base`, strokes);
-              lctx.drawImage(baseBmp, 0, 0);
-            }
-            lctx.save();
-            lctx.globalAlpha = draftStroke.opacity;
-            if (draftStroke.tool === 'eraser') {
-              lctx.globalCompositeOperation = 'destination-out';
-            } else if (layer.alphaLock) {
-              lctx.globalCompositeOperation = 'source-atop';
-            } else {
-              lctx.globalCompositeOperation = 'source-over';
-            }
-            lctx.drawImage(lsCanvas, 0, 0);
-            lctx.restore();
             sourceCanvas = layerBuffer;
           } else {
-            // Fast live preview for shape tools, Shift-locked lines, blur/smudge, and paper-grain brushes
+            // Exact 100% WYSIWYG rendering via renderStroke for G-Pen, InkPen, Eraser, Sketch.sut, Opacity Pen, Blur/Smudge, Shapes!
+            liveStrokeIdRef.current = null;
+            liveStrokeRenderedCountRef.current = 0;
             lctx.clearRect(0, 0, canvasWidth, canvasHeight);
             if (strokes.length > 0) {
               const baseBmp = getCachedLayerBitmap(`${layer.id}:${currentFrame}:base`, strokes);
               lctx.drawImage(baseBmp, 0, 0);
             }
-            const effectiveDraft =
-              layer.alphaLock && draftStroke.tool !== 'eraser' && draftStroke.tool !== 'erase_poly'
-                ? { ...draftStroke, alphaLock: true }
-                : draftStroke;
-            renderStroke(lctx, effectiveDraft, undefined, 1, true);
+            renderStroke(lctx, effectiveDraft);
             if (symmetryMode === 'vertical' && effectiveDraft.points.length > 0 && effectiveDraft.tool !== 'gradient') {
-              renderStroke(
-                lctx,
-                {
-                  ...effectiveDraft,
-                  points: effectiveDraft.points.map((p) => ({ ...p, x: canvasWidth - p.x }))
-                },
-                undefined,
-                1,
-                true
-              );
+              renderStroke(lctx, {
+                ...effectiveDraft,
+                points: effectiveDraft.points.map((p) => ({ ...p, x: canvasWidth - p.x }))
+              });
             }
             sourceCanvas = layerBuffer;
           }
