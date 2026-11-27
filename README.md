@@ -6,16 +6,16 @@
 
 ## Download Rápido (Windows)
 
-> **[Baixar Instalador — CelSketch Setup 1.2.7.exe (Recomendado)](https://github.com/guilhermeaqw/CelSketch/releases/download/v1.2.7/CelSketch.Setup.1.2.7.exe)**
+> **[Baixar Instalador — CelSketch Setup 1.2.9.exe (Recomendado)](https://github.com/guilhermeaqw/CelSketch/releases/download/v1.2.9/CelSketch.Setup.1.2.9.exe)**
 
 | Versão | Arquivo | Descrição |
 | :--- | :--- | :--- |
-| **Instalador Windows (Recomendado)** | [CelSketch.Setup.1.2.7.exe](https://github.com/guilhermeaqw/CelSketch/releases/download/v1.2.7/CelSketch.Setup.1.2.7.exe) | Instala uma única vez com **CelSketch Launcher** integrado — futuras atualizações (~1,5 MB) são aplicadas automaticamente pelo Launcher em segundos, sem nenhum instalador! |
-| **Windows Portátil (Sem instalação)** | [CelSketch.1.2.7.exe](https://github.com/guilhermeaqw/CelSketch/releases/download/v1.2.7/CelSketch.1.2.7.exe) | Basta clicar duas vezes para abrir (também inclui o Launcher com auto-atualização). |
+| **Instalador Windows (Recomendado)** | [CelSketch.Setup.1.2.9.exe](https://github.com/guilhermeaqw/CelSketch/releases/download/v1.2.9/CelSketch.Setup.1.2.9.exe) | Instala uma única vez com **CelSketch Launcher** integrado — futuras atualizações (~1,5 MB) são aplicadas automaticamente pelo Launcher em segundos, sem nenhum instalador! |
+| **Windows Portátil (Sem instalação)** | [CelSketch.1.2.9.exe](https://github.com/guilhermeaqw/CelSketch/releases/download/v1.2.9/CelSketch.1.2.9.exe) | Basta clicar duas vezes para abrir (também inclui o Launcher com auto-atualização). |
 | **Todas as Versões / Histórico** | [GitHub Releases](https://github.com/guilhermeaqw/CelSketch/releases/latest) | Página oficial de lançamentos. |
 
 ### Como instalar (só precisa baixar 1 vez!)
-1. Clique em **[CelSketch.Setup.1.2.7.exe](https://github.com/guilhermeaqw/CelSketch/releases/download/v1.2.7/CelSketch.Setup.1.2.7.exe)** para baixar.
+1. Clique em **[CelSketch.Setup.1.2.9.exe](https://github.com/guilhermeaqw/CelSketch/releases/download/v1.2.9/CelSketch.Setup.1.2.9.exe)** para baixar.
 2. Execute o instalador e siga os passos na tela *(se o Windows SmartScreen exibir um aviso por ser um app open-source sem certificado pago, clique em **Mais informações → Executar assim mesmo**)*.
 3. Abra o **CelSketch** pelo atalho criado na Área de Trabalho ou Menu Iniciar — o **CelSketch Launcher** abrirá primeiro, verificará automaticamente se existe nova versão no GitHub, mostrará as novidades e atualizará o app automaticamente quando você clicar em **Baixar Atualização**.
 

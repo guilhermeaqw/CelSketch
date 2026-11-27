@@ -545,6 +545,65 @@ function escapePsSingleQuote(s: string): string {
   return s.replace(/'/g, "''");
 }
 
+/**
+ * Spawns a PowerShell script 100% detached from Electron's process tree and 100% invisible (zero console flash).
+ * Uses Windows Script Host (wscript.exe -> WshShell.Run(..., 0, False)) with full absolute System32 paths
+ * because spawning powershell.exe directly with detached+windowsHide from a packaged GUI Electron app
+ * gets terminated on app.quit() on Windows 10/11 before PowerShell finishes initializing.
+ */
+async function launchDetachedHiddenPs1(scriptPath: string): Promise<void> {
+  const sysRoot = process.env.SystemRoot || 'C:\\Windows';
+  const psExe = path.join(sysRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  const wscriptExe = path.join(sysRoot, 'System32', 'wscript.exe');
+  const vbsPath = scriptPath.replace(/\.ps1$/i, '.vbs');
+
+  const psCmd = `"${psExe}" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "${scriptPath}"`;
+  const vbsContent = [
+    'On Error Resume Next',
+    'Set sh = CreateObject("WScript.Shell")',
+    `sh.Run "${psCmd.replace(/"/g, '""')}", 0, False`,
+    'Set fso = CreateObject("Scripting.FileSystemObject")',
+    'fso.DeleteFile WScript.ScriptFullName, True'
+  ].join('\r\n');
+
+  await fsp.writeFile(vbsPath, vbsContent, 'utf-8');
+
+  if (rawFs.existsSync(wscriptExe)) {
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const done = () => {
+        if (!settled) {
+          settled = true;
+          resolve();
+        }
+      };
+      const child = spawn(wscriptExe, ['//B', '//Nologo', vbsPath], {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true
+      });
+      child.on('error', () => done());
+      child.on('spawn', () => {
+        // Give wscript 350ms to fire WshShell.Run before Electron quits!
+        setTimeout(done, 350);
+      });
+      child.unref();
+      setTimeout(done, 600);
+    });
+    return;
+  }
+
+  // Fallback via cmd.exe start if wscript is disabled by policy
+  const cmdExe = path.join(sysRoot, 'System32', 'cmd.exe');
+  const child = spawn(
+    cmdExe,
+    ['/c', 'start', '/b', '""', psExe, '-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', scriptPath],
+    { detached: true, stdio: 'ignore', windowsHide: true }
+  );
+  child.unref();
+  await new Promise((r) => setTimeout(r, 350));
+}
+
 export async function installDownloadedUpdate(
   downloadedFilePath: string,
   installMode: InstallMode
@@ -561,6 +620,7 @@ export async function installDownloadedUpdate(
   const updatesDir = path.join(app.getPath('temp'), 'CelSketch-Updates');
   await fsp.mkdir(updatesDir, { recursive: true });
   const scriptPath = path.join(updatesDir, `apply_update_${Date.now()}.ps1`);
+  const logPath = path.join(updatesDir, 'last_update.log');
   const pid = process.pid;
 
   // 1. Ultra-fast hot app.asar swap (1.4MB, ZERO setup wizard, ~1s relaunch — only asks UAC if in Program Files!)
@@ -571,25 +631,28 @@ export async function installDownloadedUpdate(
 
     const psScript = `
 $ErrorActionPreference = 'SilentlyContinue'
+$log = '${escapePsSingleQuote(logPath)}'
+function Log($m) { Add-Content -LiteralPath $log -Value ("[" + (Get-Date -Format 'HH:mm:ss.fff') + "] " + $m) -ErrorAction SilentlyContinue }
+Set-Content -LiteralPath $log -Value ("--- CelSketch Update Start " + (Get-Date -Format 's') + " ---") -ErrorAction SilentlyContinue
 $parentPid = ${pid}
 $exePath = '${escapePsSingleQuote(currentExe)}'
 $resourcesDir = '${escapePsSingleQuote(resourcesDir)}'
 $srcAsar = '${escapePsSingleQuote(downloadedFilePath)}'
 $dstAsar = '${escapePsSingleQuote(targetAsar)}'
 
-# Wait for main process + all sibling Electron child processes from this exe to exit
+Log "Waiting for PID $parentPid and sibling processes at $exePath"
 for ($i = 0; $i -lt 50; $i++) {
   $aliveMain = Get-Process -Id $parentPid -ErrorAction SilentlyContinue
   $aliveSame = Get-Process -Name 'CelSketch' -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exePath }
   if (-not $aliveMain -and -not $aliveSame) { break }
   if ($i -eq 15) {
+    Log "Force-stopping lingering child processes"
     $aliveSame | Stop-Process -Force -ErrorAction SilentlyContinue
   }
   Start-Sleep -Milliseconds 150
 }
-Start-Sleep -Milliseconds 200
+Start-Sleep -Milliseconds 250
 
-# Check if resources folder is writable without UAC
 $needsAdmin = $false
 try {
   $probe = Join-Path $resourcesDir ('.cs_write_test_' + [guid]::NewGuid().ToString('N'))
@@ -598,34 +661,37 @@ try {
 } catch {
   $needsAdmin = $true
 }
+Log "needsAdmin=$needsAdmin"
 
+$swapped = $false
 if ($needsAdmin) {
   $copyCmd = "Copy-Item -LiteralPath '$srcAsar' -Destination '$dstAsar' -Force"
-  Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-WindowStyle','Hidden','-Command',$copyCmd) -Verb RunAs -Wait
+  Start-Process -FilePath '${escapePsSingleQuote(path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'))}' -ArgumentList @('-NoProfile','-WindowStyle','Hidden','-Command',$copyCmd) -Verb RunAs -Wait
+  $swapped = $true
 } else {
   for ($i = 0; $i -lt 30; $i++) {
     try {
       Copy-Item -LiteralPath $srcAsar -Destination $dstAsar -Force -ErrorAction Stop
+      $swapped = $true
       break
     } catch {
       Start-Sleep -Milliseconds 250
     }
   }
 }
+Log "swapped=$swapped"
 
-Remove-Item -LiteralPath $srcAsar -Force -ErrorAction SilentlyContinue
+if ($swapped) {
+  Remove-Item -LiteralPath $srcAsar -Force -ErrorAction SilentlyContinue
+}
 if (Test-Path -LiteralPath $exePath) {
+  Log "Relaunching $exePath"
   Start-Process -FilePath $exePath
 }
 Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue
 `;
     await fsp.writeFile(scriptPath, psScript, 'utf-8');
-    const child = spawn(
-      'powershell.exe',
-      ['-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', scriptPath],
-      { detached: true, stdio: 'ignore', windowsHide: true }
-    );
-    child.unref();
+    await launchDetachedHiddenPs1(scriptPath);
     return { ok: true };
   }
 
@@ -658,12 +724,7 @@ if ($copied) {
 Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue
 `;
     await fsp.writeFile(scriptPath, psScript, 'utf-8');
-    const child = spawn(
-      'powershell.exe',
-      ['-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', scriptPath],
-      { detached: true, stdio: 'ignore', windowsHide: true }
-    );
-    child.unref();
+    await launchDetachedHiddenPs1(scriptPath);
     return { ok: true };
   }
 
@@ -676,13 +737,9 @@ Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction Silent
       'celsketch',
       'CelSketch.exe'
     );
-    // For dev mode (electron.exe in node_modules), install to default per-user dir silently
     const targetDir = installMode === 'dev' ? path.dirname(defaultInstalledExe) : installDir;
     const targetExe = installMode === 'dev' ? defaultInstalledExe : currentExe;
 
-    // Wait for ALL CelSketch Electron processes (main + GPU/renderer children) to exit cleanly,
-    // then run NSIS 100% silently (/S /D=<dir>) — NEVER showing the setup wizard!
-    // Only triggers a single UAC prompt (-Verb RunAs) if the target folder requires admin rights.
     const psScript = `
 $ErrorActionPreference = 'SilentlyContinue'
 $parentPid = ${pid}
@@ -691,7 +748,6 @@ $targetDir = '${escapePsSingleQuote(targetDir)}'
 $installer = '${escapePsSingleQuote(downloadedFilePath)}'
 $fallbackExe = '${escapePsSingleQuote(defaultInstalledExe)}'
 
-# 1. Wait for main process + all sibling Electron child processes from this exe to exit
 for ($i = 0; $i -lt 50; $i++) {
   $aliveMain = Get-Process -Id $parentPid -ErrorAction SilentlyContinue
   $aliveSame = Get-Process -Name 'CelSketch' -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exePath }
@@ -703,7 +759,6 @@ for ($i = 0; $i -lt 50; $i++) {
 }
 Start-Sleep -Milliseconds 300
 
-# 2. Check if target directory is writable without admin; if not, request UAC once with /S (still 100% silent!)
 $needsAdmin = $false
 try {
   if (Test-Path -LiteralPath $targetDir) {
@@ -715,7 +770,6 @@ try {
   $needsAdmin = $true
 }
 
-# NSIS spec: /D=<dir> must be the LAST argument with NO quotes around the path
 $nsArgs = "/S /D=$targetDir"
 if ($needsAdmin) {
   $proc = Start-Process -FilePath $installer -ArgumentList $nsArgs -Verb RunAs -Wait -PassThru
@@ -735,12 +789,7 @@ if (Test-Path -LiteralPath $exePath) {
 Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue
 `;
     await fsp.writeFile(scriptPath, psScript, 'utf-8');
-    const child = spawn(
-      'powershell.exe',
-      ['-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', scriptPath],
-      { detached: true, stdio: 'ignore', windowsHide: true }
-    );
-    child.unref();
+    await launchDetachedHiddenPs1(scriptPath);
     return { ok: true };
   }
 
