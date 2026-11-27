@@ -152,15 +152,15 @@ function createLauncherWindow() {
   }
 
   launcherWindow = new BrowserWindow({
-    width: 900,
-    height: 580,
+    width: 460,
+    height: 500,
     resizable: false,
     maximizable: false,
     center: true,
     show: false,
-    title: 'CelSketch Launcher',
+    title: 'CelSketch',
     icon: path.join(__dirname, '../dist/icon.png'),
-    backgroundColor: '#16181d',
+    backgroundColor: '#13151a',
     frame: false,
     titleBarStyle: 'hidden',
     webPreferences: {
