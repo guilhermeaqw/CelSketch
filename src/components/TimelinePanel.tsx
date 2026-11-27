@@ -22,11 +22,13 @@ import {
   ChevronRight,
   ZoomIn,
   ZoomOut,
-  Flag
+  Flag,
+  Video
 } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { useHarmonyStore } from '../store/useHarmonyStore';
 import { getEffectiveFrameStrokes, renderStroke } from '../utils/canvasRenderer';
+import { CAMERA_EFFECT_PRESETS } from '../utils/cameraUtils';
 import { DrawingLayer, PoseTag } from '../types/harmony';
 
 const CelHoverPreview: React.FC<{
@@ -38,6 +40,13 @@ const CelHoverPreview: React.FC<{
   y: number;
 }> = ({ layer, frame, canvasWidth, canvasHeight, x, y }) => {
   const thumbRef = useRef<HTMLCanvasElement>(null);
+  const [imgTick, setImgTick] = useState(0);
+
+  useEffect(() => {
+    const onImgLoaded = () => setImgTick((t) => t + 1);
+    window.addEventListener('celsketch:image-loaded', onImgLoaded);
+    return () => window.removeEventListener('celsketch:image-loaded', onImgLoaded);
+  }, []);
 
   useEffect(() => {
     const cvs = thumbRef.current;
@@ -61,7 +70,7 @@ const CelHoverPreview: React.FC<{
       renderStroke(ctx, st);
     }
     ctx.restore();
-  }, [layer, frame, canvasWidth, canvasHeight]);
+  }, [layer, frame, canvasWidth, canvasHeight, imgTick]);
 
   const left = Math.min(window.innerWidth - 182, Math.max(8, x - 84));
   const top = Math.max(8, y - 124);
@@ -128,26 +137,91 @@ const TAG_COLORS: Record<PoseTag, string> = {
   inbetween: '#10b981'
 };
 
+/** Safe numeric input that lets users backspace/type freely and commits on Enter or Blur without NaN/clamp glitches */
+const SafeNumInput: React.FC<{
+  value: number;
+  min: number;
+  max: number;
+  width: number;
+  onCommit: (val: number) => void;
+}> = ({ value, min, max, width, onCommit }) => {
+  const [draft, setDraft] = useState(String(value));
+  const [focused, setFocused] = useState(false);
+
+  useEffect(() => {
+    if (!focused) setDraft(String(value));
+  }, [value, focused]);
+
+  const commit = () => {
+    const parsed = parseInt(draft, 10);
+    if (Number.isFinite(parsed)) {
+      const clamped = Math.max(min, Math.min(max, parsed));
+      onCommit(clamped);
+      setDraft(String(clamped));
+    } else {
+      setDraft(String(value));
+    }
+  };
+
+  return (
+    <input
+      type="text"
+      inputMode="numeric"
+      value={draft}
+      onFocus={(e) => {
+        setFocused(true);
+        e.currentTarget.select();
+      }}
+      onChange={(e) => setDraft(e.target.value.replace(/[^0-9]/g, ''))}
+      onBlur={() => {
+        setFocused(false);
+        commit();
+      }}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') {
+          commit();
+          e.currentTarget.blur();
+        } else if (e.key === 'Escape') {
+          setDraft(String(value));
+          e.currentTarget.blur();
+        }
+      }}
+      className="harmony-input timeline-num-input"
+      style={{ width, height: 20 }}
+    />
+  );
+};
+
 export const TimelinePanel: React.FC = () => {
   const [dragLayerIdx, setDragLayerIdx] = useState<number | null>(null);
   const [editingLayerId, setEditingLayerId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState('');
   const [frameMenu, setFrameMenu] = useState<{ x: number; y: number; layerId: string; frame: number } | null>(null);
+  const frameMenuRef = useRef<HTMLDivElement>(null);
   const [selRange, setSelRange] = useState<{ layerId: string; start: number; end: number } | null>(null);
   const [hoveredCell, setHoveredCell] = useState<{ layerId: string; frame: number } | null>(null);
   const [timelineFocus, setTimelineFocus] = useState<'layers' | 'frames' | null>(null);
   const timelineRootRef = useRef<HTMLDivElement>(null);
 
-  // Interactive ruler scrubbing, onion handle dragging, and cel exposure resizing/moving
+  // Interactive ruler scrubbing, onion handle dragging, play range handles, and cel exposure resizing/moving
   const [isScrubbing, setIsScrubbing] = useState(false);
   const [draggingOnion, setDraggingOnion] = useState<'prev' | 'next' | null>(null);
+  const [draggingPlayRange, setDraggingPlayRange] = useState<'start' | 'end' | null>(null);
   const [resizingCel, setResizingCel] = useState<{ layerId: string; startFrame: number } | null>(null);
-  const [movingCel, setMovingCel] = useState<{ layerId: string; fromFrame: number } | null>(null);
+  const [movingCel, setMovingCel] = useState<{
+    layerId: string;
+    fromFrame: number;
+    startX: number;
+    dragged: boolean;
+    isCamKey?: boolean;
+  } | null>(null);
   const [hoverPreview, setHoverPreview] = useState<{ x: number; y: number; layerId: string; frame: number } | null>(null);
 
   const rulerRef = useRef<HTMLDivElement>(null);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const scrubTimeoutRef = useRef<number | null>(null);
+  const prevPlayFrameRef = useRef<number>(1);
 
   const {
     canvasWidth,
@@ -206,6 +280,10 @@ export const TimelinePanel: React.FC = () => {
     setOnionRange,
     addLayer,
     addFolderLayer,
+    addCameraLayer,
+    setCameraKeyframe,
+    deleteCameraKeyframe,
+    moveCameraKeyframe,
     duplicateLayer,
     mergeLayerDown,
     deleteSelectedLayers,
@@ -222,6 +300,7 @@ export const TimelinePanel: React.FC = () => {
     toggleFolderCollapse,
     setLayerParent,
     setSelectedLayersOpacity,
+    pushUndoSnapshot,
     setCelDuration,
     moveCelFrame,
     substituteCel,
@@ -259,17 +338,88 @@ export const TimelinePanel: React.FC = () => {
     [audioTrack, isPlaying, fps]
   );
 
-  // Sync Audio Track with Timeline Play / Pause
+  // Cleanup audio scrub timer on unmount
+  useEffect(() => {
+    return () => {
+      if (scrubTimeoutRef.current) window.clearTimeout(scrubTimeoutRef.current);
+    };
+  }, []);
+
+  // Sync Audio Track with Timeline Play / Pause AND resync on Loop wrap!
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio || !audioTrack) return;
     if (isPlaying) {
-      audio.currentTime = Math.max(0, (currentFrame - 1) / fps);
-      audio.play().catch(() => {});
+      // Cancel any pending 75ms scrub pause timer so playback audio is never muted!
+      if (scrubTimeoutRef.current) {
+        window.clearTimeout(scrubTimeoutRef.current);
+        scrubTimeoutRef.current = null;
+      }
+      const targetSec = Math.max(0, (currentFrame - 1) / fps);
+      if (targetSec < audioTrack.duration) {
+        audio.currentTime = targetSec;
+        audio.play().catch(() => {});
+      } else {
+        audio.pause();
+      }
+      prevPlayFrameRef.current = currentFrame;
     } else {
       audio.pause();
     }
   }, [isPlaying, audioTrack, fps]);
+
+  // Resync audio whenever playback loops back (e.g. playEnd -> playStart) or seeks during playback
+  useEffect(() => {
+    if (!isPlaying) return;
+    const audio = audioRef.current;
+    if (audio && audioTrack) {
+      const jumped = currentFrame < prevPlayFrameRef.current || Math.abs(currentFrame - prevPlayFrameRef.current) > 2;
+      if (jumped) {
+        const targetSec = Math.max(0, (currentFrame - 1) / fps);
+        if (targetSec < audioTrack.duration) {
+          audio.currentTime = targetSec;
+          if (audio.paused) audio.play().catch(() => {});
+        } else {
+          audio.pause();
+        }
+      }
+    }
+    prevPlayFrameRef.current = currentFrame;
+  }, [currentFrame, isPlaying, audioTrack, fps]);
+
+  // Native non-passive wheel listener for Ctrl+Wheel horizontal Timeline zoom (prevents Chromium page zoom)
+  useEffect(() => {
+    const scroller = scrollContainerRef.current;
+    if (!scroller) return;
+    const onWheel = (e: WheelEvent) => {
+      if (e.ctrlKey || e.metaKey) {
+        e.preventDefault();
+        const cur = useHarmonyStore.getState().timelineCellWidth;
+        setTimelineCellWidth(cur + (e.deltaY < 0 ? 3 : -3));
+      }
+    };
+    scroller.addEventListener('wheel', onWheel, { passive: false });
+    return () => scroller.removeEventListener('wheel', onWheel);
+  }, [setTimelineCellWidth]);
+
+  // Close right-click frame menu on click-outside or Escape
+  useEffect(() => {
+    if (!frameMenu) return;
+    const onDown = (e: PointerEvent) => {
+      if (frameMenuRef.current && !frameMenuRef.current.contains(e.target as Node)) {
+        setFrameMenu(null);
+      }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setFrameMenu(null);
+    };
+    window.addEventListener('pointerdown', onDown, { capture: true });
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('pointerdown', onDown, { capture: true });
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [frameMenu]);
 
   // Playback timer
   useEffect(() => {
@@ -313,27 +463,47 @@ export const TimelinePanel: React.FC = () => {
         const f = frameFromClientX(e.clientX);
         const nextNext = Math.max(0, Math.min(8, f - currentFrame));
         setOnionRange(onionPrev, nextNext);
+      } else if (draggingPlayRange === 'start') {
+        const f = frameFromClientX(e.clientX);
+        setPlayRange(Math.min(f, playEnd), playEnd);
+      } else if (draggingPlayRange === 'end') {
+        const f = frameFromClientX(e.clientX);
+        setPlayRange(playStart, Math.max(f, playStart));
       } else if (resizingCel) {
         const f = frameFromClientX(e.clientX);
         const newDur = Math.max(1, f - resizingCel.startFrame + 1);
         setCelDuration(resizingCel.layerId, resizingCel.startFrame, newDur);
+      } else if (movingCel && !movingCel.dragged) {
+        if (Math.abs(e.clientX - movingCel.startX) >= 5) {
+          setMovingCel((prev) => (prev ? { ...prev, dragged: true } : null));
+        }
       }
     };
 
     const onPointerUp = (e: PointerEvent) => {
       if (movingCel) {
-        const targetF = frameFromClientX(e.clientX);
-        if (targetF !== movingCel.fromFrame) {
-          moveCelFrame(movingCel.layerId, movingCel.fromFrame, targetF);
+        // Only move Cel if user genuinely dragged >= 5px (single-clicking the tail of a stretched Cel NEVER teleports it!)
+        if (movingCel.dragged) {
+          const deltaFrames = Math.round((e.clientX - movingCel.startX) / timelineCellWidth);
+          const targetF = Math.max(1, Math.min(totalFrames, movingCel.fromFrame + deltaFrames));
+          if (targetF !== movingCel.fromFrame) {
+            if (movingCel.isCamKey) {
+              moveCameraKeyframe(movingCel.layerId, movingCel.fromFrame, targetF);
+              setCurrentFrame(targetF);
+            } else {
+              moveCelFrame(movingCel.layerId, movingCel.fromFrame, targetF);
+            }
+          }
         }
         setMovingCel(null);
       }
       setIsScrubbing(false);
       setDraggingOnion(null);
+      setDraggingPlayRange(null);
       setResizingCel(null);
     };
 
-    if (isScrubbing || draggingOnion || resizingCel || movingCel) {
+    if (isScrubbing || draggingOnion || draggingPlayRange || resizingCel || movingCel) {
       window.addEventListener('pointermove', onPointerMove);
       window.addEventListener('pointerup', onPointerUp);
       window.addEventListener('pointercancel', onPointerUp);
@@ -346,18 +516,38 @@ export const TimelinePanel: React.FC = () => {
   }, [
     isScrubbing,
     draggingOnion,
+    draggingPlayRange,
     resizingCel,
     movingCel,
     currentFrame,
+    playStart,
+    playEnd,
     onionPrev,
     onionNext,
     frameFromClientX,
     setCurrentFrame,
     triggerAudioScrub,
     setOnionRange,
+    setPlayRange,
     setCelDuration,
     moveCelFrame
   ]);
+
+  // Auto-Scroll Timeline horizontally to keep the red Playhead visible during Play / stepping
+  useEffect(() => {
+    const scroller = scrollContainerRef.current;
+    if (!scroller || isScrubbing) return;
+    const stickyLayerColWidth = 262;
+    const playheadX = (currentFrame - 1) * timelineCellWidth;
+    const visibleTrackWidth = Math.max(60, scroller.clientWidth - stickyLayerColWidth);
+    const margin = Math.min(48, visibleTrackWidth * 0.2);
+
+    if (playheadX < scroller.scrollLeft + margin) {
+      scroller.scrollLeft = Math.max(0, playheadX - margin);
+    } else if (playheadX + timelineCellWidth > scroller.scrollLeft + visibleTrackWidth - margin) {
+      scroller.scrollLeft = playheadX + timelineCellWidth - visibleTrackWidth + margin;
+    }
+  }, [currentFrame, timelineCellWidth, isScrubbing]);
 
   // Clear timeline focus when user clicks outside the Timeline panel
   useEffect(() => {
@@ -382,8 +572,20 @@ export const TimelinePanel: React.FC = () => {
         return;
       }
       if (e.key !== 'Delete') return;
+      // Never hijack Delete when the user has an active pixel selection on the Canvas!
+      const storeState = useHarmonyStore.getState();
+      if (storeState.activeSelectionPoly && storeState.activeSelectionPoly.length >= 3 && timelineFocus === null) {
+        return;
+      }
 
-      if (hoveredCell) {
+      if (selRange && timelineFocus === 'frames' && selRange.start !== selRange.end) {
+        e.preventDefault();
+        deleteFrameRange(selRange.layerId, selRange.start, selRange.end);
+        setSelRange(null);
+        setHoverPreview(null);
+      } else if (hoveredCell) {
+        const hovLayer = storeState.layers.find((l) => l.id === hoveredCell.layerId);
+        if (!hovLayer || hovLayer.type === 'folder' || hovLayer.locked) return;
         e.preventDefault();
         deleteFrameRange(hoveredCell.layerId, hoveredCell.frame, hoveredCell.frame);
         setHoverPreview(null);
@@ -449,6 +651,14 @@ export const TimelinePanel: React.FC = () => {
             </button>
             <button className="icon-btn" onClick={() => addFolderLayer()} title="Nova Pasta de Layers">
               <FolderPlus size={13} />
+            </button>
+            <button
+              className="icon-btn"
+              onClick={() => addCameraLayer()}
+              title="Adicionar / Selecionar Câmera 2D Animável (Pan, Zoom, Rotação e Tremor)"
+              style={{ color: '#38bdf8' }}
+            >
+              <Video size={13} />
             </button>
             <button className="icon-btn" onClick={() => duplicateLayer(activeLayerId)} title="Duplicar Layer">
               <Copy size={12} />
@@ -638,51 +848,43 @@ export const TimelinePanel: React.FC = () => {
           >
             <label style={{ display: 'flex', alignItems: 'center', gap: 3 }} title="Frame de Início do Playback">
               <span style={{ fontSize: 10.5, color: '#9ca3af' }}>Início</span>
-              <input
-                type="number"
+              <SafeNumInput
+                value={playStart}
                 min={1}
                 max={totalFrames}
-                value={playStart}
-                onChange={(e) => setPlayRange(Number(e.target.value), playEnd)}
-                className="harmony-input timeline-num-input"
-                style={{ width: 42, height: 20 }}
+                width={42}
+                onCommit={(v) => setPlayRange(v, Math.max(v, playEnd))}
               />
             </label>
             <label style={{ display: 'flex', alignItems: 'center', gap: 3 }} title="Frame de Fim do Playback">
               <span style={{ fontSize: 10.5, color: '#9ca3af' }}>Fim</span>
-              <input
-                type="number"
+              <SafeNumInput
+                value={playEnd}
                 min={playStart}
                 max={totalFrames}
-                value={playEnd}
-                onChange={(e) => setPlayRange(playStart, Number(e.target.value))}
-                className="harmony-input timeline-num-input"
-                style={{ width: 42, height: 20 }}
+                width={42}
+                onCommit={(v) => setPlayRange(playStart, v)}
               />
             </label>
             <div style={{ width: 1, height: 14, background: '#3a3a3a' }} />
             <label style={{ display: 'flex', alignItems: 'center', gap: 3 }} title="Total de Frames da Cena">
               <span style={{ fontSize: 10.5, color: '#9ca3af' }}>Frames</span>
-              <input
-                type="number"
+              <SafeNumInput
+                value={totalFrames}
                 min={1}
                 max={1000}
-                value={totalFrames}
-                onChange={(e) => setTotalFrames(Number(e.target.value))}
-                className="harmony-input timeline-num-input"
-                style={{ width: 46, height: 20 }}
+                width={46}
+                onCommit={(v) => setTotalFrames(v)}
               />
             </label>
             <label style={{ display: 'flex', alignItems: 'center', gap: 3 }} title="Quadros por Segundo (FPS)">
               <span style={{ fontSize: 10.5, color: '#9ca3af' }}>FPS</span>
-              <input
-                type="number"
-                min={1}
-                max={60}
+              <SafeNumInput
                 value={fps}
-                onChange={(e) => setFps(Number(e.target.value))}
-                className="harmony-input timeline-num-input"
-                style={{ width: 38, height: 20 }}
+                min={1}
+                max={120}
+                width={38}
+                onCommit={(v) => setFps(v)}
               />
             </label>
           </div>
@@ -718,6 +920,7 @@ export const TimelinePanel: React.FC = () => {
 
       {/* Unified Timeline Body: Single Synchronized Scroll Container (Sticky Left Layer Column + Sticky Top Ruler) */}
       <div
+        ref={scrollContainerRef}
         style={{
           flex: 1,
           minHeight: 0,
@@ -785,6 +988,54 @@ export const TimelinePanel: React.FC = () => {
                 userSelect: 'none'
               }}
             >
+              {/* Draggable Play Range In / Out Handles on Top of the Ruler */}
+              <div
+                onPointerDown={(e) => {
+                  e.stopPropagation();
+                  e.preventDefault();
+                  setHoverPreview(null);
+                  setDraggingPlayRange('start');
+                }}
+                title={`Início do Playback: Frame ${playStart} (arraste na régua!)`}
+                style={{
+                  position: 'absolute',
+                  left: Math.max(0, (playStart - 1) * timelineCellWidth),
+                  top: 0,
+                  width: 10,
+                  height: 11,
+                  background: '#3a86ff',
+                  borderRadius: '0 0 3px 0',
+                  cursor: 'ew-resize',
+                  zIndex: 16,
+                  touchAction: 'none',
+                  userSelect: 'none',
+                  boxShadow: '0 1px 3px rgba(0,0,0,0.5)'
+                }}
+              />
+              <div
+                onPointerDown={(e) => {
+                  e.stopPropagation();
+                  e.preventDefault();
+                  setHoverPreview(null);
+                  setDraggingPlayRange('end');
+                }}
+                title={`Fim do Playback: Frame ${playEnd} (arraste na régua!)`}
+                style={{
+                  position: 'absolute',
+                  left: Math.max(0, playEnd * timelineCellWidth - 10),
+                  top: 0,
+                  width: 10,
+                  height: 11,
+                  background: '#3a86ff',
+                  borderRadius: '0 0 0 3px',
+                  cursor: 'ew-resize',
+                  zIndex: 16,
+                  touchAction: 'none',
+                  userSelect: 'none',
+                  boxShadow: '0 1px 3px rgba(0,0,0,0.5)'
+                }}
+              />
+
               {/* Draggable Onion Skin Brackets on the Ruler (Pen-friendly PointerEvents + Grab Handles) */}
               {onionSkin && currentFrame > 1 && (
                 <div
@@ -906,13 +1157,21 @@ export const TimelinePanel: React.FC = () => {
             const isSelected = selectedLayerIds.includes(layer.id);
             const isChild = Boolean(layer.parentId);
 
-            // Compute Cel Exposure blocks for this layer
-            const celBlocks: { start: number; dur: number; hasStrokes: boolean }[] = [];
-            for (const [fKey, strokes] of Object.entries(layer.frames)) {
-              const start = Number(fKey);
-              const dur = layer.celDurations?.[start] || 1;
-              celBlocks.push({ start, dur, hasStrokes: strokes.length > 0 });
-            }
+            // Compute Cel Exposure blocks for this layer (sorted & clamped to both nextStart AND totalFrames!)
+            const sortedEntries = Object.entries(layer.frames)
+              .map(([fKey, strokes]) => ({ start: Number(fKey), hasStrokes: strokes.length > 0 }))
+              .filter((entry) => entry.start >= 1 && entry.start <= totalFrames)
+              .sort((a, b) => a.start - b.start);
+            const celBlocks: { start: number; dur: number; hasStrokes: boolean }[] = sortedEntries.map(
+              (entry, idx) => {
+                const rawDur = layer.celDurations?.[entry.start] || 1;
+                const nextStart = sortedEntries[idx + 1]?.start;
+                const maxByTotal = Math.max(1, totalFrames - entry.start + 1);
+                const maxByNext = nextStart ? Math.max(1, nextStart - entry.start) : maxByTotal;
+                const clampedDur = Math.max(1, Math.min(rawDur, maxByNext, maxByTotal));
+                return { start: entry.start, dur: clampedDur, hasStrokes: entry.hasStrokes };
+              }
+            );
 
             return (
               <div
@@ -922,7 +1181,12 @@ export const TimelinePanel: React.FC = () => {
                   height: 26,
                   width: 262 + gridWidth,
                   borderBottom: '1px solid #1a1a1a',
-                  background: layer.type === 'folder' ? '#252525' : 'transparent'
+                  background:
+                    layer.type === 'camera'
+                      ? 'rgba(14, 116, 144, 0.14)'
+                      : layer.type === 'folder'
+                      ? '#252525'
+                      : 'transparent'
                 }}
               >
                 {/* Sticky Left Layer Info Cell */}
@@ -934,11 +1198,18 @@ export const TimelinePanel: React.FC = () => {
                     if (dragLayerIdx !== null && dragLayerIdx !== origIndex) {
                       const dragged = layers[dragLayerIdx];
                       if (layer.type === 'folder' && dragged.type !== 'folder') {
-                        setLayerParent(dragged.id, layer.id);
-                        reorderLayer(dragLayerIdx, origIndex + 1);
+                        if ((dragged.parentId ?? null) !== layer.id) {
+                          setLayerParent(dragged.id, layer.id);
+                        }
+                        const targetPos =
+                          dragLayerIdx < origIndex
+                            ? Math.min(layers.length - 1, origIndex)
+                            : Math.min(layers.length - 1, origIndex + 1);
+                        reorderLayer(dragLayerIdx, targetPos);
                       } else {
-                        if (dragged.parentId && !layer.parentId) {
-                          setLayerParent(dragged.id, null);
+                        const targetParent = layer.parentId ?? null;
+                        if (dragged.type !== 'folder' && (dragged.parentId ?? null) !== targetParent) {
+                          setLayerParent(dragged.id, targetParent);
                         }
                         reorderLayer(dragLayerIdx, origIndex);
                       }
@@ -990,7 +1261,23 @@ export const TimelinePanel: React.FC = () => {
                     {layer.visible ? <Eye size={12} /> : <EyeOff size={12} />}
                   </button>
 
-                  {layer.type !== 'folder' && (
+                  {layer.type === 'camera' && (
+                    <>
+                      <Video size={12} color="#38bdf8" style={{ flexShrink: 0 }} />
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          toggleLayerLock(layer.id);
+                        }}
+                        style={{ background: 'none', border: 'none', color: layer.locked ? '#f59e0b' : '#666', cursor: 'pointer' }}
+                        title="Bloquear Câmera"
+                      >
+                        {layer.locked ? <Lock size={11} /> : <Unlock size={11} />}
+                      </button>
+                    </>
+                  )}
+
+                  {layer.type !== 'folder' && layer.type !== 'camera' && (
                     <>
                       <button
                         onClick={(e) => {
@@ -1159,21 +1446,36 @@ export const TimelinePanel: React.FC = () => {
                           setTimelineFocus('frames');
                           setActiveLayer(layer.id);
                           if (e.shiftKey) {
-                            setSelRange((prev) =>
-                              prev && prev.layerId === layer.id
-                                ? { layerId: layer.id, start: prev.start, end: f }
-                                : { layerId: layer.id, start: currentFrame, end: f }
-                            );
+                            setSelRange((prev) => {
+                              const anchor = prev && prev.layerId === layer.id ? prev.start : currentFrame;
+                              return {
+                                layerId: layer.id,
+                                start: Math.min(anchor, f),
+                                end: Math.max(anchor, f)
+                              };
+                            });
                           } else {
                             setSelRange({ layerId: layer.id, start: f, end: f });
                           }
                           setCurrentFrame(f);
                         }}
+                        onDoubleClick={(e) => {
+                          if (layer.type === 'camera' && !layer.locked) {
+                            e.stopPropagation();
+                            if (layer.cameraKeyframes?.[f]) {
+                              deleteCameraKeyframe(layer.id, f);
+                            } else {
+                              setCameraKeyframe(layer.id, f, {});
+                            }
+                          }
+                        }}
                         onContextMenu={(e) => {
                           e.preventDefault();
                           setActiveLayer(layer.id);
                           setCurrentFrame(f);
-                          setFrameMenu({ x: e.clientX, y: e.clientY, layerId: layer.id, frame: f });
+                          if (layer.type !== 'camera') {
+                            setFrameMenu({ x: e.clientX, y: e.clientY, layerId: layer.id, frame: f });
+                          }
                         }}
                         style={{
                           width: timelineCellWidth,
@@ -1196,6 +1498,35 @@ export const TimelinePanel: React.FC = () => {
                         {hasHeldDrawing && (
                           <div style={{ width: '100%', height: 2, background: 'rgba(16, 185, 129, 0.5)' }} />
                         )}
+                        {layer.type === 'camera' && layer.cameraKeyframes?.[f] && (
+                          <div
+                            onPointerDown={(e) => {
+                              if (e.button !== 0 || layer.locked) return;
+                              e.stopPropagation();
+                              setActiveLayer(layer.id);
+                              setCurrentFrame(f);
+                              setMovingCel({
+                                layerId: layer.id,
+                                fromFrame: f,
+                                startX: e.clientX,
+                                dragged: false,
+                                isCamKey: true
+                              });
+                            }}
+                            title={`Keyframe Câmera (Q${f}) • Zoom ${layer.cameraKeyframes[f].zoom.toFixed(2)}x • X:${Math.round(layer.cameraKeyframes[f].x)} Y:${Math.round(layer.cameraKeyframes[f].y)} • Rot ${Math.round(layer.cameraKeyframes[f].rotation)}° • ${layer.cameraKeyframes[f].easing || 'ease-in-out'} (Arraste para mover • Duplo clique para remover)`}
+                            style={{
+                              width: 9,
+                              height: 9,
+                              background: isCurr ? '#f59e0b' : '#38bdf8',
+                              border: '1px solid #0c4a6e',
+                              transform: 'rotate(45deg)',
+                              position: 'absolute',
+                              zIndex: 8,
+                              cursor: 'grab',
+                              boxShadow: '0 0 4px rgba(56, 189, 248, 0.7)'
+                            }}
+                          />
+                        )}
                         {layer.keyframes?.[f] && (
                           <div
                             title="Motion Keyframe"
@@ -1213,8 +1544,70 @@ export const TimelinePanel: React.FC = () => {
                     );
                   })}
 
+                  {/* Continuous Cyan Span Bar between Camera Keyframes */}
+                  {layer.type === 'camera' &&
+                    layer.cameraKeyframes &&
+                    (() => {
+                      const keys = Object.keys(layer.cameraKeyframes)
+                        .map(Number)
+                        .filter((n) => Number.isFinite(n))
+                        .sort((a, b) => a - b);
+                      if (keys.length < 2) return null;
+                      const firstK = keys[0];
+                      const lastK = keys[keys.length - 1];
+                      return (
+                        <div
+                          style={{
+                            position: 'absolute',
+                            left: (firstK - 1) * timelineCellWidth + timelineCellWidth / 2,
+                            width: Math.max(2, (lastK - firstK) * timelineCellWidth),
+                            top: 11,
+                            height: 4,
+                            background: 'rgba(56, 189, 248, 0.45)',
+                            borderRadius: 2,
+                            pointerEvents: 'none',
+                            zIndex: 4
+                          }}
+                        />
+                      );
+                    })()}
+
+                  {/* Colored Effect Range Bars on Camera Track */}
+                  {layer.type === 'camera' &&
+                    layer.cameraEffects &&
+                    layer.cameraEffects
+                      .filter((fx) => fx.enabled)
+                      .map((fx, idx) => {
+                        const meta = CAMERA_EFFECT_PRESETS.find((p) => p.type === fx.type);
+                        const color = meta?.color || '#f59e0b';
+                        const startF = fx.wholeScene ? 1 : Math.max(1, fx.startFrame);
+                        const endF = fx.wholeScene
+                          ? totalFrames
+                          : Math.min(totalFrames, fx.startFrame + Math.max(1, fx.duration));
+                        const leftPx = (startF - 1) * timelineCellWidth;
+                        const widthPx = Math.max(timelineCellWidth, (endF - startF + 1) * timelineCellWidth);
+                        return (
+                          <div
+                            key={fx.id}
+                            title={`Efeito: ${fx.name} (${fx.wholeScene ? 'Cena toda' : `Q${startF}→Q${endF}`} • ${Math.round(fx.intensity)}%)`}
+                            style={{
+                              position: 'absolute',
+                              left: leftPx,
+                              width: widthPx,
+                              bottom: 2 + (idx % 2) * 4,
+                              height: 3,
+                              background: color,
+                              borderRadius: 2,
+                              opacity: 0.85,
+                              pointerEvents: 'none',
+                              zIndex: 5
+                            }}
+                          />
+                        );
+                      })}
+
                   {/* Draggable & Resizable Cel Exposure Blocks */}
-                  {layer.type !== 'folder' &&
+                  {layer.type !== 'folder' && layer.type !== 'camera' &&
                     celBlocks.map((cel) => {
                       const tag = layer.frameTags?.[cel.start];
                       const blockColor = tag
@@ -1231,13 +1624,23 @@ export const TimelinePanel: React.FC = () => {
                             e.preventDefault();
                             setHoverPreview(null);
                             setTimelineFocus('frames');
-                            setSelRange({ layerId: layer.id, start: cel.start, end: cel.start });
+                            const clickedF = frameFromClientX(e.clientX);
                             setActiveLayer(layer.id);
-                            setCurrentFrame(cel.start);
-                            setMovingCel({ layerId: layer.id, fromFrame: cel.start });
+                            setCurrentFrame(clickedF);
+                            if (e.shiftKey && selRange && selRange.layerId === layer.id) {
+                              setSelRange({
+                                layerId: layer.id,
+                                start: Math.min(selRange.start, clickedF),
+                                end: Math.max(selRange.end, clickedF)
+                              });
+                            } else {
+                              setSelRange({ layerId: layer.id, start: clickedF, end: clickedF });
+                              setMovingCel({ layerId: layer.id, fromFrame: cel.start, startX: e.clientX, dragged: false });
+                            }
                           }}
                           onPointerEnter={(e) => {
-                            setHoveredCell({ layerId: layer.id, frame: cel.start });
+                            const hovF = frameFromClientX(e.clientX);
+                            setHoveredCell({ layerId: layer.id, frame: hovF });
                             if (!cel.hasStrokes || isScrubbing || draggingOnion || resizingCel || movingCel) return;
                             const rect = e.currentTarget.getBoundingClientRect();
                             setHoverPreview({
@@ -1248,9 +1651,7 @@ export const TimelinePanel: React.FC = () => {
                             });
                           }}
                           onPointerLeave={() => {
-                            setHoveredCell((prev) =>
-                              prev && prev.layerId === layer.id && prev.frame === cel.start ? null : prev
-                            );
+                            setHoveredCell((prev) => (prev && prev.layerId === layer.id ? null : prev));
                             setHoverPreview((prev) =>
                               prev && prev.layerId === layer.id && prev.frame === cel.start ? null : prev
                             );
@@ -1259,11 +1660,12 @@ export const TimelinePanel: React.FC = () => {
                             e.preventDefault();
                             e.stopPropagation();
                             setHoverPreview(null);
+                            const clickedF = frameFromClientX(e.clientX);
                             setActiveLayer(layer.id);
-                            setCurrentFrame(cel.start);
-                            setFrameMenu({ x: e.clientX, y: e.clientY, layerId: layer.id, frame: cel.start });
+                            setCurrentFrame(clickedF);
+                            setFrameMenu({ x: e.clientX, y: e.clientY, layerId: layer.id, frame: clickedF });
                           }}
-                          title={`Cel F${cel.start} (${cel.dur}f) — Arraste para mover ou puxe a borda direita para estender exposição`}
+                          title={`Cel F${cel.start} (${cel.dur}f) — Clique em qualquer frame • Arraste para mover • Puxe a borda direita para estender`}
                           style={{
                             position: 'absolute',
                             left: (cel.start - 1) * timelineCellWidth + 1,
@@ -1276,7 +1678,7 @@ export const TimelinePanel: React.FC = () => {
                             display: 'flex',
                             alignItems: 'center',
                             paddingLeft: 5,
-                            cursor: 'grab',
+                            cursor: movingCel?.dragged ? 'grabbing' : 'pointer',
                             zIndex: 3,
                             pointerEvents: 'auto',
                             touchAction: 'none',
@@ -1302,9 +1704,11 @@ export const TimelinePanel: React.FC = () => {
                           {/* Right-edge Exposure Resize Handle */}
                           <div
                             onPointerDown={(e) => {
+                              if (e.button !== 0 || layer.locked) return;
                               e.stopPropagation();
                               e.preventDefault();
                               setHoverPreview(null);
+                              pushUndoSnapshot();
                               setResizingCel({ layerId: layer.id, startFrame: cel.start });
                             }}
                             title="Arraste para estender ou encurtar exposição (1s, 2s, 3s...)"
@@ -1313,7 +1717,7 @@ export const TimelinePanel: React.FC = () => {
                               right: 0,
                               top: 0,
                               bottom: 0,
-                              width: 8,
+                              width: Math.min(7, Math.max(4, Math.floor(timelineCellWidth * 0.35))),
                               cursor: 'ew-resize',
                               background: 'rgba(255,255,255,0.22)',
                               borderRadius: '0 2px 2px 0',
@@ -1328,56 +1732,93 @@ export const TimelinePanel: React.FC = () => {
               </div>
             );
           })}
+          {/* Aligned Audio Track & Waveform Row (locked 1:1 with frame grid & scroll!) */}
+          {audioTrack && (
+            <div
+              style={{
+                display: 'flex',
+                height: 34,
+                width: 262 + gridWidth,
+                background: '#1c242b',
+                borderTop: '1px solid #2e4052',
+                borderBottom: '1px solid #181818'
+              }}
+            >
+              <audio ref={audioRef} src={audioTrack.objectUrl} />
+              <div
+                style={{
+                  width: 262,
+                  height: 34,
+                  flexShrink: 0,
+                  position: 'sticky',
+                  left: 0,
+                  zIndex: 15,
+                  background: '#1c242b',
+                  borderRight: '1px solid #181818',
+                  display: 'flex',
+                  alignItems: 'center',
+                  padding: '0 8px',
+                  gap: 6,
+                  fontSize: 11,
+                  color: '#93c5fd'
+                }}
+              >
+                <Volume2 size={13} />
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
+                  {audioTrack.name}
+                </span>
+                <button
+                  className="icon-btn"
+                  onClick={() => setAudioTrack(null)}
+                  title="Remover Áudio"
+                  style={{ height: 18, minWidth: 18 }}
+                >
+                  ×
+                </button>
+              </div>
+              <div
+                style={{
+                  position: 'relative',
+                  width: gridWidth,
+                  height: 34,
+                  display: 'flex',
+                  alignItems: 'center',
+                  overflow: 'hidden'
+                }}
+              >
+                <div
+                  style={{
+                    width: Math.max(timelineCellWidth, Math.round(audioTrack.duration * fps * timelineCellWidth)),
+                    height: 26,
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 1,
+                    background: 'rgba(56, 189, 248, 0.08)',
+                    borderRight: '1px solid rgba(56, 189, 248, 0.4)'
+                  }}
+                >
+                  {audioTrack.peaks.map((pk, idx) => (
+                    <div
+                      key={idx}
+                      style={{
+                        flex: 1,
+                        height: `${Math.max(8, Math.round(pk * 100))}%`,
+                        background: '#38bdf8',
+                        borderRadius: 1
+                      }}
+                    />
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       </div>
-
-      {/* Audio Track & Waveform Bar */}
-      {audioTrack && (
-        <div
-          style={{
-            height: 36,
-            background: '#1c242b',
-            borderTop: '1px solid #2e4052',
-            display: 'flex',
-            alignItems: 'center',
-            padding: '0 8px',
-            gap: 10
-          }}
-        >
-          <audio ref={audioRef} src={audioTrack.objectUrl} />
-          <div style={{ width: 228, display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: '#93c5fd' }}>
-            <Volume2 size={13} />
-            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
-              {audioTrack.name}
-            </span>
-            <button
-              className="icon-btn"
-              onClick={() => setAudioTrack(null)}
-              title="Remover Áudio"
-              style={{ height: 18, minWidth: 18 }}
-            >
-              ×
-            </button>
-          </div>
-          <div style={{ flex: 1, height: 26, display: 'flex', alignItems: 'center', gap: 1, overflow: 'hidden' }}>
-            {audioTrack.peaks.map((pk, idx) => (
-              <div
-                key={idx}
-                style={{
-                  flex: 1,
-                  height: `${Math.max(8, Math.round(pk * 100))}%`,
-                  background: '#38bdf8',
-                  borderRadius: 1
-                }}
-              />
-            ))}
-          </div>
-        </div>
-      )}
 
       {/* Pro Frame Right-Click Context Menu */}
       {frameMenu && (
         <div
+          ref={frameMenuRef}
           className="dropdown-menu"
           style={{
             position: 'fixed',
@@ -1386,7 +1827,6 @@ export const TimelinePanel: React.FC = () => {
             zIndex: 1200,
             minWidth: 210
           }}
-          onMouseLeave={() => setFrameMenu(null)}
         >
           <button className="dropdown-item" onClick={() => { copyCurrentFrame(); setFrameMenu(null); }}>
             <span>Copiar Frame</span><span style={{ color: '#888' }}>Ctrl+C</span>
@@ -1410,6 +1850,9 @@ export const TimelinePanel: React.FC = () => {
                 className="dropdown-item"
                 onClick={() => {
                   moveFrameRange(selRange.layerId, selRange.start, selRange.end, 1);
+                  if (selRange.end + 1 <= totalFrames) {
+                    setSelRange({ ...selRange, start: selRange.start + 1, end: selRange.end + 1 });
+                  }
                   setFrameMenu(null);
                 }}
               >
@@ -1475,8 +1918,8 @@ export const TimelinePanel: React.FC = () => {
             <>
               <div className="dropdown-sep" />
               <div style={{ padding: '2px 12px', fontSize: 10, color: '#888' }}>REUTILIZAR CEL (SUBSTITUTION)</div>
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, padding: '4px 10px', maxHeight: 64, overflowY: 'auto' }}>
-                {availableCels.slice(0, 12).map((srcF) => (
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, padding: '4px 10px', maxHeight: 88, overflowY: 'auto' }}>
+                {availableCels.map((srcF) => (
                   <button
                     key={srcF}
                     className="icon-btn"

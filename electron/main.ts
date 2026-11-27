@@ -1,6 +1,9 @@
 import { app, BrowserWindow, ipcMain, dialog, Menu, shell } from 'electron';
 import * as path from 'path';
 import * as fs from 'fs';
+import { execFile } from 'child_process';
+
+const fsp = fs.promises;
 
 // Hardware acceleration flags (maximizes GPU PCs; Chromium safely falls back to software on no-GPU PCs)
 app.commandLine.appendSwitch('enable-gpu-rasterization');
@@ -9,6 +12,81 @@ app.commandLine.appendSwitch('enable-accelerated-2d-canvas');
 app.commandLine.appendSwitch('disable-renderer-backgrounding');
 
 let mainWindow: BrowserWindow | null = null;
+let hasUnsavedChanges = false;
+let forceClosing = false;
+let pendingLaunchFile: string | null = null;
+
+const PROJECT_EXTS = new Set(['.celsketch', '.nexo', '.hrm']);
+
+function extractProjectPathFromArgv(argv: string[]): string | null {
+  for (const arg of argv.slice(1)) {
+    if (!arg || arg.startsWith('-')) continue;
+    const ext = path.extname(arg).toLowerCase();
+    if (PROJECT_EXTS.has(ext) && fs.existsSync(arg)) {
+      return path.resolve(arg);
+    }
+  }
+  return null;
+}
+
+function sanitizeFilename(name: string, fallback = 'Untitled'): string {
+  const cleaned = (name || '').replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').trim();
+  return cleaned || fallback;
+}
+
+async function writeFileAtomic(targetPath: string, data: string | Buffer): Promise<void> {
+  const dir = path.dirname(targetPath);
+  await fsp.mkdir(dir, { recursive: true });
+  const tmpPath = `${targetPath}.tmp-${process.pid}-${Date.now()}`;
+  try {
+    await fsp.writeFile(tmpPath, data);
+    await fsp.rename(tmpPath, targetPath);
+  } catch (err) {
+    try {
+      await fsp.unlink(tmpPath);
+    } catch {
+      // ignore cleanup error
+    }
+    throw err;
+  }
+}
+
+function getRecoveryPath(): string {
+  return path.join(app.getPath('userData'), 'autosave_recovery.celsketch');
+}
+
+// Single-instance lock so double-clicking a .celsketch file reuses the open window
+pendingLaunchFile = extractProjectPathFromArgv(process.argv);
+const gotTheLock = app.requestSingleInstanceLock();
+if (!gotTheLock) {
+  app.quit();
+} else {
+  app.on('second-instance', (_event, commandLine) => {
+    const filePath = extractProjectPathFromArgv(commandLine);
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+      if (filePath) {
+        if (mainWindow.webContents.isLoading()) {
+          pendingLaunchFile = filePath;
+        } else {
+          mainWindow.webContents.send('file:openExternalPath', filePath);
+        }
+      }
+    } else if (filePath) {
+      pendingLaunchFile = filePath;
+    }
+  });
+}
+
+app.on('open-file', (event, filePath) => {
+  event.preventDefault();
+  if (mainWindow && !mainWindow.webContents.isLoading()) {
+    mainWindow.webContents.send('file:openExternalPath', filePath);
+  } else {
+    pendingLaunchFile = filePath;
+  }
+});
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -25,12 +103,26 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false
+      sandbox: true
     }
   });
 
   mainWindow.maximize();
   Menu.setApplicationMenu(null);
+
+  // Prevent accidental drag-and-drop navigation away from CelSketch
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    const isDevLocal = !app.isPackaged && url.startsWith('http://localhost:5173');
+    if (!isDevLocal) {
+      event.preventDefault();
+    }
+  });
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (url.startsWith('https://') || url.startsWith('http://')) {
+      shell.openExternal(url).catch(() => {});
+    }
+    return { action: 'deny' };
+  });
 
   const isDev = !app.isPackaged;
   if (isDev) {
@@ -39,12 +131,23 @@ function createWindow() {
     mainWindow.loadFile(path.join(__dirname, '../dist/index.html'));
   }
 
+  mainWindow.on('close', (event) => {
+    if (forceClosing || !hasUnsavedChanges || !mainWindow) return;
+    event.preventDefault();
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.focus();
+    // Show our custom CelSketch UnsavedCloseModal instead of the ugly native OS dialog!
+    mainWindow.webContents.send('window:requestClose');
+  });
+
   mainWindow.on('closed', () => {
     mainWindow = null;
+    forceClosing = false;
   });
 }
 
 app.whenReady().then(() => {
+  if (!gotTheLock) return;
   createWindow();
 
   app.on('activate', () => {
@@ -56,7 +159,7 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
 
-// Window controls
+// Window controls & dirty state
 ipcMain.handle('window:minimize', () => mainWindow?.minimize());
 ipcMain.handle('window:maximize', () => {
   if (mainWindow?.isMaximized()) {
@@ -68,139 +171,353 @@ ipcMain.handle('window:maximize', () => {
 });
 ipcMain.handle('window:close', () => mainWindow?.close());
 ipcMain.handle('window:isMaximized', () => mainWindow?.isMaximized() ?? false);
-
-// Save Project (.celsketch)
-ipcMain.handle('file:saveProject', async (_event, { content, currentPath }: { content: string; currentPath?: string | null }) => {
-  let filePath = currentPath;
-  if (!filePath) {
-    const result = await dialog.showSaveDialog(mainWindow!, {
-      title: 'Save CelSketch Project',
-      defaultPath: 'Untitled.celsketch',
-      filters: [{ name: 'CelSketch Project', extensions: ['celsketch'] }]
-    });
-    if (result.canceled || !result.filePath) return { canceled: true };
-    filePath = result.filePath;
+ipcMain.handle('window:setDirty', (_event, dirty: boolean) => {
+  hasUnsavedChanges = Boolean(dirty);
+});
+ipcMain.handle('window:confirmClose', (_event, discardRecovery: boolean) => {
+  forceClosing = true;
+  if (discardRecovery) {
+    try {
+      if (fs.existsSync(getRecoveryPath())) fs.unlinkSync(getRecoveryPath());
+    } catch {
+      // ignore
+    }
   }
-  fs.writeFileSync(filePath, content, 'utf-8');
-  return { canceled: false, filePath };
+  mainWindow?.close();
 });
 
-// Save Project As (.celsketch)
-ipcMain.handle('file:saveProjectAs', async (_event, { content }: { content: string }) => {
-  const result = await dialog.showSaveDialog(mainWindow!, {
-    title: 'Save CelSketch Project As',
-    defaultPath: 'Untitled.celsketch',
-    filters: [{ name: 'CelSketch Project', extensions: ['celsketch'] }]
-  });
-  if (result.canceled || !result.filePath) return { canceled: true };
-  fs.writeFileSync(result.filePath, content, 'utf-8');
-  return { canceled: false, filePath: result.filePath };
+// Launch file (double-click .celsketch)
+ipcMain.handle('file:getLaunchFile', () => {
+  const f = pendingLaunchFile;
+  pendingLaunchFile = null;
+  return f;
 });
 
-// Auto-Save (silent: updates currentPath or saves recovery backup in userData)
-ipcMain.handle('file:autoSave', async (_event, { content, currentPath }: { content: string; currentPath?: string | null }) => {
-  const targetPath = currentPath || path.join(app.getPath('userData'), 'autosave_recovery.celsketch');
-  fs.writeFileSync(targetPath, content, 'utf-8');
-  return { ok: true, filePath: targetPath };
+// Save Project (.celsketch) — Atomic write
+ipcMain.handle(
+  'file:saveProject',
+  async (_event, { content, currentPath, defaultName }: { content: string; currentPath?: string | null; defaultName?: string }) => {
+    try {
+      let filePath = currentPath;
+      if (!filePath) {
+        if (!mainWindow) return { canceled: true, error: 'Window unavailable' };
+        const base = sanitizeFilename(defaultName || 'Untitled', 'Untitled');
+        const suggested = base.toLowerCase().endsWith('.celsketch') ? base : `${base}.celsketch`;
+        const result = await dialog.showSaveDialog(mainWindow, {
+          title: 'Save CelSketch Project',
+          defaultPath: suggested,
+          filters: [{ name: 'CelSketch Project', extensions: ['celsketch'] }]
+        });
+        if (result.canceled || !result.filePath) return { canceled: true };
+        filePath = result.filePath;
+      }
+      await writeFileAtomic(filePath, content);
+      // Clear recovery backup after successful manual save
+      fsp.unlink(getRecoveryPath()).catch(() => {});
+      return { canceled: false, filePath };
+    } catch (err: any) {
+      return { canceled: true, error: err?.message || 'Erro ao salvar projeto' };
+    }
+  }
+);
+
+// Save Project As (.celsketch) — Atomic write
+ipcMain.handle(
+  'file:saveProjectAs',
+  async (_event, { content, defaultName }: { content: string; defaultName?: string }) => {
+    try {
+      if (!mainWindow) return { canceled: true, error: 'Window unavailable' };
+      const base = sanitizeFilename(defaultName || 'Untitled', 'Untitled');
+      const suggested = base.toLowerCase().endsWith('.celsketch') ? base : `${base}.celsketch`;
+      const result = await dialog.showSaveDialog(mainWindow, {
+        title: 'Save CelSketch Project As',
+        defaultPath: suggested,
+        filters: [{ name: 'CelSketch Project', extensions: ['celsketch'] }]
+      });
+      if (result.canceled || !result.filePath) return { canceled: true };
+      await writeFileAtomic(result.filePath, content);
+      fsp.unlink(getRecoveryPath()).catch(() => {});
+      return { canceled: false, filePath: result.filePath };
+    } catch (err: any) {
+      return { canceled: true, error: err?.message || 'Erro ao salvar projeto' };
+    }
+  }
+);
+
+// Auto-Save (always writes atomically to recovery backup in userData; never silently overwrites user's real file)
+ipcMain.handle('file:autoSave', async (_event, { content }: { content: string; currentPath?: string | null }) => {
+  try {
+    const targetPath = getRecoveryPath();
+    await writeFileAtomic(targetPath, content);
+    return { ok: true, filePath: targetPath };
+  } catch (err: any) {
+    return { ok: false, error: err?.message || 'Auto-save failed' };
+  }
+});
+
+// Check / read / clear crash-recovery backup
+ipcMain.handle('file:checkRecovery', async () => {
+  try {
+    const recoveryPath = getRecoveryPath();
+    const stat = await fsp.stat(recoveryPath);
+    const content = await fsp.readFile(recoveryPath, 'utf-8');
+    return { exists: true, mtimeMs: stat.mtimeMs, content, filePath: recoveryPath };
+  } catch {
+    return { exists: false };
+  }
+});
+
+ipcMain.handle('file:clearRecovery', async () => {
+  try {
+    await fsp.unlink(getRecoveryPath());
+  } catch {
+    // ignore if absent
+  }
+  return { ok: true };
 });
 
 // Open Project (.celsketch)
 ipcMain.handle('file:openProject', async () => {
-  const result = await dialog.showOpenDialog(mainWindow!, {
-    title: 'Open CelSketch Project',
-    filters: [{ name: 'CelSketch Project', extensions: ['celsketch', 'nexo', 'hrm'] }],
-    properties: ['openFile']
-  });
-  if (result.canceled || result.filePaths.length === 0) return { canceled: true };
-  const filePath = result.filePaths[0];
-  const content = fs.readFileSync(filePath, 'utf-8');
-  return { canceled: false, filePath, content };
+  try {
+    if (!mainWindow) return { canceled: true, error: 'Window unavailable' };
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: 'Open CelSketch Project',
+      filters: [{ name: 'CelSketch Project', extensions: ['celsketch', 'nexo', 'hrm'] }],
+      properties: ['openFile']
+    });
+    if (result.canceled || result.filePaths.length === 0) return { canceled: true };
+    const filePath = result.filePaths[0];
+    const content = await fsp.readFile(filePath, 'utf-8');
+    return { canceled: false, filePath, content };
+  } catch (err: any) {
+    return { canceled: true, error: err?.message || 'Erro ao abrir projeto' };
+  }
 });
 
-// Open Project by exact path (Recent Projects)
+// Open Project by exact path (Recent Projects / Explorer double-click)
 ipcMain.handle('file:openProjectByPath', async (_event, { filePath }: { filePath: string }) => {
-  if (!filePath || !fs.existsSync(filePath)) return { canceled: true, error: 'File not found' };
-  const content = fs.readFileSync(filePath, 'utf-8');
-  return { canceled: false, filePath, content };
+  try {
+    if (!filePath) return { canceled: true, error: 'Caminho inválido' };
+    const content = await fsp.readFile(filePath, 'utf-8');
+    return { canceled: false, filePath, content };
+  } catch (err: any) {
+    return { canceled: true, error: err?.code === 'ENOENT' ? 'Arquivo não encontrado' : (err?.message || 'Erro ao ler arquivo') };
+  }
 });
 
 // Import external drawing/animation files (.psd, .kra, .clip, .png, .jpg, .webp, .svg)
 ipcMain.handle('file:importExternal', async () => {
-  const result = await dialog.showOpenDialog(mainWindow!, {
-    title: 'Import Artwork (.psd, .kra, .clip, .png, .jpg, .webp, .svg)',
-    filters: [
-      { name: 'All Supported Artwork', extensions: ['psd', 'kra', 'clip', 'png', 'jpg', 'jpeg', 'webp', 'bmp', 'svg'] },
-      { name: 'Layered Projects (PSD / KRA / CLIP)', extensions: ['psd', 'kra', 'clip'] },
-      { name: 'Images (PNG / JPG / WEBP / SVG)', extensions: ['png', 'jpg', 'jpeg', 'webp', 'bmp', 'svg'] }
-    ],
-    properties: ['openFile']
-  });
-  if (result.canceled || result.filePaths.length === 0) return { canceled: true };
-  const filePath = result.filePaths[0];
-  const ext = path.extname(filePath).toLowerCase().replace('.', '');
-  const bytes = fs.readFileSync(filePath);
-  return { canceled: false, filePath, ext, bytes: new Uint8Array(bytes) };
+  try {
+    if (!mainWindow) return { canceled: true, error: 'Window unavailable' };
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: 'Import Artwork (.psd, .kra, .clip, .png, .jpg, .webp, .svg)',
+      filters: [
+        { name: 'All Supported Artwork', extensions: ['psd', 'kra', 'clip', 'png', 'jpg', 'jpeg', 'webp', 'bmp', 'svg'] },
+        { name: 'Layered Projects (PSD / KRA / CLIP)', extensions: ['psd', 'kra', 'clip'] },
+        { name: 'Images (PNG / JPG / WEBP / SVG)', extensions: ['png', 'jpg', 'jpeg', 'webp', 'bmp', 'svg'] }
+      ],
+      properties: ['openFile']
+    });
+    if (result.canceled || result.filePaths.length === 0) return { canceled: true };
+    const filePath = result.filePaths[0];
+    const ext = path.extname(filePath).toLowerCase().replace('.', '');
+    const bytes = await fsp.readFile(filePath);
+    return { canceled: false, filePath, ext, bytes: new Uint8Array(bytes) };
+  } catch (err: any) {
+    return { canceled: true, error: err?.message || 'Erro ao importar arquivo' };
+  }
 });
 
-// Import audio file (.mp3, .wav, .ogg) for Timeline lip-sync
+// Import audio file (.mp3, .wav, .ogg, .m4a) for Timeline lip-sync
 ipcMain.handle('file:importAudio', async () => {
-  const result = await dialog.showOpenDialog(mainWindow!, {
-    title: 'Import Audio Track (.mp3, .wav, .ogg)',
-    filters: [{ name: 'Audio Files', extensions: ['mp3', 'wav', 'ogg', 'm4a'] }],
-    properties: ['openFile']
-  });
-  if (result.canceled || result.filePaths.length === 0) return { canceled: true };
-  const filePath = result.filePaths[0];
-  const name = path.basename(filePath);
-  const bytes = fs.readFileSync(filePath);
-  return { canceled: false, filePath, name, bytes: new Uint8Array(bytes) };
+  try {
+    if (!mainWindow) return { canceled: true, error: 'Window unavailable' };
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: 'Import Audio Track (.mp3, .wav, .ogg, .m4a)',
+      filters: [{ name: 'Audio Files', extensions: ['mp3', 'wav', 'ogg', 'm4a'] }],
+      properties: ['openFile']
+    });
+    if (result.canceled || result.filePaths.length === 0) return { canceled: true };
+    const filePath = result.filePaths[0];
+    const name = path.basename(filePath);
+    const bytes = await fsp.readFile(filePath);
+    return { canceled: false, filePath, name, bytes: new Uint8Array(bytes) };
+  } catch (err: any) {
+    return { canceled: true, error: err?.message || 'Erro ao importar áudio' };
+  }
+});
+
+// Reload audio by saved file path when reopening a project
+ipcMain.handle('file:readAudioByPath', async (_event, { filePath }: { filePath: string }) => {
+  try {
+    if (!filePath) return { canceled: true, error: 'Caminho inválido' };
+    const bytes = await fsp.readFile(filePath);
+    return { canceled: false, filePath, name: path.basename(filePath), bytes: new Uint8Array(bytes) };
+  } catch (err: any) {
+    return { canceled: true, error: err?.message || 'Áudio não encontrado' };
+  }
 });
 
 // Export Single PNG
 ipcMain.handle('file:exportPng', async (_event, { dataUrl, defaultName }: { dataUrl: string; defaultName: string }) => {
-  const result = await dialog.showSaveDialog(mainWindow!, {
-    title: 'Export Frame as PNG',
-    defaultPath: defaultName || 'frame_0001.png',
-    filters: [{ name: 'PNG Image', extensions: ['png'] }]
-  });
-  if (result.canceled || !result.filePath) return { canceled: true };
-  const base64Data = dataUrl.replace(/^data:image\/png;base64,/, '');
-  fs.writeFileSync(result.filePath, Buffer.from(base64Data, 'base64'));
-  return { canceled: false, filePath: result.filePath };
+  try {
+    if (!mainWindow) return { canceled: true, error: 'Window unavailable' };
+    const safeName = sanitizeFilename(defaultName || 'frame_0001.png', 'frame_0001.png');
+    const result = await dialog.showSaveDialog(mainWindow, {
+      title: 'Export Frame as PNG',
+      defaultPath: safeName,
+      filters: [{ name: 'PNG Image', extensions: ['png'] }]
+    });
+    if (result.canceled || !result.filePath) return { canceled: true };
+    const base64Data = dataUrl.replace(/^data:image\/png;base64,/, '');
+    await writeFileAtomic(result.filePath, Buffer.from(base64Data, 'base64'));
+    return { canceled: false, filePath: result.filePath };
+  } catch (err: any) {
+    return { canceled: true, error: err?.message || 'Erro ao exportar PNG' };
+  }
 });
 
 // Pick directory for PNG Sequence or Auto-Rec Process Folder
 ipcMain.handle('file:pickDirectory', async (_event, title?: string) => {
-  const result = await dialog.showOpenDialog(mainWindow!, {
-    title: title || 'Selecionar Pasta',
-    properties: ['openDirectory', 'createDirectory']
-  });
-  if (result.canceled || result.filePaths.length === 0) return { canceled: true };
-  return { canceled: false, dirPath: result.filePaths[0] };
+  try {
+    if (!mainWindow) return { canceled: true, error: 'Window unavailable' };
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: title || 'Selecionar Pasta',
+      properties: ['openDirectory', 'createDirectory']
+    });
+    if (result.canceled || result.filePaths.length === 0) return { canceled: true };
+    return { canceled: false, dirPath: result.filePaths[0] };
+  } catch (err: any) {
+    return { canceled: true, error: err?.message || 'Erro ao selecionar pasta' };
+  }
 });
 
-// Write a single frame PNG/JPG to a chosen directory (auto-creates scene subfolders!)
+// Inspect existing Auto-Rec folder so step_XXXX.jpg continues instead of overwriting step_0001.jpg
+ipcMain.handle('file:getNextStepNumber', async (_event, { dirPath, subFolder }: { dirPath: string; subFolder: string }) => {
+  try {
+    const resolvedBase = path.resolve(dirPath);
+    const resolvedSub = path.resolve(resolvedBase, sanitizeFilename(subFolder, 'Scene'));
+    if (!resolvedSub.startsWith(resolvedBase)) return 1;
+    const entries = await fsp.readdir(resolvedSub);
+    let maxStep = 0;
+    for (const name of entries) {
+      const m = /^step_(\d+)\.(jpg|jpeg|png)$/i.exec(name);
+      if (m) {
+        const num = parseInt(m[1], 10);
+        if (num > maxStep) maxStep = num;
+      }
+    }
+    return maxStep + 1;
+  } catch {
+    return 1;
+  }
+});
+
+// Write a single frame PNG/JPG to a chosen directory (path-traversal safe!)
 ipcMain.handle('file:writeFrameToDir', async (_event, { dirPath, name, dataUrl }: { dirPath: string; name: string; dataUrl: string }) => {
-  const fullPath = path.join(dirPath, name);
-  fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-  const base64Data = dataUrl.replace(/^data:image\/[a-zA-Z0-9.+-]+;base64,/, '');
-  fs.writeFileSync(fullPath, Buffer.from(base64Data, 'base64'));
-  return { ok: true, fullPath };
+  try {
+    const resolvedBase = path.resolve(dirPath);
+    const fullPath = path.resolve(resolvedBase, name);
+    if (!fullPath.startsWith(resolvedBase + path.sep) && fullPath !== resolvedBase) {
+      return { ok: false, error: 'Invalid target path' };
+    }
+    await fsp.mkdir(path.dirname(fullPath), { recursive: true });
+    const base64Data = dataUrl.replace(/^data:image\/[a-zA-Z0-9.+-]+;base64,/, '');
+    await fsp.writeFile(fullPath, Buffer.from(base64Data, 'base64'));
+    return { ok: true, fullPath };
+  } catch (err: any) {
+    return { ok: false, error: err?.message || 'Erro ao gravar frame' };
+  }
 });
 
 // Save binary file (GIF / MP4 / WebM)
-ipcMain.handle('file:saveBinaryFile', async (_event, { defaultName, filterName, extensions, bytes }: { defaultName: string; filterName: string; extensions: string[]; bytes: Uint8Array }) => {
-  const result = await dialog.showSaveDialog(mainWindow!, {
-    title: `Export ${filterName}`,
-    defaultPath: defaultName,
-    filters: [{ name: filterName, extensions }]
-  });
-  if (result.canceled || !result.filePath) return { canceled: true };
-  fs.writeFileSync(result.filePath, Buffer.from(bytes));
-  return { canceled: false, filePath: result.filePath };
+ipcMain.handle(
+  'file:saveBinaryFile',
+  async (
+    _event,
+    { defaultName, filterName, extensions, bytes }: { defaultName: string; filterName: string; extensions: string[]; bytes: Uint8Array }
+  ) => {
+    try {
+      if (!mainWindow) return { canceled: true, error: 'Window unavailable' };
+      const safeName = sanitizeFilename(defaultName || 'export', 'export');
+      const result = await dialog.showSaveDialog(mainWindow, {
+        title: `Export ${filterName}`,
+        defaultPath: safeName,
+        filters: [{ name: filterName, extensions }]
+      });
+      if (result.canceled || !result.filePath) return { canceled: true };
+      await writeFileAtomic(result.filePath, Buffer.from(bytes));
+      return { canceled: false, filePath: result.filePath };
+    } catch (err: any) {
+      return { canceled: true, error: err?.message || 'Erro ao salvar arquivo' };
+    }
+  }
+);
+
+// Open exported folder or file in Explorer (safely routes http/https URLs to openExternal)
+ipcMain.handle('shell:openPath', async (_event, targetPath: string) => {
+  if (!targetPath) return;
+  if (/^https?:\/\//i.test(targetPath)) {
+    await shell.openExternal(targetPath);
+    return;
+  }
+  await shell.openPath(targetPath);
 });
 
-// Open exported folder or file in Explorer
-ipcMain.handle('shell:openPath', async (_event, targetPath: string) => {
-  await shell.openPath(targetPath);
+ipcMain.handle('shell:openExternal', async (_event, url: string) => {
+  if (!url || !/^https?:\/\//i.test(url)) return;
+  await shell.openExternal(url);
+});
+
+// List installed system font families on the user's PC (cached!)
+let cachedSystemFonts: string[] | null = null;
+ipcMain.handle('system:listFonts', async () => {
+  if (cachedSystemFonts) return cachedSystemFonts;
+  const fallback = [
+    'Segoe UI',
+    'Arial',
+    'Calibri',
+    'Cambria',
+    'Comic Sans MS',
+    'Consolas',
+    'Courier New',
+    'Georgia',
+    'Impact',
+    'Tahoma',
+    'Times New Roman',
+    'Trebuchet MS',
+    'Verdana'
+  ];
+  if (process.platform !== 'win32') {
+    cachedSystemFonts = fallback;
+    return cachedSystemFonts;
+  }
+  return new Promise<string[]>((resolve) => {
+    execFile(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-Command',
+        'Add-Type -AssemblyName System.Drawing; (New-Object System.Drawing.Text.InstalledFontCollection).Families | ForEach-Object { $_.Name }'
+      ],
+      { timeout: 6000, maxBuffer: 1024 * 1024 },
+      (err, stdout) => {
+        if (err || !stdout) {
+          cachedSystemFonts = fallback;
+          resolve(fallback);
+          return;
+        }
+        const list = Array.from(
+          new Set(
+            stdout
+              .split(/\r?\n/)
+              .map((s) => s.trim())
+              .filter(Boolean)
+          )
+        ).sort((a, b) => a.localeCompare(b));
+        cachedSystemFonts = list.length > 0 ? list : fallback;
+        resolve(cachedSystemFonts);
+      }
+    );
+  });
 });

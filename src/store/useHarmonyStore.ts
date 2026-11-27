@@ -1,62 +1,50 @@
 import { create } from 'zustand';
+import { buildWarmupLayers } from '../utils/warmupGenerator';
+import { adjustHexHsl } from '../utils/hsvUtils';
+import { adjustHexLevels, isNoopLevels, LevelsAdjustment } from '../utils/levelsUtils';
+import { applyBlurToCanvas, BlurSettings, isNoopBlur } from '../utils/blurUtils';
+import { DEFAULT_POST_PROCESS } from '../utils/postProcessUtils';
+import { renderFrameToCanvas, renderStroke } from '../utils/canvasRenderer';
+import { CAMERA_EFFECT_PRESETS, getInterpolatedCamera } from '../utils/cameraUtils';
 import {
   ArtLayerId,
   BrushPresetId,
+  CameraEffect,
+  CameraEffectType,
+  CameraKeyframe,
   ColourSwatch,
   DrawingLayer,
   HarmonyProjectData,
+  KeyframeEasing,
   LayerEffects,
   LayerTransformKeyframe,
+  Point,
   PoseTag,
+  PostProcessSettings,
   Stroke,
   ToolId
 } from '../types/harmony';
 
-function adjustHexHsv(hex: string, hDelta: number, sDelta: number, vDelta: number): string {
-  const clean = hex.replace('#', '');
-  const r = parseInt(clean.substring(0, 2) || '00', 16) / 255;
-  const g = parseInt(clean.substring(2, 4) || '00', 16) / 255;
-  const b = parseInt(clean.substring(4, 6) || '00', 16) / 255;
-
-  const max = Math.max(r, g, b);
-  const min = Math.min(r, g, b);
-  const d = max - min;
-  let h = 0;
-  if (d !== 0) {
-    if (max === r) h = ((g - b) / d + (g < b ? 6 : 0)) * 60;
-    else if (max === g) h = ((b - r) / d + 2) * 60;
-    else h = ((r - g) / d + 4) * 60;
-  }
-  const s = max === 0 ? 0 : d / max;
-  const v = max;
-
-  const nh = (h + hDelta + 360) % 360;
-  const ns = Math.max(0, Math.min(1, s * (1 + sDelta / 100)));
-  const nv = Math.max(0, Math.min(1, v * (1 + vDelta / 100)));
-
-  const c = nv * ns;
-  const x = c * (1 - Math.abs(((nh / 60) % 2) - 1));
-  const m = nv - c;
-  let nr = 0, ng = 0, nb = 0;
-  if (nh < 60) { nr = c; ng = x; nb = 0; }
-  else if (nh < 120) { nr = x; ng = c; nb = 0; }
-  else if (nh < 180) { nr = 0; ng = c; nb = x; }
-  else if (nh < 240) { nr = 0; ng = x; nb = c; }
-  else if (nh < 300) { nr = x; ng = 0; nb = c; }
-  else { nr = c; ng = 0; nb = x; }
-
-  const toHex = (n: number) => Math.round((n + m) * 255).toString(16).padStart(2, '0');
-  return `#${toHex(nr)}${toHex(ng)}${toHex(nb)}`;
-}
-
 interface HistorySnapshot {
   layers: DrawingLayer[];
+  activeLayerId?: string;
+  canvasWidth?: number;
+  canvasHeight?: number;
+}
+
+export interface AudioTrackData {
+  name: string;
+  filePath?: string;
+  objectUrl: string;
+  peaks: number[];
+  duration: number;
 }
 
 export interface SceneTab {
   id: string;
   name: string;
   path: string | null;
+  isDirty: boolean;
   width: number;
   height: number;
   fps: number;
@@ -69,6 +57,26 @@ export interface SceneTab {
   selectedLayerIds: string[];
   swatches: ColourSwatch[];
   activeSwatchId: string;
+  timelineMarkers: Record<number, string>;
+  audioTrack: AudioTrackData | null;
+  undoStack: HistorySnapshot[];
+  redoStack: HistorySnapshot[];
+}
+
+export interface ImportedLayerSpec {
+  name: string;
+  type?: 'drawing' | 'folder';
+  parentName?: string;
+  folderKey?: string;
+  parentKey?: string;
+  dataUrl?: string;
+  x?: number;
+  y?: number;
+  w?: number;
+  h?: number;
+  opacity?: number;
+  blendMode?: GlobalCompositeOperation;
+  visible?: boolean;
 }
 
 interface HarmonyState {
@@ -82,7 +90,7 @@ interface HarmonyState {
   isDirty: boolean;
   symmetryMode: 'none' | 'vertical';
   clipboardStrokes: Stroke[];
-  audioTrack: { name: string; objectUrl: string; peaks: number[]; duration: number } | null;
+  audioTrack: AudioTrackData | null;
   timelineMarkers: Record<number, string>;
   timelineCellWidth: number;
   autoSaveEnabled: boolean;
@@ -111,12 +119,30 @@ interface HarmonyState {
   usePressure: boolean;
   brushOpacity: number;
   brushSmoothing: number;
+  eraserSize: number;
+  eraserMinSize: number;
+  eraserOpacity: number;
+  eraserPreset: BrushPresetId;
+  textFontFamily: string;
+  textFontSize: number;
+  textBold: boolean;
+  textItalic: boolean;
+  activeSelectionPoly: Point[] | null;
+  activeSelectionPolys: Point[][] | null;
+  activeSelectionInverted: boolean;
+  invertSelectionTrigger: number;
   shapeFilled: boolean;
+  gradientMode: 'linear' | 'radial';
+  gradientToTransparent: boolean;
   bucketReference: 'all' | 'active';
   bucketTolerance: number;
   bucketExpand: number;
   bucketCloseGap: number;
   bucketBehind: boolean;
+  liquifyMode: 'push' | 'expand' | 'pinch';
+  liquifySize: number;
+  liquifyStrength: number;
+  referenceWindowOpen: boolean;
 
   // Timelapse recording
   timelapseRecording: boolean;
@@ -135,12 +161,20 @@ interface HarmonyState {
   flipX: boolean;
   grayscaleMode: boolean;
   hsvModalOpen: boolean;
-  hsvPreview: { h: number; s: number; v: number; allFrames: boolean } | null;
+  hsvPreview: { h: number; s: number; v: number; allFrames: boolean; colorize?: boolean } | null;
+  levelsModalOpen: boolean;
+  levelsPreview: (LevelsAdjustment & { allFrames: boolean }) | null;
+  blurModalOpen: boolean;
+  blurPreview: (BlurSettings & { allFrames: boolean }) | null;
+  postProcessModalOpen: boolean;
+  postProcess: PostProcessSettings;
   exportModalOpen: boolean;
   cropMode: boolean;
   showGrid: boolean;
   perspectiveMode: 0 | 1 | 2 | 3 | 4;
   showCameraFrame: boolean;
+  cameraViewMode: boolean;
+  cameraGuides: boolean;
   lightTable: boolean;
   onionSkin: boolean;
   onionPrev: number;
@@ -177,16 +211,33 @@ interface HarmonyState {
   setUsePressure: (use: boolean) => void;
   setBrushOpacity: (opacity: number) => void;
   setBrushSmoothing: (smoothing: number) => void;
+  setEraserSize: (size: number) => void;
+  setEraserMinSize: (minPct: number) => void;
+  setEraserOpacity: (opacity: number) => void;
+  setEraserPreset: (preset: BrushPresetId) => void;
+  setTextFontFamily: (family: string) => void;
+  setTextFontSize: (size: number) => void;
+  setTextBold: (bold: boolean) => void;
+  setTextItalic: (italic: boolean) => void;
+  setActiveSelectionPoly: (poly: Point[] | null, inverted?: boolean, polys?: Point[][] | null) => void;
+  requestInvertSelection: () => void;
   setShapeFilled: (filled: boolean) => void;
+  setGradientMode: (mode: 'linear' | 'radial') => void;
+  setGradientToTransparent: (toTransparent: boolean) => void;
   setBucketReference: (ref: 'all' | 'active') => void;
   setBucketTolerance: (tol: number) => void;
   setBucketExpand: (px: number) => void;
   setBucketCloseGap: (px: number) => void;
   setBucketBehind: (behind: boolean) => void;
+  setLiquifyMode: (mode: 'push' | 'expand' | 'pinch') => void;
+  setLiquifySize: (size: number) => void;
+  setLiquifyStrength: (strength: number) => void;
+  toggleReferenceWindow: () => void;
 
   setZoom: (zoom: number) => void;
   setShowWelcome: (show: boolean) => void;
   createNewScene: (name: string, width: number, height: number, fps: number) => void;
+  createWarmupScene: () => void;
   switchSceneTab: (id: string) => void;
   closeSceneTab: (id: string) => void;
   addBlankSceneTab: () => void;
@@ -196,15 +247,27 @@ interface HarmonyState {
   toggleFlipX: () => void;
   toggleGrayscaleMode: () => void;
   setHsvModalOpen: (open: boolean) => void;
-  setHsvPreview: (preview: { h: number; s: number; v: number; allFrames: boolean } | null) => void;
+  setHsvPreview: (preview: { h: number; s: number; v: number; allFrames: boolean; colorize?: boolean } | null) => void;
+  setLevelsModalOpen: (open: boolean) => void;
+  setLevelsPreview: (preview: (LevelsAdjustment & { allFrames: boolean }) | null) => void;
+  applyLayerLevels: (adj: LevelsAdjustment, allFrames: boolean) => void;
+  setBlurModalOpen: (open: boolean) => void;
+  setBlurPreview: (preview: (BlurSettings & { allFrames: boolean }) | null) => void;
+  applyLayerBlur: (cfg: BlurSettings, allFrames: boolean) => void;
+  setPostProcessModalOpen: (open: boolean) => void;
+  setPostProcess: (patch: Partial<PostProcessSettings>) => void;
+  resetPostProcess: () => void;
   setExportModalOpen: (open: boolean) => void;
   setCropMode: (open: boolean) => void;
   resizeCanvas: (offsetX: number, offsetY: number, newWidth: number, newHeight: number) => void;
-  applyLayerHsv: (hDelta: number, sDelta: number, vDelta: number, allFrames: boolean) => void;
+  applyLayerHsv: (hDelta: number, sDelta: number, vDelta: number, allFrames: boolean, colorize?: boolean) => void;
   resetView: () => void;
   toggleGrid: () => void;
   setPerspectiveMode: (mode: 0 | 1 | 2 | 3 | 4) => void;
   toggleCameraFrame: () => void;
+  toggleCameraViewMode: () => void;
+  setCameraViewMode: (enabled: boolean) => void;
+  toggleCameraGuides: () => void;
   toggleLightTable: () => void;
   toggleOnionSkin: () => void;
   setOnionRange: (prev: number, next: number) => void;
@@ -215,6 +278,8 @@ interface HarmonyState {
   setCurrentFrame: (frame: number) => void;
   nextFrame: () => void;
   prevFrame: () => void;
+  jumpToNextDrawing: () => void;
+  jumpToPrevDrawing: () => void;
   setFps: (fps: number) => void;
   setTotalFrames: (total: number) => void;
   setPlayRange: (start: number, end: number) => void;
@@ -231,9 +296,19 @@ interface HarmonyState {
   // Layers & Drawing
   addLayer: (name?: string) => void;
   addFolderLayer: (name?: string) => void;
+  addCameraLayer: (name?: string) => void;
+  setCameraKeyframe: (id: string, frame: number, kf: Partial<CameraKeyframe>, pushUndo?: boolean) => void;
+  deleteCameraKeyframe: (id: string, frame: number) => void;
+  moveCameraKeyframe: (id: string, fromFrame: number, toFrame: number) => void;
+  applyCameraShake: (id: string, startFrame: number, durationFrames: number, intensityPx: number) => void;
+  addCameraEffect: (layerId: string, type: CameraEffectType, startFrame?: number) => void;
+  updateCameraEffect: (layerId: string, effectId: string, patch: Partial<CameraEffect>, pushUndo?: boolean) => void;
+  removeCameraEffect: (layerId: string, effectId: string) => void;
+  toggleCameraEffect: (layerId: string, effectId: string) => void;
   duplicateLayer: (id: string) => void;
   mergeLayerDown: (id: string) => void;
   importImageLayer: (name: string, dataUrl: string, x: number, y: number, w: number, h: number, opacity?: number) => void;
+  importArtworkLayersBatch: (items: ImportedLayerSpec[]) => void;
   deleteLayer: (id: string) => void;
   deleteSelectedLayers: () => void;
   setActiveLayer: (id: string) => void;
@@ -271,9 +346,11 @@ interface HarmonyState {
   pasteToCurrentFrame: () => void;
   extendExposureF5: () => void;
   reduceExposureShiftF5: () => void;
-  setAudioTrack: (track: { name: string; objectUrl: string; peaks: number[]; duration: number } | null) => void;
+  setAudioTrack: (track: AudioTrackData | null) => void;
 
+  pushUndoSnapshot: () => void;
   addStroke: (stroke: Stroke, insertAtBottom?: boolean) => void;
+  addStrokesBatch: (strokes: Stroke[], materializeHeld?: boolean, bypassAlphaLock?: boolean) => void;
   moveStrokes: (strokeIds: string[], dx: number, dy: number) => void;
   replaceStrokes: (updated: Stroke[]) => void;
   deleteStrokes: (strokeIds: string[]) => void;
@@ -356,8 +433,151 @@ const createDefaultLayers = (): DrawingLayer[] => [
   }
 ];
 
+// Structural-sharing snapshot: shares immutable Stroke[] arrays across all 40 Undo steps (~20-50x less RAM & instant!)
 const cloneLayers = (layers: DrawingLayer[]): DrawingLayer[] =>
-  typeof structuredClone === 'function' ? structuredClone(layers) : JSON.parse(JSON.stringify(layers));
+  layers.map((l) => ({
+    ...l,
+    frames: { ...l.frames },
+    celDurations: l.celDurations ? { ...l.celDurations } : undefined,
+    frameTags: l.frameTags ? { ...l.frameTags } : undefined,
+    keyframes: l.keyframes ? { ...l.keyframes } : undefined,
+    effects: l.effects ? { ...l.effects } : undefined
+  }));
+
+/**
+ * Auto-split/trim any earlier stretched Cel that overlaps targetFrame:
+ * e.g. Cel at F1 stretched 8f (1..8) -> creating a new Cel at F4 cleanly splits it into F1 (3f) + F4 (5f)!
+ */
+function splitCelDurationsAt(
+  celDurations: Record<number, number> | undefined,
+  targetFrame: number,
+  inheritRemainder = true
+): Record<number, number> {
+  const next = { ...(celDurations || {}) };
+  for (const [k, rawDur] of Object.entries(next)) {
+    const start = Number(k);
+    const dur = Math.max(1, rawDur || 1);
+    const end = start + dur - 1;
+    if (start < targetFrame && end >= targetFrame) {
+      next[start] = Math.max(1, targetFrame - start);
+      if (inheritRemainder && !next[targetFrame]) {
+        const remainder = end - targetFrame + 1;
+        if (remainder > 1) {
+          next[targetFrame] = remainder;
+        }
+      }
+    }
+  }
+  return next;
+}
+
+/**
+ * Single source of truth for resolving which strokes are visible on `frame` for `layer`.
+ * Explicit blank frames (`layer.frames[frame] = []`) stop earlier celDurations & holdFrames!
+ */
+export function resolveEffectiveStrokes(layer: DrawingLayer, frame: number): Stroke[] {
+  if (layer.frames[frame] !== undefined) {
+    return layer.frames[frame];
+  }
+  if (layer.celDurations) {
+    let bestStart = -1;
+    for (const [k, rawDur] of Object.entries(layer.celDurations)) {
+      const start = Number(k);
+      const dur = Math.max(1, rawDur || 1);
+      if (start < frame && start + dur - 1 >= frame && layer.frames[start] !== undefined) {
+        if (start > bestStart) bestStart = start;
+      }
+    }
+    if (bestStart !== -1) {
+      return layer.frames[bestStart] || [];
+    }
+  }
+  if (layer.holdFrames) {
+    for (let f = frame - 1; f >= 1; f--) {
+      if (layer.frames[f] !== undefined) return layer.frames[f];
+    }
+  }
+  return [];
+}
+
+function cloneStrokesWithNewIds(strokes: Stroke[], prefix = 'st-copy'): Stroke[] {
+  const base = Date.now();
+  return strokes.map((st, idx) => {
+    const cloned: Stroke =
+      typeof structuredClone === 'function' ? structuredClone(st) : JSON.parse(JSON.stringify(st));
+    cloned.id = `${prefix}-${base}-${idx}-${Math.random().toString(36).slice(2, 6)}`;
+    return cloned;
+  });
+}
+
+function makeSnapshot(s: HarmonyState): HistorySnapshot {
+  return {
+    layers: cloneLayers(s.layers),
+    activeLayerId: s.activeLayerId,
+    canvasWidth: s.canvasWidth,
+    canvasHeight: s.canvasHeight
+  };
+}
+
+function syncActiveTabInList(s: HarmonyState): SceneTab[] {
+  return s.openScenes.map((sc) =>
+    sc.id === s.activeSceneId
+      ? {
+          ...sc,
+          name: s.projectName,
+          path: s.projectPath,
+          isDirty: s.isDirty,
+          width: s.canvasWidth,
+          height: s.canvasHeight,
+          fps: s.fps,
+          totalFrames: s.totalFrames,
+          playStart: s.playStart,
+          playEnd: s.playEnd,
+          currentFrame: s.currentFrame,
+          layers: s.layers,
+          activeLayerId: s.activeLayerId,
+          selectedLayerIds: s.selectedLayerIds,
+          swatches: s.swatches,
+          activeSwatchId: s.activeSwatchId,
+          timelineMarkers: s.timelineMarkers,
+          audioTrack: s.audioTrack,
+          undoStack: s.undoStack,
+          redoStack: s.redoStack
+        }
+      : sc
+  );
+}
+
+function findCoveringCelStart(layer: DrawingLayer, frame: number): number | null {
+  if (layer.frames[frame] !== undefined) return frame;
+  if (layer.celDurations) {
+    let bestStart = -1;
+    for (const [k, rawDur] of Object.entries(layer.celDurations)) {
+      const start = Number(k);
+      const dur = Math.max(1, rawDur || 1);
+      if (start < frame && start + dur - 1 >= frame && layer.frames[start] !== undefined) {
+        if (start > bestStart) bestStart = start;
+      }
+    }
+    if (bestStart !== -1) return bestStart;
+  }
+  return null;
+}
+
+function shiftRecordKeys<T>(rec: Record<number, T> | undefined, fromFrame: number, delta: number): Record<number, T> {
+  const out: Record<number, T> = {};
+  if (!rec) return out;
+  for (const [k, v] of Object.entries(rec)) {
+    const f = Number(k);
+    if (f >= fromFrame) {
+      const nf = f + delta;
+      if (nf >= 1) out[nf] = v;
+    } else {
+      out[f] = v;
+    }
+  }
+  return out;
+}
 
 const USER_PREFS_KEY = 'celsketch_user_prefs';
 
@@ -409,12 +629,30 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
   usePressure: typeof savedPrefs.usePressure === 'boolean' ? savedPrefs.usePressure : true,
   brushOpacity: typeof savedPrefs.brushOpacity === 'number' ? savedPrefs.brushOpacity : 1,
   brushSmoothing: typeof savedPrefs.brushSmoothing === 'number' ? savedPrefs.brushSmoothing : 35,
+  eraserSize: typeof savedPrefs.eraserSize === 'number' ? savedPrefs.eraserSize : 32,
+  eraserMinSize: typeof savedPrefs.eraserMinSize === 'number' ? savedPrefs.eraserMinSize : 10,
+  eraserOpacity: typeof savedPrefs.eraserOpacity === 'number' ? savedPrefs.eraserOpacity : 1,
+  eraserPreset: savedPrefs.eraserPreset || 'sai_pen',
+  textFontFamily: typeof savedPrefs.textFontFamily === 'string' ? savedPrefs.textFontFamily : 'Segoe UI',
+  textFontSize: typeof savedPrefs.textFontSize === 'number' ? savedPrefs.textFontSize : 48,
+  textBold: typeof savedPrefs.textBold === 'boolean' ? savedPrefs.textBold : false,
+  textItalic: typeof savedPrefs.textItalic === 'boolean' ? savedPrefs.textItalic : false,
+  activeSelectionPoly: null,
+  activeSelectionPolys: null,
+  activeSelectionInverted: false,
+  invertSelectionTrigger: 0,
   shapeFilled: typeof savedPrefs.shapeFilled === 'boolean' ? savedPrefs.shapeFilled : false,
+  gradientMode: 'linear',
+  gradientToTransparent: true,
   bucketReference: savedPrefs.bucketReference === 'all' ? 'all' : 'active',
   bucketTolerance: typeof savedPrefs.bucketTolerance === 'number' ? savedPrefs.bucketTolerance : 32,
   bucketExpand: typeof savedPrefs.bucketExpand === 'number' ? savedPrefs.bucketExpand : 1,
   bucketCloseGap: typeof savedPrefs.bucketCloseGap === 'number' ? savedPrefs.bucketCloseGap : 4,
   bucketBehind: typeof savedPrefs.bucketBehind === 'boolean' ? savedPrefs.bucketBehind : false,
+  liquifyMode: savedPrefs.liquifyMode === 'expand' || savedPrefs.liquifyMode === 'pinch' ? savedPrefs.liquifyMode : 'push',
+  liquifySize: typeof savedPrefs.liquifySize === 'number' ? savedPrefs.liquifySize : 90,
+  liquifyStrength: typeof savedPrefs.liquifyStrength === 'number' ? savedPrefs.liquifyStrength : 55,
+  referenceWindowOpen: false,
 
   timelapseRecording: false,
   timelapseRootDir: typeof savedPrefs.timelapseRootDir === 'string' ? savedPrefs.timelapseRootDir : null,
@@ -433,11 +671,19 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
   grayscaleMode: false,
   hsvModalOpen: false,
   hsvPreview: null,
+  levelsModalOpen: false,
+  levelsPreview: null,
+  blurModalOpen: false,
+  blurPreview: null,
+  postProcessModalOpen: false,
+  postProcess: { ...DEFAULT_POST_PROCESS },
   exportModalOpen: false,
   cropMode: false,
   showGrid: typeof savedPrefs.showGrid === 'boolean' ? savedPrefs.showGrid : false,
   perspectiveMode: 0,
   showCameraFrame: typeof savedPrefs.showCameraFrame === 'boolean' ? savedPrefs.showCameraFrame : false,
+  cameraViewMode: false,
+  cameraGuides: true,
   lightTable: typeof savedPrefs.lightTable === 'boolean' ? savedPrefs.lightTable : false,
   onionSkin: typeof savedPrefs.onionSkin === 'boolean' ? savedPrefs.onionSkin : true,
   onionPrev: typeof savedPrefs.onionPrev === 'number' ? savedPrefs.onionPrev : 2,
@@ -501,6 +747,7 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
       sai_marker: { size: 28, minSize: 65, opacity: 0.58 },
       sai_inkpen: { size: 22, minSize: 3, opacity: 1 },
       sai_binary: { size: 6, minSize: 100, opacity: 1 },
+      sai_opacity_pen: { size: 18, minSize: 8, opacity: 0.82 },
       blur_soft: { size: 42, minSize: 30, opacity: 0.22 },
       blur_smudge: { size: 32, minSize: 20, opacity: 0.35 }
     };
@@ -532,12 +779,39 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
   setUsePressure: (usePressure) => set({ usePressure }),
   setBrushOpacity: (brushOpacity) => set({ brushOpacity: Math.max(0.05, Math.min(1, brushOpacity)) }),
   setBrushSmoothing: (brushSmoothing) => set({ brushSmoothing: Math.max(0, Math.min(100, brushSmoothing)) }),
+  setEraserSize: (eraserSize) => set({ eraserSize: Math.max(1, Math.min(300, eraserSize)) }),
+  setEraserMinSize: (eraserMinSize) => set({ eraserMinSize: Math.max(0, Math.min(100, eraserMinSize)) }),
+  setEraserOpacity: (eraserOpacity) => set({ eraserOpacity: Math.max(0.05, Math.min(1, eraserOpacity)) }),
+  setEraserPreset: (eraserPreset) => set({ eraserPreset, activeTool: 'eraser' }),
+  setTextFontFamily: (textFontFamily) => set({ textFontFamily }),
+  setTextFontSize: (textFontSize) => set({ textFontSize: Math.max(8, Math.min(400, Math.round(textFontSize))) }),
+  setTextBold: (textBold) => set({ textBold }),
+  setTextItalic: (textItalic) => set({ textItalic }),
+  setActiveSelectionPoly: (activeSelectionPoly, activeSelectionInverted = false, polys) =>
+    set({
+      activeSelectionPoly,
+      activeSelectionPolys:
+        polys && polys.length > 0
+          ? polys
+          : activeSelectionPoly && activeSelectionPoly.length >= 3
+            ? [activeSelectionPoly]
+            : null,
+      activeSelectionInverted: activeSelectionPoly && activeSelectionPoly.length >= 3 ? Boolean(activeSelectionInverted) : false
+    }),
+  requestInvertSelection: () =>
+    set((s) => (s.activeSelectionPoly && s.activeSelectionPoly.length >= 3 ? { invertSelectionTrigger: s.invertSelectionTrigger + 1 } : s)),
   setShapeFilled: (shapeFilled) => set({ shapeFilled }),
+  setGradientMode: (gradientMode) => set({ gradientMode }),
+  setGradientToTransparent: (gradientToTransparent) => set({ gradientToTransparent }),
   setBucketReference: (bucketReference) => set({ bucketReference }),
   setBucketTolerance: (bucketTolerance) => set({ bucketTolerance: Math.max(0, Math.min(150, bucketTolerance)) }),
   setBucketExpand: (bucketExpand) => set({ bucketExpand: Math.max(0, Math.min(4, bucketExpand)) }),
   setBucketCloseGap: (bucketCloseGap) => set({ bucketCloseGap: Math.max(0, Math.min(24, Math.round(bucketCloseGap))) }),
   setBucketBehind: (bucketBehind) => set({ bucketBehind }),
+  setLiquifyMode: (liquifyMode) => set({ liquifyMode }),
+  setLiquifySize: (liquifySize) => set({ liquifySize: Math.max(20, Math.min(300, Math.round(liquifySize))) }),
+  setLiquifyStrength: (liquifyStrength) => set({ liquifyStrength: Math.max(10, Math.min(100, Math.round(liquifyStrength))) }),
+  toggleReferenceWindow: () => set((s) => ({ referenceWindowOpen: !s.referenceWindowOpen })),
 
   setZoom: (zoom) => set({ zoom: Math.max(0.1, Math.min(8, zoom)) }),
   setShowWelcome: (showWelcome) => set({ showWelcome }),
@@ -549,34 +823,13 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
       const h = Math.max(64, Math.min(8192, Math.round(height)));
       const f = Math.max(1, Math.min(120, Math.round(fps)));
       const sceneName = name.trim() || `Cena_${s.openScenes.length + 1}`;
-
-      // Save current active scene state back into openScenes before adding new one
-      const synced = s.openScenes.map((sc) =>
-        sc.id === s.activeSceneId
-          ? {
-              ...sc,
-              name: s.projectName,
-              path: s.projectPath,
-              width: s.canvasWidth,
-              height: s.canvasHeight,
-              fps: s.fps,
-              totalFrames: s.totalFrames,
-              playStart: s.playStart,
-              playEnd: s.playEnd,
-              currentFrame: s.currentFrame,
-              layers: s.layers,
-              activeLayerId: s.activeLayerId,
-              selectedLayerIds: s.selectedLayerIds,
-              swatches: s.swatches,
-              activeSwatchId: s.activeSwatchId
-            }
-          : sc
-      );
+      const synced = syncActiveTabInList(s);
 
       const newTab: SceneTab = {
         id,
         name: sceneName,
         path: null,
+        isDirty: false,
         width: w,
         height: h,
         fps: f,
@@ -588,7 +841,11 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
         activeLayerId: newLayers[0].id,
         selectedLayerIds: [newLayers[0].id],
         swatches: DEFAULT_SWATCHES,
-        activeSwatchId: 'sw-black'
+        activeSwatchId: 'sw-black',
+        timelineMarkers: {},
+        audioTrack: null,
+        undoStack: [],
+        redoStack: []
       };
 
       return {
@@ -596,6 +853,7 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
         activeSceneId: id,
         projectName: sceneName,
         projectPath: null,
+        isDirty: false,
         canvasWidth: w,
         canvasHeight: h,
         fps: f,
@@ -604,6 +862,8 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
         playEnd: 60,
         totalFrames: 60,
         isPlaying: false,
+        timelineMarkers: {},
+        audioTrack: null,
         swatches: DEFAULT_SWATCHES,
         activeSwatchId: 'sw-black',
         activeColor: '#141414',
@@ -612,33 +872,69 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
         selectedLayerIds: [newLayers[0].id],
         undoStack: [],
         redoStack: [],
+        timelapseFrames: [],
+        showWelcome: false
+      };
+    }),
+  createWarmupScene: () =>
+    set((s) => {
+      const id = `scene-warmup-${Date.now()}`;
+      const warmupLayers = buildWarmupLayers();
+      const synced = syncActiveTabInList(s);
+      const newTab: SceneTab = {
+        id,
+        name: 'Aquecimento',
+        path: null,
+        isDirty: false,
+        width: 1920,
+        height: 1080,
+        fps: 24,
+        totalFrames: 5,
+        playStart: 1,
+        playEnd: 5,
+        currentFrame: 1,
+        layers: warmupLayers,
+        activeLayerId: warmupLayers[0].id,
+        selectedLayerIds: [warmupLayers[0].id],
+        swatches: DEFAULT_SWATCHES,
+        activeSwatchId: 'sw-black',
+        timelineMarkers: {},
+        audioTrack: null,
+        undoStack: [],
+        redoStack: []
+      };
+      return {
+        openScenes: [...synced, newTab],
+        activeSceneId: id,
+        projectName: 'Aquecimento',
+        projectPath: null,
+        isDirty: false,
+        canvasWidth: 1920,
+        canvasHeight: 1080,
+        fps: 24,
+        currentFrame: 1,
+        playStart: 1,
+        playEnd: 5,
+        totalFrames: 5,
+        isPlaying: false,
+        timelineMarkers: {},
+        audioTrack: null,
+        activeTool: 'brush',
+        swatches: DEFAULT_SWATCHES,
+        activeSwatchId: 'sw-black',
+        layers: warmupLayers,
+        activeLayerId: warmupLayers[0].id,
+        selectedLayerIds: [warmupLayers[0].id],
+        undoStack: [],
+        redoStack: [],
+        timelapseFrames: [],
         showWelcome: false
       };
     }),
   switchSceneTab: (id) =>
     set((s) => {
       if (id === s.activeSceneId) return s;
-      const synced = s.openScenes.map((sc) =>
-        sc.id === s.activeSceneId
-          ? {
-              ...sc,
-              name: s.projectName,
-              path: s.projectPath,
-              width: s.canvasWidth,
-              height: s.canvasHeight,
-              fps: s.fps,
-              totalFrames: s.totalFrames,
-              playStart: s.playStart,
-              playEnd: s.playEnd,
-              currentFrame: s.currentFrame,
-              layers: s.layers,
-              activeLayerId: s.activeLayerId,
-              selectedLayerIds: s.selectedLayerIds,
-              swatches: s.swatches,
-              activeSwatchId: s.activeSwatchId
-            }
-          : sc
-      );
+      const synced = syncActiveTabInList(s);
       const target = synced.find((sc) => sc.id === id);
       if (!target) return s;
       return {
@@ -646,6 +942,7 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
         activeSceneId: target.id,
         projectName: target.name,
         projectPath: target.path,
+        isDirty: target.isDirty,
         canvasWidth: target.width,
         canvasHeight: target.height,
         fps: target.fps,
@@ -658,19 +955,45 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
         selectedLayerIds: target.selectedLayerIds,
         swatches: target.swatches,
         activeSwatchId: target.activeSwatchId,
+        timelineMarkers: target.timelineMarkers || {},
+        audioTrack: target.audioTrack || null,
         isPlaying: false,
-        undoStack: [],
-        redoStack: []
+        undoStack: target.undoStack || [],
+        redoStack: target.redoStack || []
       };
     }),
   closeSceneTab: (id) =>
     set((s) => {
-      const remaining = s.openScenes.filter((sc) => sc.id !== id);
+      const synced = syncActiveTabInList(s);
+      const closing = synced.find((sc) => sc.id === id);
+      const remaining = synced.filter((sc) => sc.id !== id);
+      // Revoke closed tab's audio objectUrl if no other tab shares it
+      if (closing?.audioTrack?.objectUrl) {
+        const stillUsed = remaining.some((sc) => sc.audioTrack?.objectUrl === closing.audioTrack?.objectUrl);
+        if (!stillUsed) {
+          try {
+            URL.revokeObjectURL(closing.audioTrack.objectUrl);
+          } catch {
+            // ignore
+          }
+        }
+      }
       if (remaining.length === 0) {
         return {
           openScenes: [],
           activeSceneId: '',
+          layers: [],
+          isDirty: false,
           isPlaying: false,
+          audioTrack: null,
+          timelineMarkers: {},
+          undoStack: [],
+          redoStack: [],
+          activeSelectionPoly: null,
+          activeSelectionInverted: false,
+          hsvModalOpen: false,
+          hsvPreview: null,
+          cropMode: false,
           showWelcome: true
         };
       }
@@ -683,6 +1006,7 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
         activeSceneId: next.id,
         projectName: next.name,
         projectPath: next.path,
+        isDirty: next.isDirty,
         canvasWidth: next.width,
         canvasHeight: next.height,
         fps: next.fps,
@@ -695,9 +1019,11 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
         selectedLayerIds: next.selectedLayerIds,
         swatches: next.swatches,
         activeSwatchId: next.activeSwatchId,
+        timelineMarkers: next.timelineMarkers || {},
+        audioTrack: next.audioTrack || null,
         isPlaying: false,
-        undoStack: [],
-        redoStack: []
+        undoStack: next.undoStack || [],
+        redoStack: next.redoStack || []
       };
     }),
   addBlankSceneTab: () => {
@@ -717,18 +1043,33 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
     set((s) => {
       const w = Math.max(64, Math.min(8192, Math.round(newWidth)));
       const h = Math.max(64, Math.min(8192, Math.round(newHeight)));
-      const snapshot = { layers: cloneLayers(s.layers) };
+      const snapshot = makeSnapshot(s);
       const layers = s.layers.map((l) => {
         const updatedFrames: Record<number, Stroke[]> = {};
         for (const [fKey, strokes] of Object.entries(l.frames)) {
-          updatedFrames[Number(fKey)] = strokes.map((st) => ({
-            ...st,
-            points: st.points.map((pt) => ({
-              ...pt,
-              x: pt.x - offsetX,
-              y: pt.y - offsetY
-            }))
-          }));
+          updatedFrames[Number(fKey)] = strokes.map((st) => {
+            const shifted: Stroke = {
+              ...st,
+              points: st.points.map((pt) => ({
+                ...pt,
+                x: pt.x - offsetX,
+                y: pt.y - offsetY
+              }))
+            };
+            if (st.tool === 'image') {
+              if (typeof st.imageX === 'number') shifted.imageX = st.imageX - offsetX;
+              if (typeof st.imageY === 'number') shifted.imageY = st.imageY - offsetY;
+              if (st.imageQuad) {
+                shifted.imageQuad = {
+                  tl: { x: st.imageQuad.tl.x - offsetX, y: st.imageQuad.tl.y - offsetY },
+                  tr: { x: st.imageQuad.tr.x - offsetX, y: st.imageQuad.tr.y - offsetY },
+                  br: { x: st.imageQuad.br.x - offsetX, y: st.imageQuad.br.y - offsetY },
+                  bl: { x: st.imageQuad.bl.x - offsetX, y: st.imageQuad.bl.y - offsetY }
+                };
+              }
+            }
+            return shifted;
+          });
         }
         return { ...l, frames: updatedFrames };
       });
@@ -738,53 +1079,212 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
         canvasWidth: w,
         canvasHeight: h,
         layers,
-        cropMode: false
+        cropMode: false,
+        isDirty: true
       };
     }),
-  applyLayerHsv: (hDelta, sDelta, vDelta, allFrames) =>
+  applyLayerHsv: (hDelta, sDelta, vDelta, allFrames, colorize = false) =>
     set((s) => {
-      if (hDelta === 0 && sDelta === 0 && vDelta === 0) return { hsvPreview: null };
-      const snapshot = { layers: cloneLayers(s.layers) };
+      if (!colorize && hDelta === 0 && sDelta === 0 && vDelta === 0) return { hsvPreview: null };
+      const targetLayer = s.layers.find((l) => l.id === s.activeLayerId);
+      if (!targetLayer || targetLayer.locked || targetLayer.type === 'folder') return { hsvPreview: null };
+      const snapshot = makeSnapshot(s);
+      const step = { h: hDelta, s: sDelta, v: vDelta, ...(colorize ? { colorize: true } : {}) };
+      const adjustStroke = (st: Stroke): Stroke => {
+        if (st.tool === 'eraser' || st.tool === 'erase_poly') return st;
+        if (st.tool === 'image') {
+          const prevList = st.hsvFilters
+            ? st.hsvFilters
+            : st.hsvFilter
+              ? [st.hsvFilter]
+              : [];
+          return {
+            ...st,
+            hsvFilter: undefined,
+            hsvFilters: [...prevList, step]
+          };
+        }
+        return {
+          ...st,
+          color: adjustHexHsl(st.color, hDelta, sDelta, vDelta, colorize)
+        };
+      };
       const layers = s.layers.map((l) => {
         if (l.id !== s.activeLayerId) return l;
         const updatedFrames: Record<number, Stroke[]> = {};
         for (const [fKey, strokes] of Object.entries(l.frames)) {
           const fNum = Number(fKey);
           if (allFrames || fNum === s.currentFrame) {
-            updatedFrames[fNum] = strokes.map((st) => {
-              if (st.tool === 'image') {
-                const prev = st.hsvFilter || { h: 0, s: 0, v: 0 };
-                return {
-                  ...st,
-                  hsvFilter: {
-                    h: (prev.h + hDelta + 360) % 360,
-                    s: Math.max(-100, Math.min(200, prev.s + sDelta)),
-                    v: Math.max(-100, Math.min(200, prev.v + vDelta))
-                  }
-                };
-              }
-              return {
-                ...st,
-                color: adjustHexHsv(st.color, hDelta, sDelta, vDelta)
-              };
-            });
+            updatedFrames[fNum] = strokes.map(adjustStroke);
           } else {
             updatedFrames[fNum] = strokes;
           }
         }
-        return { ...l, frames: updatedFrames };
+        let nextDur = l.celDurations;
+        // If adjusting only the current frame and it is displaying a held/stretched Cel, materialize it cleanly!
+        if (!allFrames && l.frames[s.currentFrame] === undefined) {
+          const effective = resolveEffectiveStrokes(l, s.currentFrame);
+          if (effective.length > 0) {
+            updatedFrames[s.currentFrame] = cloneStrokesWithNewIds(effective, 'st-hsv').map(adjustStroke);
+            nextDur = splitCelDurationsAt(l.celDurations, s.currentFrame, true);
+          }
+        }
+        return { ...l, frames: updatedFrames, celDurations: nextDur };
       });
       return {
         undoStack: [...s.undoStack.slice(-39), snapshot],
         redoStack: [],
         layers,
-        hsvPreview: null
+        hsvPreview: null,
+        isDirty: true
       };
+    }),
+  setLevelsModalOpen: (levelsModalOpen) => set({ levelsModalOpen, levelsPreview: levelsModalOpen ? null : null }),
+  setLevelsPreview: (levelsPreview) => set({ levelsPreview }),
+  applyLayerLevels: (adj, allFrames) =>
+    set((s) => {
+      if (isNoopLevels(adj)) return { levelsPreview: null };
+      const targetLayer = s.layers.find((l) => l.id === s.activeLayerId);
+      if (!targetLayer || targetLayer.locked || targetLayer.type === 'folder' || targetLayer.type === 'camera') {
+        return { levelsPreview: null };
+      }
+      const snapshot = makeSnapshot(s);
+      const step = { ...adj };
+      const adjustStroke = (st: Stroke): Stroke => {
+        if (st.tool === 'eraser' || st.tool === 'erase_poly') return st;
+        if (st.tool === 'image') {
+          return {
+            ...st,
+            levelsFilters: [...(st.levelsFilters || []), step]
+          };
+        }
+        return {
+          ...st,
+          color: adjustHexLevels(st.color, step),
+          ...(st.secondaryColor ? { secondaryColor: adjustHexLevels(st.secondaryColor, step) } : {})
+        };
+      };
+      const layers = s.layers.map((l) => {
+        if (l.id !== s.activeLayerId) return l;
+        const updatedFrames: Record<number, Stroke[]> = {};
+        for (const [fKey, strokes] of Object.entries(l.frames)) {
+          const fNum = Number(fKey);
+          if (allFrames || fNum === s.currentFrame) {
+            updatedFrames[fNum] = strokes.map(adjustStroke);
+          } else {
+            updatedFrames[fNum] = strokes;
+          }
+        }
+        let nextDur = l.celDurations;
+        if (!allFrames && l.frames[s.currentFrame] === undefined) {
+          const effective = resolveEffectiveStrokes(l, s.currentFrame);
+          if (effective.length > 0) {
+            updatedFrames[s.currentFrame] = cloneStrokesWithNewIds(effective, 'st-lvl').map(adjustStroke);
+            nextDur = splitCelDurationsAt(l.celDurations, s.currentFrame, true);
+          }
+        }
+        return { ...l, frames: updatedFrames, celDurations: nextDur };
+      });
+      return {
+        undoStack: [...s.undoStack.slice(-39), snapshot],
+        redoStack: [],
+        layers,
+        levelsPreview: null,
+        isDirty: true
+      };
+    }),
+  setPostProcessModalOpen: (postProcessModalOpen) => set({ postProcessModalOpen }),
+  setBlurModalOpen: (blurModalOpen) => set({ blurModalOpen, blurPreview: null }),
+  setBlurPreview: (blurPreview) => set({ blurPreview }),
+  applyLayerBlur: (cfg, allFrames) =>
+    set((s) => {
+      if (isNoopBlur(cfg) || typeof document === 'undefined') return { blurPreview: null };
+      const targetLayer = s.layers.find((l) => l.id === s.activeLayerId);
+      if (!targetLayer || targetLayer.locked || targetLayer.type === 'folder' || targetLayer.type === 'camera') {
+        return { blurPreview: null };
+      }
+      const snapshot = makeSnapshot(s);
+      const srcCanvas = document.createElement('canvas');
+      srcCanvas.width = s.canvasWidth;
+      srcCanvas.height = s.canvasHeight;
+      const sctx = srcCanvas.getContext('2d');
+      const dstCanvas = document.createElement('canvas');
+      if (!sctx) return { blurPreview: null };
+
+      const blurFrameStrokes = (strokes: Stroke[], fNum: number): Stroke[] => {
+        if (!strokes || strokes.length === 0) return strokes;
+        sctx.clearRect(0, 0, s.canvasWidth, s.canvasHeight);
+        for (const st of strokes) {
+          renderStroke(sctx, st);
+        }
+        applyBlurToCanvas(srcCanvas, dstCanvas, cfg);
+        return [
+          {
+            id: `st-blur-${Date.now()}-${fNum}-${Math.random().toString(36).slice(2, 5)}`,
+            tool: 'image',
+            artLayer: 'LA',
+            swatchId: 'sw-black',
+            color: '#ffffff',
+            size: 1,
+            opacity: 1,
+            smoothing: 0,
+            points: [{ x: 0, y: 0 }],
+            imageDataUrl: dstCanvas.toDataURL('image/png'),
+            imageX: 0,
+            imageY: 0,
+            imageW: s.canvasWidth,
+            imageH: s.canvasHeight
+          }
+        ];
+      };
+
+      const layers = s.layers.map((l) => {
+        if (l.id !== s.activeLayerId) return l;
+        const updatedFrames: Record<number, Stroke[]> = {};
+        for (const [fKey, strokes] of Object.entries(l.frames)) {
+          const fNum = Number(fKey);
+          if (allFrames || fNum === s.currentFrame) {
+            updatedFrames[fNum] = blurFrameStrokes(strokes, fNum);
+          } else {
+            updatedFrames[fNum] = strokes;
+          }
+        }
+        let nextDur = l.celDurations;
+        if (!allFrames && l.frames[s.currentFrame] === undefined) {
+          const effective = resolveEffectiveStrokes(l, s.currentFrame);
+          if (effective.length > 0) {
+            updatedFrames[s.currentFrame] = blurFrameStrokes(effective, s.currentFrame);
+            nextDur = splitCelDurationsAt(l.celDurations, s.currentFrame, true);
+          }
+        }
+        return { ...l, frames: updatedFrames, celDurations: nextDur };
+      });
+
+      return {
+        undoStack: [...s.undoStack.slice(-39), snapshot],
+        redoStack: [],
+        layers,
+        blurPreview: null,
+        isDirty: true
+      };
+    }),
+  setPostProcess: (patch) =>
+    set((s) => ({
+      postProcess: { ...s.postProcess, ...patch },
+      isDirty: true
+    })),
+  resetPostProcess: () =>
+    set({
+      postProcess: { ...DEFAULT_POST_PROCESS },
+      isDirty: true
     }),
   resetView: () => set({ zoom: 0.55, panX: 0, panY: 0, rotation: 0, flipX: false }),
   toggleGrid: () => set((s) => ({ showGrid: !s.showGrid })),
   setPerspectiveMode: (perspectiveMode) => set({ perspectiveMode }),
   toggleCameraFrame: () => set((s) => ({ showCameraFrame: !s.showCameraFrame })),
+  toggleCameraViewMode: () => set((s) => ({ cameraViewMode: !s.cameraViewMode })),
+  setCameraViewMode: (cameraViewMode) => set({ cameraViewMode }),
+  toggleCameraGuides: () => set((s) => ({ cameraGuides: !s.cameraGuides })),
   toggleLightTable: () => set((s) => ({ lightTable: !s.lightTable })),
   toggleOnionSkin: () => set((s) => ({ onionSkin: !s.onionSkin })),
   setOnionRange: (onionPrev, onionNext) => set({ onionPrev, onionNext }),
@@ -808,28 +1308,65 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
         currentFrame: s.currentFrame >= s.totalFrames ? (s.loopPlayback ? 1 : s.totalFrames) : s.currentFrame + 1
       };
     }),
+  jumpToNextDrawing: () =>
+    set((s) => {
+      const layer = s.layers.find((l) => l.id === s.activeLayerId);
+      if (!layer) return s;
+      const drawn = Object.entries(layer.frames)
+        .filter(([, strokes]) => strokes && strokes.length > 0)
+        .map(([k]) => Number(k))
+        .sort((a, b) => a - b);
+      if (drawn.length === 0) return s;
+      const next = drawn.find((f) => f > s.currentFrame);
+      return { currentFrame: next ?? drawn[0] };
+    }),
+  jumpToPrevDrawing: () =>
+    set((s) => {
+      const layer = s.layers.find((l) => l.id === s.activeLayerId);
+      if (!layer) return s;
+      const drawn = Object.entries(layer.frames)
+        .filter(([, strokes]) => strokes && strokes.length > 0)
+        .map(([k]) => Number(k))
+        .sort((a, b) => a - b);
+      if (drawn.length === 0) return s;
+      const prev = [...drawn].reverse().find((f) => f < s.currentFrame);
+      return { currentFrame: prev ?? drawn[drawn.length - 1] };
+    }),
   prevFrame: () =>
     set((s) => ({
       currentFrame: s.currentFrame <= 1 ? (s.loopPlayback ? s.totalFrames : 1) : s.currentFrame - 1
     })),
-  setFps: (fps) => set({ fps: Math.max(1, Math.min(120, fps)) }),
+  setFps: (fps) =>
+    set((s) => {
+      if (!Number.isFinite(fps)) return s;
+      return { fps: Math.max(1, Math.min(120, Math.round(fps))), isDirty: true };
+    }),
   setTotalFrames: (totalFrames) =>
     set((s) => {
-      const clamped = Math.max(1, Math.min(1000, totalFrames));
+      if (!Number.isFinite(totalFrames)) return s;
+      const clamped = Math.max(1, Math.min(1000, Math.round(totalFrames)));
       return {
         totalFrames: clamped,
         playEnd: Math.min(s.playEnd, clamped),
         playStart: Math.min(s.playStart, clamped),
-        currentFrame: Math.min(s.currentFrame, clamped)
+        currentFrame: Math.min(s.currentFrame, clamped),
+        isDirty: true
       };
     }),
   setPlayRange: (start, end) =>
     set((s) => {
-      const clampedStart = Math.max(1, Math.min(s.totalFrames, start));
-      const clampedEnd = Math.max(clampedStart, Math.min(s.totalFrames, end));
-      return { playStart: clampedStart, playEnd: clampedEnd };
+      if (!Number.isFinite(start) || !Number.isFinite(end)) return s;
+      const clampedStart = Math.max(1, Math.min(s.totalFrames, Math.round(start)));
+      const clampedEnd = Math.max(clampedStart, Math.min(s.totalFrames, Math.round(end)));
+      return { playStart: clampedStart, playEnd: clampedEnd, isDirty: true };
     }),
-  togglePlay: () => set((s) => ({ isPlaying: !s.isPlaying })),
+  togglePlay: () =>
+    set((s) => {
+      if (!s.isPlaying && !s.loopPlayback && s.currentFrame >= s.playEnd) {
+        return { isPlaying: true, currentFrame: s.playStart };
+      }
+      return { isPlaying: !s.isPlaying };
+    }),
   setIsPlaying: (isPlaying) => set({ isPlaying }),
   toggleLoop: () => set((s) => ({ loopPlayback: !s.loopPlayback })),
 
@@ -847,7 +1384,8 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
       return {
         swatches: [...s.swatches, { id, name, hex, alpha: 1 }],
         activeSwatchId: id,
-        activeColor: hex
+        activeColor: hex,
+        isDirty: true
       };
     }),
   updateSwatch: (id, hex, name) =>
@@ -855,7 +1393,8 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
       activeColor: hex,
       swatches: s.swatches.map((sw) =>
         sw.id === id ? { ...sw, hex, name: name ?? sw.name } : sw
-      )
+      ),
+      isDirty: true
     })),
   deleteSwatch: (id) =>
     set((s) => {
@@ -863,7 +1402,8 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
       const remaining = s.swatches.filter((sw) => sw.id !== id);
       return {
         swatches: remaining,
-        activeSwatchId: s.activeSwatchId === id ? remaining[0].id : s.activeSwatchId
+        activeSwatchId: s.activeSwatchId === id ? remaining[0].id : s.activeSwatchId,
+        isDirty: true
       };
     }),
 
@@ -885,7 +1425,7 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
         nodeY: 110
       };
       return {
-        undoStack: [...s.undoStack.slice(-39), { layers: cloneLayers(s.layers) }],
+        undoStack: [...s.undoStack.slice(-39), makeSnapshot(s)],
         redoStack: [],
         layers: [newLayer, ...s.layers],
         activeLayerId: newLayer.id,
@@ -911,11 +1451,238 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
         nodeY: 80
       };
       return {
-        undoStack: [...s.undoStack.slice(-39), { layers: cloneLayers(s.layers) }],
+        undoStack: [...s.undoStack.slice(-39), makeSnapshot(s)],
         redoStack: [],
         layers: [folder, ...s.layers],
         activeLayerId: folder.id,
         selectedLayerIds: [folder.id],
+        isDirty: true
+      };
+    }),
+
+  addCameraLayer: (name) =>
+    set((s) => {
+      const existing = s.layers.find((l) => l.type === 'camera');
+      if (existing) {
+        return {
+          activeLayerId: existing.id,
+          selectedLayerIds: [existing.id],
+          rightTab: 'properties',
+          showCameraFrame: true
+        };
+      }
+      const cam: DrawingLayer = {
+        id: `camera-${Date.now()}`,
+        name: name || 'Camera_2D',
+        type: 'camera',
+        visible: true,
+        locked: false,
+        solo: false,
+        opacity: 1,
+        tagColor: '#38bdf8',
+        frames: {},
+        cameraKeyframes: {
+          1: { x: 0, y: 0, zoom: 1, rotation: 0, easing: 'ease-in-out' }
+        },
+        nodeX: 120,
+        nodeY: 40
+      };
+      return {
+        undoStack: [...s.undoStack.slice(-39), makeSnapshot(s)],
+        redoStack: [],
+        layers: [cam, ...s.layers],
+        activeLayerId: cam.id,
+        selectedLayerIds: [cam.id],
+        rightTab: 'properties',
+        showCameraFrame: true,
+        isDirty: true
+      };
+    }),
+
+  setCameraKeyframe: (id, frame, kf, pushUndo = true) =>
+    set((s) => {
+      const target = s.layers.find((l) => l.id === id && l.type === 'camera');
+      if (!target || target.locked) return s;
+      const cur = getInterpolatedCamera(target, frame, false);
+      const nextKf: CameraKeyframe = {
+        x: Math.round((kf.x ?? cur.x) * 10) / 10,
+        y: Math.round((kf.y ?? cur.y) * 10) / 10,
+        zoom: Math.max(0.2, Math.min(8, Math.round((kf.zoom ?? cur.zoom) * 1000) / 1000)),
+        rotation: Math.max(-360, Math.min(360, Math.round((kf.rotation ?? cur.rotation) * 10) / 10)),
+        easing: (kf.easing ?? cur.easing ?? 'ease-in-out') as KeyframeEasing
+      };
+      const layers = s.layers.map((l) =>
+        l.id === id
+          ? {
+              ...l,
+              cameraKeyframes: {
+                ...(l.cameraKeyframes || {}),
+                [frame]: nextKf
+              }
+            }
+          : l
+      );
+      return {
+        ...(pushUndo ? { undoStack: [...s.undoStack.slice(-39), makeSnapshot(s)], redoStack: [] } : {}),
+        layers,
+        isDirty: true
+      };
+    }),
+
+  deleteCameraKeyframe: (id, frame) =>
+    set((s) => {
+      const target = s.layers.find((l) => l.id === id && l.type === 'camera');
+      if (!target || target.locked || !target.cameraKeyframes?.[frame]) return s;
+      const nextKfs = { ...target.cameraKeyframes };
+      delete nextKfs[frame];
+      return {
+        undoStack: [...s.undoStack.slice(-39), makeSnapshot(s)],
+        redoStack: [],
+        layers: s.layers.map((l) => (l.id === id ? { ...l, cameraKeyframes: nextKfs } : l)),
+        isDirty: true
+      };
+    }),
+
+  moveCameraKeyframe: (id, fromFrame, toFrame) =>
+    set((s) => {
+      if (fromFrame === toFrame || toFrame < 1 || toFrame > s.totalFrames) return s;
+      const target = s.layers.find((l) => l.id === id && l.type === 'camera');
+      if (!target || target.locked || !target.cameraKeyframes?.[fromFrame]) return s;
+      const nextKfs = { ...target.cameraKeyframes };
+      const data = nextKfs[fromFrame];
+      delete nextKfs[fromFrame];
+      nextKfs[toFrame] = data;
+      return {
+        undoStack: [...s.undoStack.slice(-39), makeSnapshot(s)],
+        redoStack: [],
+        layers: s.layers.map((l) => (l.id === id ? { ...l, cameraKeyframes: nextKfs } : l)),
+        isDirty: true
+      };
+    }),
+
+  applyCameraShake: (id, startFrame, durationFrames, intensityPx) =>
+    set((s) => {
+      const target = s.layers.find((l) => l.id === id && l.type === 'camera');
+      if (!target || target.locked) return s;
+      const dur = Math.max(2, Math.min(48, Math.round(durationFrames)));
+      const amp = Math.max(2, Math.min(200, intensityPx));
+      const base = getInterpolatedCamera(target, startFrame);
+      const nextKfs = { ...(target.cameraKeyframes || {}) };
+      // Deterministic damped impact shake returning cleanly to exact baseline!
+      for (let i = 0; i <= dur; i++) {
+        const f = startFrame + i;
+        if (f > s.totalFrames) break;
+        if (i === dur) {
+          nextKfs[f] = {
+            x: Math.round(base.x * 10) / 10,
+            y: Math.round(base.y * 10) / 10,
+            zoom: base.zoom,
+            rotation: base.rotation,
+            easing: 'ease-out'
+          };
+        } else {
+          const decay = Math.pow(1 - i / dur, 1.45);
+          const signX = i % 2 === 0 ? 1 : -1;
+          const signY = (i + 1) % 3 === 0 ? -1 : 1;
+          const jitterX = Math.sin(i * 2.7 + 0.5) * 0.45 + 0.55;
+          const jitterY = Math.cos(i * 3.1 + 1.1) * 0.5 + 0.5;
+          nextKfs[f] = {
+            x: Math.round((base.x + signX * amp * decay * jitterX) * 10) / 10,
+            y: Math.round((base.y + signY * amp * 0.72 * decay * jitterY) * 10) / 10,
+            zoom: base.zoom,
+            rotation: Math.round((base.rotation + signX * Math.min(3.5, amp * 0.04) * decay) * 10) / 10,
+            easing: 'linear'
+          };
+        }
+      }
+      return {
+        undoStack: [...s.undoStack.slice(-39), makeSnapshot(s)],
+        redoStack: [],
+        layers: s.layers.map((l) => (l.id === id ? { ...l, cameraKeyframes: nextKfs } : l)),
+        isDirty: true
+      };
+    }),
+
+  addCameraEffect: (layerId, type, startFrame) =>
+    set((s) => {
+      const target = s.layers.find((l) => l.id === layerId && l.type === 'camera');
+      if (!target || target.locked) return s;
+      const meta = CAMERA_EFFECT_PRESETS.find((p) => p.type === type) || CAMERA_EFFECT_PRESETS[0];
+      const fx: CameraEffect = {
+        id: `camfx-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+        type: meta.type,
+        name: meta.label,
+        enabled: true,
+        startFrame: Math.max(1, Math.min(s.totalFrames, startFrame ?? s.currentFrame)),
+        duration: meta.defaultDuration,
+        wholeScene: meta.defaultWholeScene,
+        intensity: meta.defaultIntensity,
+        speed: meta.defaultSpeed,
+        seed: Math.floor(Math.random() * 1000) + 1
+      };
+      return {
+        undoStack: [...s.undoStack.slice(-39), makeSnapshot(s)],
+        redoStack: [],
+        layers: s.layers.map((l) =>
+          l.id === layerId ? { ...l, cameraEffects: [...(l.cameraEffects || []), fx] } : l
+        ),
+        isDirty: true
+      };
+    }),
+
+  updateCameraEffect: (layerId, effectId, patch, pushUndo = false) =>
+    set((s) => {
+      const target = s.layers.find((l) => l.id === layerId && l.type === 'camera');
+      if (!target || target.locked) return s;
+      return {
+        ...(pushUndo ? { undoStack: [...s.undoStack.slice(-39), makeSnapshot(s)], redoStack: [] } : {}),
+        layers: s.layers.map((l) =>
+          l.id === layerId
+            ? {
+                ...l,
+                cameraEffects: (l.cameraEffects || []).map((fx) =>
+                  fx.id === effectId ? { ...fx, ...patch } : fx
+                )
+              }
+            : l
+        ),
+        isDirty: true
+      };
+    }),
+
+  removeCameraEffect: (layerId, effectId) =>
+    set((s) => {
+      const target = s.layers.find((l) => l.id === layerId && l.type === 'camera');
+      if (!target || target.locked) return s;
+      return {
+        undoStack: [...s.undoStack.slice(-39), makeSnapshot(s)],
+        redoStack: [],
+        layers: s.layers.map((l) =>
+          l.id === layerId
+            ? { ...l, cameraEffects: (l.cameraEffects || []).filter((fx) => fx.id !== effectId) }
+            : l
+        ),
+        isDirty: true
+      };
+    }),
+
+  toggleCameraEffect: (layerId, effectId) =>
+    set((s) => {
+      const target = s.layers.find((l) => l.id === layerId && l.type === 'camera');
+      if (!target || target.locked) return s;
+      return {
+        undoStack: [...s.undoStack.slice(-39), makeSnapshot(s)],
+        redoStack: [],
+        layers: s.layers.map((l) =>
+          l.id === layerId
+            ? {
+                ...l,
+                cameraEffects: (l.cameraEffects || []).map((fx) =>
+                  fx.id === effectId ? { ...fx, enabled: !fx.enabled } : fx
+                )
+              }
+            : l
+        ),
         isDirty: true
       };
     }),
@@ -927,13 +1694,13 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
       const orig = s.layers[idx];
       const copy: DrawingLayer = {
         ...JSON.parse(JSON.stringify(orig)),
-        id: `layer-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+        id: `${orig.type === 'folder' ? 'folder' : 'layer'}-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
         name: `${orig.name}_Copy`
       };
       const next = [...s.layers];
       next.splice(idx, 0, copy);
       return {
-        undoStack: [...s.undoStack.slice(-39), { layers: cloneLayers(s.layers) }],
+        undoStack: [...s.undoStack.slice(-39), makeSnapshot(s)],
         redoStack: [],
         layers: next,
         activeLayerId: copy.id,
@@ -948,16 +1715,102 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
       if (idx === -1 || idx >= s.layers.length - 1) return s;
       const top = s.layers[idx];
       const bottom = s.layers[idx + 1];
-      const mergedFrames: Record<number, Stroke[]> = JSON.parse(JSON.stringify(bottom.frames));
-      for (const [fKey, strokes] of Object.entries(top.frames)) {
-        const f = Number(fKey);
-        mergedFrames[f] = [...(mergedFrames[f] || []), ...JSON.parse(JSON.stringify(strokes))];
+      // Prevent merging folders, cameras, or locked layers
+      if (
+        top.type === 'folder' ||
+        bottom.type === 'folder' ||
+        top.type === 'camera' ||
+        bottom.type === 'camera' ||
+        top.locked ||
+        bottom.locked
+      ) {
+        return s;
       }
+
+      // Check if safe vector append is possible or if raster compositing is required
+      // (erasers, alphaLock, clippingMask, blendMode, opacity < 1, effects, or keyframes require pixel compositing so top erasers never erase bottom!)
+      const topHasDestructiveOrMasked =
+        Boolean(top.clippingMask) ||
+        top.opacity < 0.999 ||
+        Boolean(top.blendMode && top.blendMode !== 'source-over') ||
+        Boolean(top.effects && (top.effects.blur > 0 || top.effects.glow > 0 || top.effects.dropShadow)) ||
+        Boolean(top.keyframes && Object.keys(top.keyframes).length > 0) ||
+        Object.values(top.frames).some((sts) =>
+          sts.some((st) => st.tool === 'eraser' || st.tool === 'erase_poly' || st.alphaLock)
+        );
+
+      let mergedFrames: Record<number, Stroke[]>;
+      let mergedDur: Record<number, number>;
+
+      if (topHasDestructiveOrMasked && typeof document !== 'undefined') {
+        const frameSet = new Set<number>();
+        for (const k of Object.keys(bottom.frames)) frameSet.add(Number(k));
+        for (const k of Object.keys(top.frames)) frameSet.add(Number(k));
+        const sortedFrames = Array.from(frameSet).sort((a, b) => a - b);
+        const compCanvas = document.createElement('canvas');
+        compCanvas.width = s.canvasWidth;
+        compCanvas.height = s.canvasHeight;
+        // Render strictly [top, bottom] with bottom at 100% opacity (so bottom.opacity isn't double-applied!)
+        const pairLayers: DrawingLayer[] = [
+          { ...top, visible: true, parentId: null },
+          { ...bottom, visible: true, parentId: null, opacity: 1 }
+        ];
+        mergedFrames = {};
+        for (const f of sortedFrames) {
+          const topEff = resolveEffectiveStrokes(top, f);
+          const botEff = resolveEffectiveStrokes(bottom, f);
+          if (topEff.length === 0 && botEff.length === 0) {
+            mergedFrames[f] = [];
+            continue;
+          }
+          renderFrameToCanvas(compCanvas, pairLayers, f, s.canvasWidth, s.canvasHeight, 'transparent', false);
+          mergedFrames[f] = [
+            {
+              id: `st-mrg-${Date.now()}-${f}-${Math.random().toString(36).slice(2, 5)}`,
+              tool: 'image',
+              artLayer: 'LA',
+              swatchId: 'sw-black',
+              color: '#ffffff',
+              size: 1,
+              opacity: 1,
+              smoothing: 0,
+              points: [{ x: 0, y: 0 }],
+              imageDataUrl: compCanvas.toDataURL('image/png'),
+              imageX: 0,
+              imageY: 0,
+              imageW: s.canvasWidth,
+              imageH: s.canvasHeight
+            }
+          ];
+        }
+        mergedDur = { ...(bottom.celDurations || {}) };
+        for (const [k, d] of Object.entries(top.celDurations || {})) {
+          const f = Number(k);
+          mergedDur[f] = Math.max(mergedDur[f] || 1, d);
+        }
+      } else {
+        mergedFrames = cloneLayers([bottom])[0].frames;
+        for (const [fKey, strokes] of Object.entries(top.frames)) {
+          const f = Number(fKey);
+          const botBase =
+            mergedFrames[f] !== undefined
+              ? mergedFrames[f]
+              : cloneStrokesWithNewIds(resolveEffectiveStrokes(bottom, f), 'st-mrg-b');
+          const clonedTop = cloneStrokesWithNewIds(strokes, 'st-mrg');
+          mergedFrames[f] = [...botBase, ...clonedTop];
+        }
+        mergedDur = { ...(bottom.celDurations || {}) };
+        for (const [k, d] of Object.entries(top.celDurations || {})) {
+          const f = Number(k);
+          mergedDur[f] = Math.max(mergedDur[f] || 1, d);
+        }
+      }
+
       const next = s.layers
-        .map((l, i) => (i === idx + 1 ? { ...l, frames: mergedFrames } : l))
+        .map((l, i) => (i === idx + 1 ? { ...l, frames: mergedFrames, celDurations: mergedDur } : l))
         .filter((_, i) => i !== idx);
       return {
-        undoStack: [...s.undoStack.slice(-39), { layers: cloneLayers(s.layers) }],
+        undoStack: [...s.undoStack.slice(-39), makeSnapshot(s)],
         redoStack: [],
         layers: next,
         activeLayerId: bottom.id,
@@ -1001,7 +1854,7 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
         nodeY: 110
       };
       return {
-        undoStack: [...s.undoStack.slice(-39), { layers: cloneLayers(s.layers) }],
+        undoStack: [...s.undoStack.slice(-39), makeSnapshot(s)],
         redoStack: [],
         layers: [newLayer, ...s.layers],
         activeLayerId: newLayer.id,
@@ -1010,13 +1863,103 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
       };
     }),
 
+  importArtworkLayersBatch: (items) =>
+    set((s) => {
+      if (!items || items.length === 0) return s;
+      const colors = ['#4f9cf9', '#f59e0b', '#10b981', '#ec4899', '#8b5cf6', '#06b6d4'];
+      const now = Date.now();
+      const created: DrawingLayer[] = [];
+      const folderIdByKey = new Map<string, string>();
+      const folderIdByName = new Map<string, string>();
+      items.forEach((item, i) => {
+        const lid = `${item.type === 'folder' ? 'folder' : 'layer'}-${now}-${i}-${Math.random().toString(36).slice(2, 5)}`;
+        const resolvedParentId = item.parentKey
+          ? folderIdByKey.get(item.parentKey) || null
+          : item.parentName
+            ? folderIdByName.get(item.parentName) || null
+            : null;
+        if (item.type === 'folder') {
+          if (item.folderKey) folderIdByKey.set(item.folderKey, lid);
+          folderIdByName.set(item.name, lid);
+          created.push({
+            id: lid,
+            name: item.name || `Group_${i + 1}`,
+            type: 'folder',
+            parentId: resolvedParentId,
+            visible: item.visible ?? true,
+            locked: false,
+            solo: false,
+            collapsed: false,
+            opacity: item.opacity ?? 1,
+            tagColor: '#eab308',
+            frames: {},
+            nodeX: 120,
+            nodeY: 80
+          });
+        } else if (item.dataUrl) {
+          const x = item.x ?? 0;
+          const y = item.y ?? 0;
+          const w = item.w ?? s.canvasWidth;
+          const h = item.h ?? s.canvasHeight;
+          const imgStroke: Stroke = {
+            id: `st-img-${now}-${i}-${Math.random().toString(36).slice(2, 6)}`,
+            tool: 'image',
+            artLayer: 'LA',
+            swatchId: 'sw-black',
+            color: '#ffffff',
+            size: 1,
+            opacity: 1,
+            smoothing: 0,
+            points: [{ x, y }],
+            imageDataUrl: item.dataUrl,
+            imageX: x,
+            imageY: y,
+            imageW: w,
+            imageH: h
+          };
+          created.push({
+            id: lid,
+            name: item.name || `Imported_${i + 1}`,
+            type: 'drawing',
+            parentId: resolvedParentId,
+            visible: item.visible ?? true,
+            locked: false,
+            solo: false,
+            holdFrames: true,
+            opacity: item.opacity ?? 1,
+            blendMode: item.blendMode,
+            tagColor: colors[(s.layers.length + i) % colors.length],
+            frames: { [s.currentFrame]: [imgStroke] },
+            nodeX: 120 + i * 140,
+            nodeY: 110
+          });
+        }
+      });
+      if (created.length === 0) return s;
+      const firstDrawing = created.find((l) => l.type !== 'folder') || created[0];
+      return {
+        undoStack: [...s.undoStack.slice(-39), makeSnapshot(s)],
+        redoStack: [],
+        layers: [...created, ...s.layers],
+        activeLayerId: firstDrawing.id,
+        selectedLayerIds: [firstDrawing.id],
+        isDirty: true
+      };
+    }),
+
   deleteLayer: (id) =>
     set((s) => {
       if (s.layers.length <= 1) return s;
-      const remaining = s.layers.filter((l) => l.id !== id);
-      const nextActive = s.activeLayerId === id ? remaining[0].id : s.activeLayerId;
+      // Clear parentId on any children if deleting a folder
+      const remaining = s.layers
+        .filter((l) => l.id !== id)
+        .map((l) => (l.parentId === id ? { ...l, parentId: null } : l));
+      // Never leave a scene with zero drawing layers (only folders/cameras)
+      if (!remaining.some((l) => l.type === 'drawing')) return s;
+      const fallbackActive = remaining.find((l) => l.type === 'drawing')?.id || remaining[0].id;
+      const nextActive = s.activeLayerId === id ? fallbackActive : s.activeLayerId;
       return {
-        undoStack: [...s.undoStack.slice(-39), { layers: cloneLayers(s.layers) }],
+        undoStack: [...s.undoStack.slice(-39), makeSnapshot(s)],
         redoStack: [],
         layers: remaining,
         activeLayerId: nextActive,
@@ -1028,23 +1971,29 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
   deleteSelectedLayers: () =>
     set((s) => {
       const targetIds = new Set(s.selectedLayerIds.length > 0 ? s.selectedLayerIds : [s.activeLayerId]);
-      const remaining = s.layers.filter((l) => !targetIds.has(l.id));
-      if (remaining.length === 0) {
-        // Keep at least one layer (the last one) so scene is never empty
-        const kept = s.layers[s.layers.length - 1];
+      const remaining = s.layers
+        .filter((l) => !targetIds.has(l.id))
+        .map((l) => (l.parentId && targetIds.has(l.parentId) ? { ...l, parentId: null } : l));
+      if (remaining.length === 0 || !remaining.some((l) => l.type === 'drawing')) {
+        // Keep at least one drawing layer so scene is never empty or folder/camera-only
+        const kept = [...s.layers].reverse().find((l) => l.type === 'drawing') || s.layers[s.layers.length - 1];
         if (!kept || s.layers.length <= 1) return s;
+        const cleanKept = kept.parentId ? { ...kept, parentId: null } : kept;
+        const nextLayers = remaining.some((l) => l.id === cleanKept.id) ? remaining : [...remaining, cleanKept];
+        if (nextLayers.length === s.layers.length) return s;
         return {
-          undoStack: [...s.undoStack.slice(-39), { layers: cloneLayers(s.layers) }],
+          undoStack: [...s.undoStack.slice(-39), makeSnapshot(s)],
           redoStack: [],
-          layers: [kept],
-          activeLayerId: kept.id,
-          selectedLayerIds: [kept.id],
+          layers: nextLayers,
+          activeLayerId: cleanKept.id,
+          selectedLayerIds: [cleanKept.id],
           isDirty: true
         };
       }
-      const nextActive = targetIds.has(s.activeLayerId) ? remaining[0].id : s.activeLayerId;
+      const fallbackActive = remaining.find((l) => l.type !== 'folder')?.id || remaining[0].id;
+      const nextActive = targetIds.has(s.activeLayerId) ? fallbackActive : s.activeLayerId;
       return {
-        undoStack: [...s.undoStack.slice(-39), { layers: cloneLayers(s.layers) }],
+        undoStack: [...s.undoStack.slice(-39), makeSnapshot(s)],
         redoStack: [],
         layers: remaining,
         activeLayerId: nextActive,
@@ -1057,12 +2006,15 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
   toggleSelectLayer: (id, multi, range = false) =>
     set((s) => {
       if (range) {
-        const anchorIdx = s.layers.findIndex((l) => l.id === s.activeLayerId);
-        const targetIdx = s.layers.findIndex((l) => l.id === id);
+        // Only include visible rows (skip children inside collapsed folders)
+        const collapsedFolders = new Set(s.layers.filter((l) => l.type === 'folder' && l.collapsed).map((l) => l.id));
+        const visibleLayers = s.layers.filter((l) => !l.parentId || !collapsedFolders.has(l.parentId));
+        const anchorIdx = visibleLayers.findIndex((l) => l.id === s.activeLayerId);
+        const targetIdx = visibleLayers.findIndex((l) => l.id === id);
         if (anchorIdx !== -1 && targetIdx !== -1) {
           const start = Math.min(anchorIdx, targetIdx);
           const end = Math.max(anchorIdx, targetIdx);
-          const rangeIds = s.layers.slice(start, end + 1).map((l) => l.id);
+          const rangeIds = visibleLayers.slice(start, end + 1).map((l) => l.id);
           return { activeLayerId: id, selectedLayerIds: rangeIds };
         }
       }
@@ -1070,38 +2022,68 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
         return { activeLayerId: id, selectedLayerIds: [id] };
       }
       const exists = s.selectedLayerIds.includes(id);
-      const next = exists
-        ? s.selectedLayerIds.length > 1
-          ? s.selectedLayerIds.filter((x) => x !== id)
-          : s.selectedLayerIds
-        : [...s.selectedLayerIds, id];
-      return { activeLayerId: id, selectedLayerIds: next };
+      if (exists) {
+        if (s.selectedLayerIds.length <= 1) return s;
+        const next = s.selectedLayerIds.filter((x) => x !== id);
+        const nextActive = s.activeLayerId === id ? next[next.length - 1] : s.activeLayerId;
+        return { activeLayerId: nextActive, selectedLayerIds: next };
+      }
+      return { activeLayerId: id, selectedLayerIds: [...s.selectedLayerIds, id] };
     }),
   reorderLayer: (fromIndex, toIndex) =>
     set((s) => {
       if (fromIndex === toIndex || fromIndex < 0 || toIndex < 0 || fromIndex >= s.layers.length || toIndex >= s.layers.length) {
         return s;
       }
+      const moving = s.layers[fromIndex];
       const next = [...s.layers];
+      // If moving a folder, move its children right along with it!
+      if (moving.type === 'folder') {
+        const children = next.filter((l) => l.parentId === moving.id);
+        const childIds = new Set(children.map((c) => c.id));
+        const targetLayer = s.layers[toIndex];
+        if (childIds.has(targetLayer.id)) return s;
+        const withoutGroup = next.filter((l) => l.id !== moving.id && !childIds.has(l.id));
+        const targetInWithout = withoutGroup.findIndex((l) => l.id === targetLayer.id);
+        const insertPos = targetInWithout === -1 ? withoutGroup.length : (fromIndex < toIndex ? targetInWithout + 1 : targetInWithout);
+        withoutGroup.splice(insertPos, 0, moving, ...children);
+        return {
+          undoStack: [...s.undoStack.slice(-39), makeSnapshot(s)],
+          redoStack: [],
+          layers: withoutGroup,
+          isDirty: true
+        };
+      }
       const [moved] = next.splice(fromIndex, 1);
       next.splice(toIndex, 0, moved);
-      return { layers: next };
+      return {
+        undoStack: [...s.undoStack.slice(-39), makeSnapshot(s)],
+        redoStack: [],
+        layers: next,
+        isDirty: true
+      };
     }),
   setLayerBlendMode: (id, blendMode) =>
     set((s) => ({
-      layers: s.layers.map((l) => (l.id === id ? { ...l, blendMode } : l))
+      undoStack: [...s.undoStack.slice(-39), makeSnapshot(s)],
+      redoStack: [],
+      layers: s.layers.map((l) => (l.id === id ? { ...l, blendMode } : l)),
+      isDirty: true
     })),
   toggleLayerVisibility: (id) =>
     set((s) => ({
-      layers: s.layers.map((l) => (l.id === id ? { ...l, visible: !l.visible } : l))
+      layers: s.layers.map((l) => (l.id === id ? { ...l, visible: !l.visible } : l)),
+      isDirty: true
     })),
   toggleLayerLock: (id) =>
     set((s) => ({
-      layers: s.layers.map((l) => (l.id === id ? { ...l, locked: !l.locked } : l))
+      layers: s.layers.map((l) => (l.id === id ? { ...l, locked: !l.locked } : l)),
+      isDirty: true
     })),
   toggleLayerSolo: (id) =>
     set((s) => ({
-      layers: s.layers.map((l) => (l.id === id ? { ...l, solo: !l.solo } : l))
+      layers: s.layers.map((l) => (l.id === id ? { ...l, solo: !l.solo } : l)),
+      isDirty: true
     })),
   toggleFolderCollapse: (id) =>
     set((s) => ({
@@ -1109,46 +2091,79 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
     })),
   setLayerParent: (id, parentId) =>
     set((s) => ({
+      undoStack: [...s.undoStack.slice(-39), makeSnapshot(s)],
+      redoStack: [],
       layers: s.layers.map((l) => (l.id === id && l.id !== parentId ? { ...l, parentId } : l)),
       isDirty: true
     })),
   setCelDuration: (layerId, startFrame, duration) =>
-    set((s) => ({
-      layers: s.layers.map((l) => {
-        if (l.id !== layerId) return l;
-        return {
-          ...l,
-          celDurations: {
-            ...(l.celDurations || {}),
-            [startFrame]: Math.max(1, Math.min(200, Math.round(duration)))
-          }
-        };
-      }),
-      isDirty: true
-    })),
+    set((s) => {
+      const target = s.layers.find((l) => l.id === layerId);
+      if (!target || target.locked || target.type === 'folder') return s;
+      return {
+        layers: s.layers.map((l) => {
+          if (l.id !== layerId) return l;
+          const nextExisting = Object.keys(l.frames)
+            .map(Number)
+            .filter((f) => f > startFrame)
+            .sort((a, b) => a - b)[0];
+          const maxDur = nextExisting
+            ? Math.max(1, nextExisting - startFrame)
+            : Math.max(1, s.totalFrames - startFrame + 1);
+          const clamped = Math.max(1, Math.min(maxDur, Math.round(duration)));
+          return {
+            ...l,
+            celDurations: {
+              ...(l.celDurations || {}),
+              [startFrame]: clamped
+            }
+          };
+        }),
+        isDirty: true
+      };
+    }),
   moveCelFrame: (layerId, fromFrame, toFrame) =>
     set((s) => {
       if (fromFrame === toFrame || toFrame < 1 || toFrame > s.totalFrames) return s;
-      const snapshot = { layers: cloneLayers(s.layers) };
+      const target = s.layers.find((l) => l.id === layerId);
+      if (!target || target.locked || target.type === 'folder' || target.frames[fromFrame] === undefined) return s;
+      const snapshot = makeSnapshot(s);
       const layers = s.layers.map((l) => {
         if (l.id !== layerId) return l;
         const srcStrokes = l.frames[fromFrame];
-        if (!srcStrokes) return l;
+        if (srcStrokes === undefined) return l;
         const nextFrames = { ...l.frames };
         delete nextFrames[fromFrame];
         nextFrames[toFrame] = srcStrokes;
 
-        const nextDur = { ...(l.celDurations || {}) };
-        if (nextDur[fromFrame]) {
-          nextDur[toFrame] = nextDur[fromFrame];
-          delete nextDur[fromFrame];
+        let nextDur = { ...(l.celDurations || {}) };
+        const movedDur = nextDur[fromFrame];
+        delete nextDur[fromFrame];
+        delete nextDur[toFrame];
+        nextDur = splitCelDurationsAt(nextDur, toFrame, false);
+        if (movedDur) {
+          const nextAfter = Object.keys(nextFrames)
+            .map(Number)
+            .filter((f) => f > toFrame)
+            .sort((a, b) => a - b)[0];
+          const maxDur = nextAfter
+            ? Math.max(1, nextAfter - toFrame)
+            : Math.max(1, s.totalFrames - toFrame + 1);
+          nextDur[toFrame] = Math.min(movedDur, maxDur);
         }
         const nextTags = { ...(l.frameTags || {}) };
-        if (nextTags[fromFrame]) {
-          nextTags[toFrame] = nextTags[fromFrame];
-          delete nextTags[fromFrame];
-        }
-        return { ...l, frames: nextFrames, celDurations: nextDur, frameTags: nextTags };
+        const movedTag = nextTags[fromFrame];
+        delete nextTags[fromFrame];
+        delete nextTags[toFrame];
+        if (movedTag) nextTags[toFrame] = movedTag;
+
+        const nextKfs = { ...(l.keyframes || {}) };
+        const movedKf = nextKfs[fromFrame];
+        delete nextKfs[fromFrame];
+        delete nextKfs[toFrame];
+        if (movedKf) nextKfs[toFrame] = movedKf;
+
+        return { ...l, frames: nextFrames, celDurations: nextDur, frameTags: nextTags, keyframes: nextKfs };
       });
       return {
         undoStack: [...s.undoStack.slice(-39), snapshot],
@@ -1160,7 +2175,9 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
     }),
   substituteCel: (layerId, targetFrame, sourceFrame) =>
     set((s) => {
-      const snapshot = { layers: cloneLayers(s.layers) };
+      const target = s.layers.find((l) => l.id === layerId);
+      if (!target || target.locked || target.type === 'folder' || !target.frames[sourceFrame]) return s;
+      const snapshot = makeSnapshot(s);
       const layers = s.layers.map((l) => {
         if (l.id !== layerId) return l;
         const src = l.frames[sourceFrame];
@@ -1169,8 +2186,9 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
           ...l,
           frames: {
             ...l.frames,
-            [targetFrame]: JSON.parse(JSON.stringify(src))
-          }
+            [targetFrame]: cloneStrokesWithNewIds(src, 'st-sub')
+          },
+          celDurations: splitCelDurationsAt(l.celDurations, targetFrame, true)
         };
       });
       return {
@@ -1205,20 +2223,62 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
       const a = Math.min(startFrame, endFrame);
       const b = Math.max(startFrame, endFrame);
       if (a === b) return s;
-      const snapshot = { layers: cloneLayers(s.layers) };
+      const target = s.layers.find((l) => l.id === layerId);
+      if (!target || target.locked || target.type === 'folder') return s;
+      const snapshot = makeSnapshot(s);
       const layers = s.layers.map((l) => {
         if (l.id !== layerId) return l;
         const nextFrames = { ...l.frames };
-        const slice: (Stroke[] | undefined)[] = [];
+        const nextDur = { ...(l.celDurations || {}) };
+        const nextTags = { ...(l.frameTags || {}) };
+        const nextKfs = { ...(l.keyframes || {}) };
+
+        // Trim any earlier stretched cel that spills into [a, b]
+        for (const [k, d] of Object.entries(nextDur)) {
+          const cf = Number(k);
+          if (cf < a && cf + d - 1 >= a) {
+            nextDur[cf] = Math.max(1, a - cf);
+          }
+        }
+
+        // Collect all cels starting in [a, b] with their effective duration clamped to [a, b]
+        const cels: Array<{
+          start: number;
+          dur: number;
+          strokes?: Stroke[];
+          tag?: PoseTag;
+          kf?: LayerTransformKeyframe;
+        }> = [];
         for (let f = a; f <= b; f++) {
-          slice.push(l.frames[f]);
+          const hasAny =
+            l.frames[f] !== undefined || nextTags[f] !== undefined || nextKfs[f] !== undefined;
+          if (hasAny) {
+            const rawDur = Math.max(1, nextDur[f] || 1);
+            const clampedDur = Math.min(rawDur, b - f + 1);
+            cels.push({
+              start: f,
+              dur: clampedDur,
+              strokes: l.frames[f],
+              tag: nextTags[f],
+              kf: nextKfs[f]
+            });
+          }
           delete nextFrames[f];
+          delete nextDur[f];
+          delete nextTags[f];
+          delete nextKfs[f];
         }
-        slice.reverse();
-        for (let i = 0; i < slice.length; i++) {
-          if (slice[i] !== undefined) nextFrames[a + i] = slice[i]!;
+
+        // Mirror each cel block [start .. start+dur-1] cleanly inside [a, b] so nothing spills out!
+        for (const cel of cels) {
+          const celEnd = cel.start + cel.dur - 1;
+          const newStart = a + (b - celEnd);
+          if (cel.strokes !== undefined) nextFrames[newStart] = cel.strokes;
+          if (cel.dur > 1) nextDur[newStart] = cel.dur;
+          if (cel.tag !== undefined) nextTags[newStart] = cel.tag;
+          if (cel.kf !== undefined) nextKfs[newStart] = cel.kf;
         }
-        return { ...l, frames: nextFrames };
+        return { ...l, frames: nextFrames, celDurations: nextDur, frameTags: nextTags, keyframes: nextKfs };
       });
       return {
         undoStack: [...s.undoStack.slice(-39), snapshot],
@@ -1231,18 +2291,30 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
     set((s) => {
       const a = Math.min(startFrame, endFrame);
       const b = Math.max(startFrame, endFrame);
-      const snapshot = { layers: cloneLayers(s.layers) };
+      const target = s.layers.find((l) => l.id === layerId);
+      if (!target || target.locked || target.type === 'folder') return s;
+      const snapshot = makeSnapshot(s);
       const layers = s.layers.map((l) => {
         if (l.id !== layerId) return l;
         const nextFrames = { ...l.frames };
         const nextDur = { ...(l.celDurations || {}) };
         const nextTags = { ...(l.frameTags || {}) };
+        const nextKfs = { ...(l.keyframes || {}) };
         for (let f = a; f <= b; f++) {
           delete nextFrames[f];
           delete nextDur[f];
           delete nextTags[f];
+          delete nextKfs[f];
         }
-        return { ...l, frames: nextFrames, celDurations: nextDur, frameTags: nextTags };
+        // Trim any earlier stretched Cel whose tail overlaps [a, b]
+        for (const [k, rawDur] of Object.entries(nextDur)) {
+          const start = Number(k);
+          const dur = Math.max(1, rawDur || 1);
+          if (start < a && start + dur - 1 >= a) {
+            nextDur[start] = Math.max(1, a - start);
+          }
+        }
+        return { ...l, frames: nextFrames, celDurations: nextDur, frameTags: nextTags, keyframes: nextKfs };
       });
       return {
         undoStack: [...s.undoStack.slice(-39), snapshot],
@@ -1257,21 +2329,56 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
       const a = Math.min(startFrame, endFrame);
       const b = Math.max(startFrame, endFrame);
       if (a + delta < 1 || b + delta > s.totalFrames) return s;
-      const snapshot = { layers: cloneLayers(s.layers) };
+      const target = s.layers.find((l) => l.id === layerId);
+      if (!target || target.locked || target.type === 'folder') return s;
+      const snapshot = makeSnapshot(s);
       const layers = s.layers.map((l) => {
         if (l.id !== layerId) return l;
         const nextFrames = { ...l.frames };
-        const temp: Record<number, Stroke[]> = {};
+        let nextDur = { ...(l.celDurations || {}) };
+        const nextTags = { ...(l.frameTags || {}) };
+        const nextKfs = { ...(l.keyframes || {}) };
+        const tmpF: Record<number, Stroke[]> = {};
+        const tmpD: Record<number, number> = {};
+        const tmpT: Record<number, PoseTag> = {};
+        const tmpK: Record<number, LayerTransformKeyframe> = {};
         for (let f = a; f <= b; f++) {
           if (l.frames[f] !== undefined) {
-            temp[f + delta] = l.frames[f];
+            tmpF[f + delta] = l.frames[f];
             delete nextFrames[f];
           }
+          if (nextDur[f] !== undefined) {
+            tmpD[f + delta] = nextDur[f];
+            delete nextDur[f];
+          }
+          if (nextTags[f] !== undefined) {
+            tmpT[f + delta] = nextTags[f];
+            delete nextTags[f];
+          }
+          if (nextKfs[f] !== undefined) {
+            tmpK[f + delta] = nextKfs[f];
+            delete nextKfs[f];
+          }
         }
-        for (const [k, v] of Object.entries(temp)) {
-          nextFrames[Number(k)] = v;
+        // Clear destination metadata before writing moved frames so overwritten cels don't leak old durations/tags/keyframes
+        for (let f = a; f <= b; f++) {
+          const dest = f + delta;
+          delete nextDur[dest];
+          delete nextTags[dest];
+          delete nextKfs[dest];
         }
-        return { ...l, frames: nextFrames };
+        for (const [k, v] of Object.entries(tmpF)) {
+          const nf = Number(k);
+          nextFrames[nf] = v;
+          nextDur = splitCelDurationsAt(nextDur, nf, false);
+        }
+        for (const [k, v] of Object.entries(tmpD)) {
+          const nf = Number(k);
+          nextDur[nf] = Math.max(1, Math.min(v, s.totalFrames - nf + 1));
+        }
+        for (const [k, v] of Object.entries(tmpT)) nextTags[Number(k)] = v;
+        for (const [k, v] of Object.entries(tmpK)) nextKfs[Number(k)] = v;
+        return { ...l, frames: nextFrames, celDurations: nextDur, frameTags: nextTags, keyframes: nextKfs };
       });
       return {
         undoStack: [...s.undoStack.slice(-39), snapshot],
@@ -1344,23 +2451,27 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
   copyCurrentFrame: () =>
     set((s) => {
       const layer = s.layers.find((l) => l.id === s.activeLayerId);
-      const strokes = layer?.frames[s.currentFrame] || [];
-      return { clipboardStrokes: JSON.parse(JSON.stringify(strokes)) };
+      if (!layer || layer.type === 'folder') return s;
+      const strokes = resolveEffectiveStrokes(layer, s.currentFrame);
+      return { clipboardStrokes: cloneStrokesWithNewIds(strokes, 'st-clip') };
     }),
   pasteToCurrentFrame: () =>
     set((s) => {
       if (s.clipboardStrokes.length === 0) return s;
-      const snapshot = { layers: cloneLayers(s.layers) };
-      const pasted = s.clipboardStrokes.map((st) => ({
-        ...JSON.parse(JSON.stringify(st)),
-        id: `st-paste-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
-      }));
+      const targetLayer = s.layers.find((l) => l.id === s.activeLayerId);
+      if (!targetLayer || targetLayer.locked || targetLayer.type === 'folder' || targetLayer.type === 'camera') return s;
+      const snapshot = makeSnapshot(s);
+      const pasted = cloneStrokesWithNewIds(s.clipboardStrokes, 'st-paste');
       const layers = s.layers.map((l) => {
         if (l.id !== s.activeLayerId) return l;
         const existing = l.frames[s.currentFrame] || [];
         return {
           ...l,
-          frames: { ...l.frames, [s.currentFrame]: [...existing, ...pasted] }
+          frames: { ...l.frames, [s.currentFrame]: [...existing, ...pasted] },
+          celDurations:
+            l.frames[s.currentFrame] === undefined
+              ? splitCelDurationsAt(l.celDurations, s.currentFrame, true)
+              : l.celDurations
         };
       });
       return {
@@ -1370,23 +2481,90 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
         isDirty: true
       };
     }),
-  extendExposureF5: () => {
-    // Same as inserting a held/blank exposure shift right after current frame
-    get().insertFrameAfterCurrent();
-  },
-  reduceExposureShiftF5: () =>
+  extendExposureF5: () =>
     set((s) => {
-      const removeAt = s.currentFrame;
-      const snapshot = { layers: cloneLayers(s.layers) };
+      const targetLayer = s.layers.find((l) => l.id === s.activeLayerId);
+      if (!targetLayer || targetLayer.locked || targetLayer.type === 'folder' || targetLayer.type === 'camera') return s;
+      const snapshot = makeSnapshot(s);
+      const coveringStart = findCoveringCelStart(targetLayer, s.currentFrame);
+      const shiftFrom = coveringStart !== null
+        ? coveringStart + Math.max(1, targetLayer.celDurations?.[coveringStart] || 1)
+        : s.currentFrame + 1;
+      let maxFrame = s.totalFrames;
       const layers = s.layers.map((l) => {
         if (l.id !== s.activeLayerId) return l;
-        const shifted: Record<number, Stroke[]> = {};
-        for (const [fKey, strokes] of Object.entries(l.frames)) {
-          const fNum = Number(fKey);
-          if (fNum < removeAt) shifted[fNum] = strokes;
-          else if (fNum > removeAt) shifted[fNum - 1] = strokes;
+        const nextFrames = shiftRecordKeys(l.frames, shiftFrom, 1);
+        const nextDur = shiftRecordKeys(l.celDurations, shiftFrom, 1);
+        const nextTags = shiftRecordKeys(l.frameTags, shiftFrom, 1);
+        const nextKfs = shiftRecordKeys(l.keyframes, shiftFrom, 1);
+        if (coveringStart !== null) {
+          const prevDur = Math.max(1, l.celDurations?.[coveringStart] || 1);
+          nextDur[coveringStart] = prevDur + 1;
+          maxFrame = Math.max(maxFrame, coveringStart + prevDur);
         }
-        return { ...l, frames: shifted };
+        for (const k of Object.keys(nextFrames)) {
+          const f = Number(k);
+          maxFrame = Math.max(maxFrame, f + Math.max(1, nextDur[f] || 1) - 1);
+        }
+        return { ...l, frames: nextFrames, celDurations: nextDur, frameTags: nextTags, keyframes: nextKfs };
+      });
+      const newTotal = Math.min(1000, Math.max(s.totalFrames, maxFrame));
+      return {
+        undoStack: [...s.undoStack.slice(-39), snapshot],
+        redoStack: [],
+        layers,
+        totalFrames: newTotal,
+        playEnd: Math.min(newTotal, Math.max(s.playEnd, Math.min(newTotal, maxFrame))),
+        isDirty: true
+      };
+    }),
+  reduceExposureShiftF5: () =>
+    set((s) => {
+      const targetLayer = s.layers.find((l) => l.id === s.activeLayerId);
+      if (!targetLayer || targetLayer.locked || targetLayer.type === 'folder' || targetLayer.type === 'camera') return s;
+      const removeAt = s.currentFrame;
+      const snapshot = makeSnapshot(s);
+      const coveringStart = findCoveringCelStart(targetLayer, removeAt);
+      const layers = s.layers.map((l) => {
+        if (l.id !== s.activeLayerId) return l;
+        if (coveringStart !== null) {
+          const prevDur = Math.max(1, l.celDurations?.[coveringStart] || 1);
+          if (prevDur > 1) {
+            const shiftFrom = coveringStart + prevDur;
+            const nextFrames = shiftRecordKeys(l.frames, shiftFrom, -1);
+            const nextDur = shiftRecordKeys(l.celDurations, shiftFrom, -1);
+            const nextTags = shiftRecordKeys(l.frameTags, shiftFrom, -1);
+            const nextKfs = shiftRecordKeys(l.keyframes, shiftFrom, -1);
+            nextDur[coveringStart] = prevDur - 1;
+            return { ...l, frames: nextFrames, celDurations: nextDur, frameTags: nextTags, keyframes: nextKfs };
+          }
+        }
+        // Duration is 1 (or empty frame): remove removeAt and shift everything > removeAt left by 1
+        const nextFrames: Record<number, Stroke[]> = {};
+        for (const [k, v] of Object.entries(l.frames)) {
+          const f = Number(k);
+          if (f < removeAt) nextFrames[f] = v;
+          else if (f > removeAt) nextFrames[f - 1] = v;
+        }
+        const nextDur: Record<number, number> = {};
+        for (const [k, v] of Object.entries(l.celDurations || {})) {
+          const f = Number(k);
+          if (f < removeAt) nextDur[f] = v;
+          else if (f > removeAt) nextDur[f - 1] = v;
+        }
+        const nextTags: Record<number, PoseTag> = {};
+        for (const [k, v] of Object.entries(l.frameTags || {})) {
+          const f = Number(k);
+          if (f < removeAt) nextTags[f] = v;
+          else if (f > removeAt) nextTags[f - 1] = v;
+        }
+        const nextKfs: Record<number, LayerTransformKeyframe> = {};
+        for (const [k, v] of Object.entries(l.keyframes || {})) {
+          const f = Number(k);
+          if (f < removeAt) nextKfs[f] = v;
+          else if (f > removeAt) nextKfs[f - 1] = v;
+        }
+        return { ...l, frames: nextFrames, celDurations: nextDur, frameTags: nextTags, keyframes: nextKfs };
       });
       return {
         undoStack: [...s.undoStack.slice(-39), snapshot],
@@ -1395,45 +2573,126 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
         isDirty: true
       };
     }),
-  setAudioTrack: (audioTrack) => set({ audioTrack }),
+  setAudioTrack: (audioTrack) =>
+    set((s) => {
+      const prevUrl = s.audioTrack?.objectUrl;
+      if (prevUrl && prevUrl !== audioTrack?.objectUrl) {
+        const usedByOtherTab = s.openScenes.some(
+          (sc) => sc.id !== s.activeSceneId && sc.audioTrack?.objectUrl === prevUrl
+        );
+        if (!usedByOtherTab) {
+          try {
+            URL.revokeObjectURL(prevUrl);
+          } catch {
+            // ignore
+          }
+        }
+      }
+      return { audioTrack, isDirty: true };
+    }),
   renameLayer: (id, name) =>
     set((s) => ({
-      layers: s.layers.map((l) => (l.id === id ? { ...l, name } : l))
+      layers: s.layers.map((l) => (l.id === id ? { ...l, name } : l)),
+      isDirty: true
     })),
   setLayerOpacity: (id, opacity) =>
     set((s) => ({
-      layers: s.layers.map((l) => (l.id === id ? { ...l, opacity } : l))
+      layers: s.layers.map((l) => (l.id === id ? { ...l, opacity } : l)),
+      isDirty: true
     })),
   setSelectedLayersOpacity: (opacity) =>
     set((s) => {
       const targetSet = new Set(s.selectedLayerIds.length > 0 ? s.selectedLayerIds : [s.activeLayerId]);
       return {
-        layers: s.layers.map((l) => (targetSet.has(l.id) ? { ...l, opacity } : l))
+        layers: s.layers.map((l) => (targetSet.has(l.id) ? { ...l, opacity } : l)),
+        isDirty: true
       };
     }),
   updateNodePosition: (id, nodeX, nodeY) =>
     set((s) => ({
-      layers: s.layers.map((l) => (l.id === id ? { ...l, nodeX, nodeY } : l))
+      layers: s.layers.map((l) => (l.id === id ? { ...l, nodeX, nodeY } : l)),
+      isDirty: true
+    })),
+
+  pushUndoSnapshot: () =>
+    set((s) => ({
+      undoStack: [...s.undoStack.slice(-39), makeSnapshot(s)],
+      redoStack: []
     })),
 
   addStroke: (stroke, insertAtBottom = false) =>
     set((s) => {
       const targetLayer = s.layers.find((l) => l.id === s.activeLayerId);
-      if (!targetLayer || targetLayer.locked) return s;
+      if (!targetLayer || targetLayer.locked || targetLayer.type === 'folder' || targetLayer.type === 'camera') return s;
       const finalStroke: Stroke =
-        targetLayer.alphaLock && stroke.tool !== 'eraser' && stroke.tool !== 'erase_poly'
+        targetLayer.alphaLock && stroke.tool !== 'eraser' && stroke.tool !== 'erase_poly' && !insertAtBottom
           ? { ...stroke, alphaLock: true }
           : stroke;
-      const snapshot = { layers: cloneLayers(s.layers) };
+      const snapshot = makeSnapshot(s);
       const layers = s.layers.map((l) => {
         if (l.id !== s.activeLayerId) return l;
-        const existing = l.frames[s.currentFrame] || [];
+        const isDirectUndefined = l.frames[s.currentFrame] === undefined;
+        let existing: Stroke[];
+        if (!isDirectUndefined) {
+          existing = l.frames[s.currentFrame];
+        } else if (
+          stroke.tool === 'eraser' ||
+          stroke.tool === 'erase_poly' ||
+          l.holdFrames ||
+          l.alphaLock
+        ) {
+          // Materialize the currently displayed held/stretched drawing when erasing, alpha-locked, or on holdFrames layers
+          existing = cloneStrokesWithNewIds(resolveEffectiveStrokes(l, s.currentFrame), 'st-mat');
+        } else {
+          existing = [];
+        }
         return {
           ...l,
           frames: {
             ...l.frames,
             [s.currentFrame]: insertAtBottom ? [finalStroke, ...existing] : [...existing, finalStroke]
-          }
+          },
+          celDurations: isDirectUndefined
+            ? splitCelDurationsAt(l.celDurations, s.currentFrame, true)
+            : l.celDurations
+        };
+      });
+      return {
+        undoStack: [...s.undoStack.slice(-39), snapshot],
+        redoStack: [],
+        layers,
+        isDirty: true
+      };
+    }),
+
+  addStrokesBatch: (newStrokes, materializeHeld = true, bypassAlphaLock = false) =>
+    set((s) => {
+      if (newStrokes.length === 0) return s;
+      const targetLayer = s.layers.find((l) => l.id === s.activeLayerId);
+      if (!targetLayer || targetLayer.locked || targetLayer.type === 'folder' || targetLayer.type === 'camera') return s;
+      const snapshot = makeSnapshot(s);
+      const layers = s.layers.map((l) => {
+        if (l.id !== s.activeLayerId) return l;
+        const isDirectUndefined = l.frames[s.currentFrame] === undefined;
+        let base: Stroke[] = !isDirectUndefined ? [...l.frames[s.currentFrame]] : [];
+        if (isDirectUndefined && (materializeHeld || l.holdFrames || l.alphaLock)) {
+          const eff = resolveEffectiveStrokes(l, s.currentFrame);
+          if (eff.length > 0) base = cloneStrokesWithNewIds(eff, 'st-mat');
+        }
+        const taggedNew = newStrokes.map((st) =>
+          !bypassAlphaLock && l.alphaLock && st.tool !== 'eraser' && st.tool !== 'erase_poly'
+            ? { ...st, alphaLock: true }
+            : st
+        );
+        return {
+          ...l,
+          frames: {
+            ...l.frames,
+            [s.currentFrame]: [...base, ...taggedNew]
+          },
+          celDurations: isDirectUndefined
+            ? splitCelDurationsAt(l.celDurations, s.currentFrame, true)
+            : l.celDurations
         };
       });
       return {
@@ -1447,42 +2706,68 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
   moveStrokes: (strokeIds, dx, dy) =>
     set((s) => {
       if (strokeIds.length === 0 || (dx === 0 && dy === 0)) return s;
+      const targetLayer = s.layers.find((l) => l.id === s.activeLayerId);
+      if (!targetLayer || targetLayer.locked || targetLayer.type === 'folder' || targetLayer.type === 'camera') return s;
       const idSet = new Set(strokeIds);
       const layers = s.layers.map((l) => {
         if (l.id !== s.activeLayerId) return l;
-        const existing = l.frames[s.currentFrame] || [];
+        const isDirectUndefined = l.frames[s.currentFrame] === undefined;
+        const existing = isDirectUndefined ? resolveEffectiveStrokes(l, s.currentFrame) : l.frames[s.currentFrame];
         return {
           ...l,
           frames: {
             ...l.frames,
-            [s.currentFrame]: existing.map((st) =>
-              idSet.has(st.id)
-                ? {
-                    ...st,
-                    points: st.points.map((pt) => ({ ...pt, x: pt.x + dx, y: pt.y + dy }))
-                  }
-                : st
-            )
-          }
+            [s.currentFrame]: existing.map((st) => {
+              if (!idSet.has(st.id)) return st;
+              const next: Stroke = {
+                ...st,
+                points: st.points.map((pt) => ({ ...pt, x: pt.x + dx, y: pt.y + dy }))
+              };
+              if (st.tool === 'image') {
+                next.imageX = (st.imageX ?? 0) + dx;
+                next.imageY = (st.imageY ?? 0) + dy;
+                if (st.imageQuad) {
+                  next.imageQuad = {
+                    tl: { x: st.imageQuad.tl.x + dx, y: st.imageQuad.tl.y + dy },
+                    tr: { x: st.imageQuad.tr.x + dx, y: st.imageQuad.tr.y + dy },
+                    br: { x: st.imageQuad.br.x + dx, y: st.imageQuad.br.y + dy },
+                    bl: { x: st.imageQuad.bl.x + dx, y: st.imageQuad.bl.y + dy }
+                  };
+                }
+              }
+              return next;
+            })
+          },
+          celDurations: isDirectUndefined
+            ? splitCelDurationsAt(l.celDurations, s.currentFrame, true)
+            : l.celDurations
         };
       });
-      return { layers };
+      return { layers, isDirty: true };
     }),
 
   replaceStrokes: (updated) =>
     set((s) => {
       if (updated.length === 0) return s;
+      const targetLayer = s.layers.find((l) => l.id === s.activeLayerId);
+      if (!targetLayer || targetLayer.locked || targetLayer.type === 'folder' || targetLayer.type === 'camera') return s;
       const map = new Map(updated.map((st) => [st.id, st]));
-      const snapshot = { layers: cloneLayers(s.layers) };
+      const snapshot = makeSnapshot(s);
       const layers = s.layers.map((l) => {
         if (l.id !== s.activeLayerId) return l;
-        const existing = l.frames[s.currentFrame] || [];
+        const isDirectUndefined = l.frames[s.currentFrame] === undefined;
+        const existing = isDirectUndefined ? resolveEffectiveStrokes(l, s.currentFrame) : l.frames[s.currentFrame];
+        const nextFrameStrokes =
+          existing.length > 0 ? existing.map((st) => map.get(st.id) || st) : updated;
         return {
           ...l,
           frames: {
             ...l.frames,
-            [s.currentFrame]: existing.map((st) => map.get(st.id) || st)
-          }
+            [s.currentFrame]: nextFrameStrokes
+          },
+          celDurations: isDirectUndefined
+            ? splitCelDurationsAt(l.celDurations, s.currentFrame, true)
+            : l.celDurations
         };
       });
       return {
@@ -1496,17 +2781,23 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
   deleteStrokes: (strokeIds) =>
     set((s) => {
       if (strokeIds.length === 0) return s;
+      const targetLayer = s.layers.find((l) => l.id === s.activeLayerId);
+      if (!targetLayer || targetLayer.locked || targetLayer.type === 'folder' || targetLayer.type === 'camera') return s;
       const idSet = new Set(strokeIds);
-      const snapshot = { layers: cloneLayers(s.layers) };
+      const snapshot = makeSnapshot(s);
       const layers = s.layers.map((l) => {
         if (l.id !== s.activeLayerId) return l;
-        const existing = l.frames[s.currentFrame] || [];
+        const isDirectUndefined = l.frames[s.currentFrame] === undefined;
+        const existing = isDirectUndefined ? resolveEffectiveStrokes(l, s.currentFrame) : l.frames[s.currentFrame];
         return {
           ...l,
           frames: {
             ...l.frames,
             [s.currentFrame]: existing.filter((st) => !idSet.has(st.id))
-          }
+          },
+          celDurations: isDirectUndefined
+            ? splitCelDurationsAt(l.celDurations, s.currentFrame, true)
+            : l.celDurations
         };
       });
       return {
@@ -1529,13 +2820,18 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
   insertFrameAfterCurrent: () =>
     set((s) => {
       const activeLayer = s.layers.find((l) => l.id === s.activeLayerId);
-      const snapshot = { layers: cloneLayers(s.layers) };
+      if (!activeLayer || activeLayer.locked || activeLayer.type === 'folder') return s;
+      const snapshot = makeSnapshot(s);
 
-      // If current frame has no frame yet on this layer, create it right here without shifting!
-      if (activeLayer && activeLayer.frames[s.currentFrame] === undefined) {
+      // If current frame has no frame yet on this layer, create it right here AND auto-split any stretched Cel covering it!
+      if (activeLayer.frames[s.currentFrame] === undefined) {
         const layers = s.layers.map((l) =>
           l.id === s.activeLayerId
-            ? { ...l, frames: { ...l.frames, [s.currentFrame]: [] } }
+            ? {
+                ...l,
+                frames: { ...l.frames, [s.currentFrame]: [] },
+                celDurations: splitCelDurationsAt(l.celDurations, s.currentFrame, true)
+              }
             : l
         );
         return {
@@ -1547,35 +2843,43 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
       }
 
       const insertAt = s.currentFrame + 1;
+      let maxShiftedFrame = insertAt;
       const layers = s.layers.map((l) => {
         if (l.id !== s.activeLayerId) return l;
-        const shifted: Record<number, Stroke[]> = {};
-        for (const [fKey, strokes] of Object.entries(l.frames)) {
-          const fNum = Number(fKey);
-          if (fNum >= insertAt) {
-            shifted[fNum + 1] = strokes;
-          } else {
-            shifted[fNum] = strokes;
-          }
-        }
+        const shifted = shiftRecordKeys(l.frames, insertAt, 1);
         shifted[insertAt] = [];
-        return { ...l, frames: shifted };
+        const shiftedDur = splitCelDurationsAt(shiftRecordKeys(l.celDurations, insertAt, 1), insertAt, false);
+        const shiftedTags = shiftRecordKeys(l.frameTags, insertAt, 1);
+        const shiftedKfs = shiftRecordKeys(l.keyframes, insertAt, 1);
+        for (const k of Object.keys(shifted)) {
+          const f = Number(k);
+          maxShiftedFrame = Math.max(maxShiftedFrame, f + Math.max(1, shiftedDur[f] || 1) - 1);
+        }
+        return {
+          ...l,
+          frames: shifted,
+          celDurations: shiftedDur,
+          frameTags: shiftedTags,
+          keyframes: shiftedKfs
+        };
       });
-      const newTotal = Math.max(s.totalFrames, insertAt + 1);
+      const newTotal = Math.min(1000, Math.max(s.totalFrames, maxShiftedFrame));
       return {
         undoStack: [...s.undoStack.slice(-39), snapshot],
         redoStack: [],
         layers,
         totalFrames: newTotal,
-        playEnd: Math.max(s.playEnd, insertAt),
-        currentFrame: insertAt,
+        playEnd: Math.min(newTotal, Math.max(s.playEnd, insertAt)),
+        currentFrame: Math.min(newTotal, insertAt),
         isDirty: true
       };
     }),
 
   clearCurrentFrame: () =>
     set((s) => {
-      const snapshot = { layers: cloneLayers(s.layers) };
+      const targetLayer = s.layers.find((l) => l.id === s.activeLayerId);
+      if (!targetLayer || targetLayer.locked || targetLayer.type === 'folder' || targetLayer.type === 'camera') return s;
+      const snapshot = makeSnapshot(s);
       const layers = s.layers.map((l) => {
         if (l.id !== s.activeLayerId) return l;
         return {
@@ -1583,7 +2887,11 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
           frames: {
             ...l.frames,
             [s.currentFrame]: []
-          }
+          },
+          celDurations:
+            l.frames[s.currentFrame] === undefined
+              ? splitCelDurationsAt(l.celDurations, s.currentFrame, true)
+              : l.celDurations
         };
       });
       return {
@@ -1596,24 +2904,32 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
 
   duplicateFrameToNext: () =>
     set((s) => {
-      const next = Math.min(s.totalFrames, s.currentFrame + 1);
-      const snapshot = { layers: cloneLayers(s.layers) };
+      const targetLayer = s.layers.find((l) => l.id === s.activeLayerId);
+      if (!targetLayer || targetLayer.locked || targetLayer.type === 'folder' || targetLayer.type === 'camera') return s;
+      const next = Math.min(1000, s.currentFrame + 1);
+      if (next === s.currentFrame) return s;
+      const snapshot = makeSnapshot(s);
       const layers = s.layers.map((l) => {
         if (l.id !== s.activeLayerId) return l;
-        const curr = l.frames[s.currentFrame] || [];
+        const curr = resolveEffectiveStrokes(l, s.currentFrame);
         return {
           ...l,
           frames: {
             ...l.frames,
-            [next]: JSON.parse(JSON.stringify(curr))
-          }
+            [next]: cloneStrokesWithNewIds(curr, 'st-dup')
+          },
+          celDurations: splitCelDurationsAt(l.celDurations, next, true)
         };
       });
+      const newTotal = Math.max(s.totalFrames, next);
       return {
         undoStack: [...s.undoStack.slice(-39), snapshot],
         redoStack: [],
         layers,
-        currentFrame: next
+        totalFrames: newTotal,
+        playEnd: Math.max(s.playEnd, next),
+        currentFrame: next,
+        isDirty: true
       };
     }),
 
@@ -1621,10 +2937,21 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
     set((s) => {
       if (s.undoStack.length === 0) return s;
       const prev = s.undoStack[s.undoStack.length - 1];
+      const layerIds = new Set(prev.layers.map((l) => l.id));
+      const fallbackActive = prev.layers.find((l) => l.type !== 'folder')?.id || prev.layers[0]?.id || '';
+      const validActive =
+        (prev.activeLayerId && layerIds.has(prev.activeLayerId) ? prev.activeLayerId : null) ||
+        (layerIds.has(s.activeLayerId) ? s.activeLayerId : fallbackActive);
+      const validSelected = s.selectedLayerIds.filter((id) => layerIds.has(id));
       return {
         undoStack: s.undoStack.slice(0, -1),
-        redoStack: [...s.redoStack, { layers: cloneLayers(s.layers) }],
-        layers: prev.layers
+        redoStack: [...s.redoStack, makeSnapshot(s)],
+        layers: prev.layers,
+        activeLayerId: validActive,
+        selectedLayerIds: validSelected.length > 0 ? validSelected : validActive ? [validActive] : [],
+        canvasWidth: prev.canvasWidth ?? s.canvasWidth,
+        canvasHeight: prev.canvasHeight ?? s.canvasHeight,
+        isDirty: true
       };
     }),
 
@@ -1632,10 +2959,21 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
     set((s) => {
       if (s.redoStack.length === 0) return s;
       const next = s.redoStack[s.redoStack.length - 1];
+      const layerIds = new Set(next.layers.map((l) => l.id));
+      const fallbackActive = next.layers.find((l) => l.type !== 'folder')?.id || next.layers[0]?.id || '';
+      const validActive =
+        (next.activeLayerId && layerIds.has(next.activeLayerId) ? next.activeLayerId : null) ||
+        (layerIds.has(s.activeLayerId) ? s.activeLayerId : fallbackActive);
+      const validSelected = s.selectedLayerIds.filter((id) => layerIds.has(id));
       return {
         redoStack: s.redoStack.slice(0, -1),
-        undoStack: [...s.undoStack, { layers: cloneLayers(s.layers) }],
-        layers: next.layers
+        undoStack: [...s.undoStack, makeSnapshot(s)],
+        layers: next.layers,
+        activeLayerId: validActive,
+        selectedLayerIds: validSelected.length > 0 ? validSelected : validActive ? [validActive] : [],
+        canvasWidth: next.canvasWidth ?? s.canvasWidth,
+        canvasHeight: next.canvasHeight ?? s.canvasHeight,
+        isDirty: true
       };
     }),
 
@@ -1645,7 +2983,7 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
       projectPath,
       isDirty: false,
       openScenes: s.openScenes.map((sc) =>
-        sc.id === s.activeSceneId ? { ...sc, name: projectName, path: projectPath } : sc
+        sc.id === s.activeSceneId ? { ...sc, name: projectName, path: projectPath, isDirty: false } : sc
       )
     })),
   setAutoSaveEnabled: (autoSaveEnabled) => set({ autoSaveEnabled }),
@@ -1655,12 +2993,17 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
   exportProjectData: () => {
     const s = get();
     return {
-      version: '27.1.0',
+      version: '27.2.0',
       name: s.projectName,
       width: s.canvasWidth,
       height: s.canvasHeight,
       fps: s.fps,
       totalFrames: s.totalFrames,
+      playStart: s.playStart,
+      playEnd: s.playEnd,
+      timelineMarkers: s.timelineMarkers,
+      audioTrackPath: s.audioTrack?.filePath || null,
+      postProcess: s.postProcess,
       swatches: s.swatches,
       layers: s.layers
     };
@@ -1668,14 +3011,17 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
 
   loadProjectData: (data, filePath) =>
     set((s) => {
-      // If already open in a tab, just switch to it!
+      const synced = syncActiveTabInList(s);
+      // If already open in a tab, sync current tab FIRST and switch cleanly!
       if (filePath) {
-        const existing = s.openScenes.find((sc) => sc.path === filePath);
+        const existing = synced.find((sc) => sc.path === filePath);
         if (existing) {
           return {
+            openScenes: synced,
             activeSceneId: existing.id,
             projectName: existing.name,
             projectPath: existing.path,
+            isDirty: existing.isDirty,
             canvasWidth: existing.width,
             canvasHeight: existing.height,
             fps: existing.fps,
@@ -1688,53 +3034,46 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
             selectedLayerIds: existing.selectedLayerIds,
             swatches: existing.swatches,
             activeSwatchId: existing.activeSwatchId,
+            timelineMarkers: existing.timelineMarkers || {},
+            audioTrack: existing.audioTrack || null,
+            undoStack: existing.undoStack || [],
+            redoStack: existing.redoStack || [],
+            isPlaying: false,
             showWelcome: false
           };
         }
       }
 
-      const synced = s.openScenes.map((sc) =>
-        sc.id === s.activeSceneId
-          ? {
-              ...sc,
-              name: s.projectName,
-              path: s.projectPath,
-              width: s.canvasWidth,
-              height: s.canvasHeight,
-              fps: s.fps,
-              totalFrames: s.totalFrames,
-              playStart: s.playStart,
-              playEnd: s.playEnd,
-              currentFrame: s.currentFrame,
-              layers: s.layers,
-              activeLayerId: s.activeLayerId,
-              selectedLayerIds: s.selectedLayerIds,
-              swatches: s.swatches,
-              activeSwatchId: s.activeSwatchId
-            }
-          : sc
-      );
-
       const id = `scene-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`;
       const loadedLayers = data.layers?.length ? data.layers : createDefaultLayers();
       const loadedSwatches = data.swatches?.length ? data.swatches : DEFAULT_SWATCHES;
-      const total = data.totalFrames || 60;
+      const total = Math.max(1, Math.min(1000, data.totalFrames || 60));
+      const pStart = Math.max(1, Math.min(total, data.playStart ?? 1));
+      const pEnd = Math.max(pStart, Math.min(total, data.playEnd ?? total));
+      const markers = data.timelineMarkers || {};
+      const firstActive = loadedLayers.find((l) => l.type !== 'folder')?.id || loadedLayers[0].id;
+
       const newTab: SceneTab = {
         id,
         name: data.name || 'Loaded_Scene',
         path: filePath,
+        isDirty: false,
         width: data.width || 1920,
         height: data.height || 1080,
         fps: data.fps || 24,
         totalFrames: total,
-        playStart: 1,
-        playEnd: total,
-        currentFrame: 1,
+        playStart: pStart,
+        playEnd: pEnd,
+        currentFrame: pStart,
         layers: loadedLayers,
-        activeLayerId: loadedLayers[0].id,
-        selectedLayerIds: [loadedLayers[0].id],
+        activeLayerId: firstActive,
+        selectedLayerIds: [firstActive],
         swatches: loadedSwatches,
-        activeSwatchId: loadedSwatches[0].id
+        activeSwatchId: loadedSwatches[0].id,
+        timelineMarkers: markers,
+        audioTrack: null,
+        undoStack: [],
+        redoStack: []
       };
 
       return {
@@ -1742,76 +3081,108 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
         activeSceneId: id,
         projectName: newTab.name,
         projectPath: filePath,
+        isDirty: false,
         canvasWidth: newTab.width,
         canvasHeight: newTab.height,
         fps: newTab.fps,
         totalFrames: total,
-        playStart: 1,
-        playEnd: total,
-        currentFrame: 1,
+        playStart: pStart,
+        playEnd: pEnd,
+        currentFrame: pStart,
+        timelineMarkers: markers,
+        audioTrack: null,
+        postProcess: data.postProcess ? { ...DEFAULT_POST_PROCESS, ...data.postProcess } : { ...DEFAULT_POST_PROCESS },
         swatches: loadedSwatches,
         activeSwatchId: loadedSwatches[0].id,
         layers: loadedLayers,
-        activeLayerId: loadedLayers[0].id,
-        selectedLayerIds: [loadedLayers[0].id],
+        activeLayerId: firstActive,
+        selectedLayerIds: [firstActive],
         undoStack: [],
         redoStack: [],
+        timelapseFrames: [],
+        isPlaying: false,
         showWelcome: false
       };
     }),
 
-  newProject: () =>
-    set({
-      projectName: 'Untitled_Scene',
-      projectPath: null,
-      currentFrame: 1,
-      isPlaying: false,
-      swatches: DEFAULT_SWATCHES,
-      activeSwatchId: 'sw-black',
-      layers: createDefaultLayers(),
-      activeLayerId: 'layer-1',
-      undoStack: [],
-      redoStack: []
-    })
+  newProject: () => {
+    const s = get();
+    s.createNewScene(`Cena_${s.openScenes.length + 1}`, 1920, 1080, 24);
+  }
 }));
 
-// Automatically persist user preferences to localStorage (debounced 250ms)
+// Automatically persist ONLY user preferences when a preference actually changes + sync Electron dirty flag
+const PREF_KEYS = [
+  'onionSkin',
+  'onionPrev',
+  'onionNext',
+  'brushSmoothing',
+  'brushSize',
+  'brushMinSize',
+  'brushOpacity',
+  'eraserSize',
+  'eraserMinSize',
+  'eraserOpacity',
+  'eraserPreset',
+  'textFontFamily',
+  'textFontSize',
+  'textBold',
+  'textItalic',
+  'usePressure',
+  'activeBrushPreset',
+  'activeColor',
+  'secondaryColor',
+  'recentColors',
+  'lastSelectionTool',
+  'lastShapeTool',
+  'shapeFilled',
+  'bucketReference',
+  'bucketTolerance',
+  'bucketExpand',
+  'bucketCloseGap',
+  'bucketBehind',
+  'liquifyMode',
+  'liquifySize',
+  'liquifyStrength',
+  'showGrid',
+  'showCameraFrame',
+  'lightTable',
+  'loopPlayback',
+  'timelineCellWidth',
+  'autoSaveEnabled',
+  'autoSaveIntervalSec',
+  'timelapseRootDir',
+  'performanceMode'
+] as const;
+
 let prefsSaveTimer: number | null = null;
-useHarmonyStore.subscribe((s) => {
+let lastElectronDirty = false;
+useHarmonyStore.subscribe((s, prev) => {
+  // Keep Electron main process informed whether ANY open scene has unsaved edits (even while viewing Home screen!)
+  const anyDirty =
+    s.isDirty || s.openScenes.some((sc) => sc.id !== s.activeSceneId && sc.isDirty);
+  if (anyDirty !== lastElectronDirty) {
+    lastElectronDirty = anyDirty;
+    window.harmonyAPI?.setDirty?.(anyDirty);
+  }
+
+  let prefChanged = false;
+  for (const key of PREF_KEYS) {
+    if (s[key] !== prev[key]) {
+      prefChanged = true;
+      break;
+    }
+  }
+  if (!prefChanged) return;
+
   if (prefsSaveTimer) window.clearTimeout(prefsSaveTimer);
   prefsSaveTimer = window.setTimeout(() => {
     try {
-      const prefs = {
-        onionSkin: s.onionSkin,
-        onionPrev: s.onionPrev,
-        onionNext: s.onionNext,
-        brushSmoothing: s.brushSmoothing,
-        brushSize: s.brushSize,
-        brushMinSize: s.brushMinSize,
-        brushOpacity: s.brushOpacity,
-        usePressure: s.usePressure,
-        activeBrushPreset: s.activeBrushPreset,
-        activeColor: s.activeColor,
-        secondaryColor: s.secondaryColor,
-        recentColors: s.recentColors,
-        lastSelectionTool: s.lastSelectionTool,
-        lastShapeTool: s.lastShapeTool,
-        shapeFilled: s.shapeFilled,
-        bucketReference: s.bucketReference,
-        bucketTolerance: s.bucketTolerance,
-        bucketExpand: s.bucketExpand,
-        bucketCloseGap: s.bucketCloseGap,
-        bucketBehind: s.bucketBehind,
-        showGrid: s.showGrid,
-        showCameraFrame: s.showCameraFrame,
-        lightTable: s.lightTable,
-        loopPlayback: s.loopPlayback,
-        timelineCellWidth: s.timelineCellWidth,
-        autoSaveEnabled: s.autoSaveEnabled,
-        autoSaveIntervalSec: s.autoSaveIntervalSec,
-        timelapseRootDir: s.timelapseRootDir,
-        performanceMode: s.performanceMode
-      };
+      const cur = useHarmonyStore.getState();
+      const prefs: Record<string, any> = {};
+      for (const key of PREF_KEYS) {
+        prefs[key] = cur[key];
+      }
       localStorage.setItem(USER_PREFS_KEY, JSON.stringify(prefs));
     } catch {
       // ignore storage quota errors

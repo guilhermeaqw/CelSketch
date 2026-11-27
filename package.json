@@ -48,9 +48,14 @@
     "directories": {
       "output": "release-celsketch"
     },
+    "electronLanguages": [
+      "pt-BR",
+      "en-US"
+    ],
     "files": [
       "dist/**/*",
-      "dist-electron/**/*"
+      "dist-electron/**/*",
+      "!node_modules/**/*"
     ],
     "win": {
       "signAndEditExecutable": false,

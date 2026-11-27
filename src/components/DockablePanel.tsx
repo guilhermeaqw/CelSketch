@@ -12,6 +12,16 @@ interface DockablePanelProps {
   children: React.ReactNode;
 }
 
+// Dynamic z-index counter so clicking any floating panel brings it cleanly to the front
+let globalFloatZ = 800;
+
+function clampFloatPos(pos: { x: number; y: number }, size: { w: number; h: number }) {
+  return {
+    x: Math.max(0, Math.min(Math.max(0, window.innerWidth - Math.min(size.w, 120)), pos.x)),
+    y: Math.max(30, Math.min(Math.max(30, window.innerHeight - 60), pos.y))
+  };
+}
+
 export const DockablePanel: React.FC<DockablePanelProps> = ({
   title,
   dockSide,
@@ -24,8 +34,11 @@ export const DockablePanel: React.FC<DockablePanelProps> = ({
 }) => {
   const [isFloating, setIsFloating] = useState(false);
   const [dockedSize, setDockedSize] = useState(defaultDockedSize);
-  const [floatPos, setFloatPos] = useState(defaultFloatPos);
+  const [floatPos, setFloatPos] = useState(() => clampFloatPos(defaultFloatPos, defaultFloatSize));
   const [floatSize, setFloatSize] = useState(defaultFloatSize);
+  const [floatZ, setFloatZ] = useState(() => ++globalFloatZ);
+
+  const minFloatW = Math.min(160, defaultFloatSize.w);
 
   const dragState = useRef<{
     type: 'dock-resize' | 'float-move' | 'float-resize' | null;
@@ -64,25 +77,47 @@ export const DockablePanel: React.FC<DockablePanelProps> = ({
         const ny = Math.max(30, Math.min(window.innerHeight - 60, st.startPos.y + (e.clientY - st.startY)));
         setFloatPos({ x: nx, y: ny });
       } else if (st.type === 'float-resize') {
-        const nw = Math.max(160, Math.min(window.innerWidth - 40, st.startFloatSize.w + (e.clientX - st.startX)));
+        const nw = Math.max(minFloatW, Math.min(window.innerWidth - 40, st.startFloatSize.w + (e.clientX - st.startX)));
         const nh = Math.max(120, Math.min(window.innerHeight - 60, st.startFloatSize.h + (e.clientY - st.startY)));
         setFloatSize({ w: nw, h: nh });
       }
     };
 
-    const onPointerUp = () => {
+    const stopDrag = () => {
       dragState.current.type = null;
     };
 
+    const onResize = () => {
+      setFloatPos((p) => clampFloatPos(p, floatSize));
+    };
+
     window.addEventListener('pointermove', onPointerMove);
-    window.addEventListener('pointerup', onPointerUp);
+    window.addEventListener('pointerup', stopDrag);
+    window.addEventListener('pointercancel', stopDrag);
+    window.addEventListener('blur', stopDrag);
+    window.addEventListener('resize', onResize);
     return () => {
       window.removeEventListener('pointermove', onPointerMove);
-      window.removeEventListener('pointerup', onPointerUp);
+      window.removeEventListener('pointerup', stopDrag);
+      window.removeEventListener('pointercancel', stopDrag);
+      window.removeEventListener('blur', stopDrag);
+      window.removeEventListener('resize', onResize);
     };
-  }, [dockSide, minDockedSize, maxDockedSize]);
+  }, [dockSide, minDockedSize, maxDockedSize, minFloatW, floatSize]);
+
+  const bringToFront = () => {
+    globalFloatZ += 1;
+    setFloatZ(globalFloatZ);
+  };
+
+  const enterFloat = () => {
+    setFloatPos((p) => clampFloatPos(p, floatSize));
+    bringToFront();
+    setIsFloating(true);
+  };
 
   const startDockResize = (e: React.PointerEvent) => {
+    if (e.button !== 0) return;
     e.preventDefault();
     dragState.current = {
       type: 'dock-resize',
@@ -95,7 +130,9 @@ export const DockablePanel: React.FC<DockablePanelProps> = ({
   };
 
   const startFloatMove = (e: React.PointerEvent) => {
+    if (e.button !== 0) return;
     e.preventDefault();
+    bringToFront();
     dragState.current = {
       type: 'float-move',
       startX: e.clientX,
@@ -107,8 +144,10 @@ export const DockablePanel: React.FC<DockablePanelProps> = ({
   };
 
   const startFloatResize = (e: React.PointerEvent) => {
+    if (e.button !== 0) return;
     e.preventDefault();
     e.stopPropagation();
+    bringToFront();
     dragState.current = {
       type: 'float-resize',
       startX: e.clientX,
@@ -123,6 +162,7 @@ export const DockablePanel: React.FC<DockablePanelProps> = ({
   if (isFloating) {
     return (
       <div
+        onPointerDown={bringToFront}
         style={{
           position: 'fixed',
           left: floatPos.x,
@@ -133,7 +173,7 @@ export const DockablePanel: React.FC<DockablePanelProps> = ({
           border: '1px solid #4c4c4c',
           borderRadius: 5,
           boxShadow: '0 10px 28px rgba(0,0,0,0.65)',
-          zIndex: 800,
+          zIndex: floatZ,
           display: 'flex',
           flexDirection: 'column',
           overflow: 'hidden'
@@ -155,15 +195,16 @@ export const DockablePanel: React.FC<DockablePanelProps> = ({
             flexShrink: 0
           }}
         >
-          <div style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 10.5, color: '#bbb' }}>
-            <GripHorizontal size={12} />
-            <span>{title}</span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 10.5, color: '#bbb', overflow: 'hidden' }}>
+            <GripHorizontal size={12} style={{ flexShrink: 0 }} />
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{title}</span>
           </div>
           <button
             className="icon-btn"
+            onPointerDown={(e) => e.stopPropagation()}
             onClick={() => setIsFloating(false)}
             title="Encaixar painel de volta (Dock)"
-            style={{ height: 18, minWidth: 18 }}
+            style={{ height: 18, minWidth: 18, flexShrink: 0 }}
           >
             <Minimize2 size={11} />
           </button>
@@ -203,7 +244,6 @@ export const DockablePanel: React.FC<DockablePanelProps> = ({
 
   return (
     <div style={dockedStyle}>
-      {/* Splitter handle for right or bottom dock */}
       {dockSide === 'right' && (
         <div
           onPointerDown={startDockResize}
@@ -232,9 +272,8 @@ export const DockablePanel: React.FC<DockablePanelProps> = ({
       )}
 
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, minHeight: 0, background: '#2b2b2b' }}>
-        {/* Compact Dock Header with Undock/Float button */}
         <div
-          onDoubleClick={() => setIsFloating(true)}
+          onDoubleClick={enterFloat}
           style={{
             height: 20,
             background: '#222222',
@@ -251,7 +290,7 @@ export const DockablePanel: React.FC<DockablePanelProps> = ({
           </span>
           <button
             className="icon-btn"
-            onClick={() => setIsFloating(true)}
+            onClick={enterFloat}
             title="Soltar painel para arrastar livremente (Float)"
             style={{ height: 16, minWidth: 16, padding: 0 }}
           >
@@ -266,7 +305,7 @@ export const DockablePanel: React.FC<DockablePanelProps> = ({
             flexDirection: 'column',
             minWidth: 0,
             minHeight: 0,
-            overflow: dockSide === 'left' ? 'visible' : 'hidden'
+            overflow: 'hidden'
           }}
         >
           {children}

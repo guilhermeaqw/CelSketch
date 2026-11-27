@@ -1,16 +1,56 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
+import { useShallow } from 'zustand/react/shallow';
 import { useHarmonyStore } from '../store/useHarmonyStore';
 import { ArtLayerId, Point, Stroke } from '../types/harmony';
 import {
   renderStroke,
   getEffectiveFrameStrokes,
   isLayerEffectivelyVisible,
+  getLayerEffectiveOpacity,
   getInterpolatedLayerTransform,
   performFloodFill,
+  performMagicWandPolygon,
   renderFrameToCanvas,
   detectIsWeakHardware,
   setGlobalEcoMode
 } from '../utils/canvasRenderer';
+import { applyHslToCanvas, isNoopHsv } from '../utils/hsvUtils';
+import { applyLevelsToCanvas, isNoopLevels } from '../utils/levelsUtils';
+import { applyBlurToCanvas, isNoopBlur } from '../utils/blurUtils';
+import { applyPostProcessToCanvas, hasActivePostProcess } from '../utils/postProcessUtils';
+import {
+  combineSelections,
+  getSelectionBounds,
+  isPointInSelection,
+  traceSelectionPath
+} from '../utils/selectionUtils';
+import {
+  applyCameraTransformToCtx,
+  getActiveCameraLayer,
+  getCameraFrameCorners,
+  getInterpolatedCamera,
+  sampleCameraMotionPath
+} from '../utils/cameraUtils';
+
+function isTextEditingTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  if (target.isContentEditable) return true;
+  if (target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement) return true;
+  if (target instanceof HTMLInputElement) {
+    const t = (target.type || 'text').toLowerCase();
+    return t !== 'range' && t !== 'checkbox' && t !== 'radio' && t !== 'button' && t !== 'color';
+  }
+  return false;
+}
+
+function isDarkHexColor(hex: string): boolean {
+  const clean = hex.replace('#', '');
+  const r = parseInt(clean.substring(0, 2) || '00', 16);
+  const g = parseInt(clean.substring(2, 4) || '00', 16);
+  const b = parseInt(clean.substring(4, 6) || '00', 16);
+  const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  return lum < 110;
+}
 
 const ART_LAYERS: { id: ArtLayerId; label: string }[] = [
   { id: 'OL', label: 'Overlay Art' },
@@ -43,6 +83,16 @@ export const CanvasStage: React.FC = () => {
   const layerBitmapCacheRef = useRef<
     Map<string, { strokesRef: Stroke[]; width: number; height: number; imgTick: number; canvas: HTMLCanvasElement }>
   >(new Map());
+  const liquifyModifiedRef = useRef<boolean>(false);
+  const transformSavedLassoRef = useRef<Point[][] | null>(null);
+  const transformSavedLassoInvertedRef = useRef<boolean>(false);
+  const selectionOpModeRef = useRef<'replace' | 'add' | 'subtract'>('replace');
+  const clipGroupCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const postProcessCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const eyedropperCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const eyedropperKeyRef = useRef<string>('');
+  const eyedropperLayersRef = useRef<typeof layers | null>(null);
+  const [viewportTick, setViewportTick] = useState(0);
 
   const [isDrawing, setIsDrawing] = useState(false);
   const [isPanning, setIsPanning] = useState(false);
@@ -54,19 +104,49 @@ export const CanvasStage: React.FC = () => {
   const [eyedropperPreviewHex, setEyedropperPreviewHex] = useState<string | null>(null);
   const [imageTick, setImageTick] = useState(0);
   const [panStart, setPanStart] = useState<Point>({ x: 0, y: 0 });
-  const [draftStroke, setDraftStroke] = useState<Stroke | null>(null);
+  // Zero-re-render refs for live pen strokes (coalesced to 1 requestAnimationFrame per display refresh!)
+  const draftStrokeRef = useRef<Stroke | null>(null);
+  const stabilizerCursorRef = useRef<Point | null>(null);
+  const drawStageRef = useRef<(() => void) | null>(null);
+  const liveRafRef = useRef<number | null>(null);
+  const scheduleLivePaint = useCallback(() => {
+    if (liveRafRef.current !== null) return;
+    liveRafRef.current = window.requestAnimationFrame(() => {
+      liveRafRef.current = null;
+      drawStageRef.current?.();
+    });
+  }, []);
+  useEffect(() => {
+    return () => {
+      if (liveRafRef.current !== null) window.cancelAnimationFrame(liveRafRef.current);
+      if (pickedToastTimerRef.current !== null) window.clearTimeout(pickedToastTimerRef.current);
+      layerBitmapCacheRef.current.clear();
+      layerBufferRef.current = null;
+      hsvPreviewCanvasRef.current = null;
+      clipGroupCanvasRef.current = null;
+      postProcessCanvasRef.current = null;
+      eyedropperCanvasRef.current = null;
+    };
+  }, []);
+
+  const shiftLineAxisRef = useRef<'h' | 'v' | null>(null);
+  const shiftLineOriginRef = useRef<Point | null>(null);
+  const [textDraft, setTextDraft] = useState<{ canvasX: number; canvasY: number; screenX: number; screenY: number; value: string } | null>(null);
+  const [liquifyPreview, setLiquifyPreview] = useState<Stroke[] | null>(null);
+  const liquifyLastPtRef = useRef<Point | null>(null);
   const [dHeld, setDHeld] = useState(false);
   const [pickedLayerToast, setPickedLayerToast] = useState<{ name: string; x: number; y: number } | null>(null);
   const pickedToastTimerRef = useRef<number | null>(null);
-  const [stabilizerCursor, setStabilizerCursor] = useState<Point | null>(null);
   const [penStatus, setPenStatus] = useState<{ type: string; pressure: number }>({
     type: 'mouse',
     pressure: 1
   });
 
-  // Lasso & Polygonal Lasso state
+  // Lasso & Polygonal Lasso state (supports multi-contour Shift=Add & Alt=Subtract!)
+  const [selectionPolys, setSelectionPolys] = useState<Point[][]>([]);
   const [lassoPoints, setLassoPoints] = useState<Point[]>([]);
   const [lassoClosed, setLassoClosed] = useState(false);
+  const [lassoInverted, setLassoInverted] = useState(false);
   const [lassoCursor, setLassoCursor] = useState<Point | null>(null);
   const [selectShapeStart, setSelectShapeStart] = useState<Point | null>(null);
   const [selectedStrokeIds, setSelectedStrokeIds] = useState<string[]>([]);
@@ -94,13 +174,30 @@ export const CanvasStage: React.FC = () => {
   const [transformActive, setTransformActive] = useState(false);
   const [transformSubMode, setTransformSubMode] = useState<'scale' | 'perspective'>('scale');
   const [transformOrigStrokes, setTransformOrigStrokes] = useState<Stroke[]>([]);
+  const [transformCutEraseMask, setTransformCutEraseMask] = useState<Stroke | null>(null);
   const [transformOrigBounds, setTransformOrigBounds] = useState<{ minX: number; minY: number; maxX: number; maxY: number } | null>(null);
   const [transformQuad, setTransformQuad] = useState<Quad | null>(null);
+  const [transformQuadHistory, setTransformQuadHistory] = useState<Quad[]>([]);
+  const [transformQuadRedo, setTransformQuadRedo] = useState<Quad[]>([]);
   const [activeTransformHandle, setActiveTransformHandle] = useState<TransformHandle | null>(null);
   const [hoverTransformHandle, setHoverTransformHandle] = useState<TransformHandle | null>(null);
   const [transformDragStart, setTransformDragStart] = useState<{ pt: Point; quad: Quad } | null>(null);
   const [transformMenuPos, setTransformMenuPos] = useState<{ x: number; y: number } | null>(null);
 
+  // Interactive 2D Camera direct-manipulation drag state (Pan / Corner Zoom / Top Rotate)
+  const cameraDragRef = useRef<{
+    layerId: string;
+    mode: 'move' | 'zoom' | 'rotate';
+    startPt: Point;
+    origX: number;
+    origY: number;
+    origZoom: number;
+    origRot: number;
+    startDist: number;
+    startAngle: number;
+  } | null>(null);
+
+  // Granular shallow selector: ignores unrelated store changes (AutoSave clock, recentColors, timelineZoom, undoStack, etc.)
   const {
     canvasWidth,
     canvasHeight,
@@ -110,17 +207,31 @@ export const CanvasStage: React.FC = () => {
     activeBrushPreset,
     activeArtLayer,
     activeColor,
+    secondaryColor,
+    gradientMode,
+    gradientToTransparent,
     brushSize,
     brushMinSize,
     usePressure,
     brushOpacity,
     brushSmoothing,
+    eraserSize,
+    eraserMinSize,
+    eraserOpacity,
+    eraserPreset,
+    textFontFamily,
+    textFontSize,
+    textBold,
+    textItalic,
     shapeFilled,
     bucketReference,
     bucketTolerance,
     bucketExpand,
     bucketCloseGap,
     bucketBehind,
+    liquifyMode,
+    liquifySize,
+    liquifyStrength,
     swatches,
     activeSwatchId,
     currentFrame,
@@ -131,15 +242,94 @@ export const CanvasStage: React.FC = () => {
     flipX,
     grayscaleMode,
     hsvPreview,
+    levelsPreview,
+    blurPreview,
+    postProcess,
     cropMode,
     showGrid,
     perspectiveMode,
     symmetryMode,
     showCameraFrame,
+    cameraViewMode,
+    cameraGuides,
+    totalFrames,
     lightTable,
     onionSkin,
     onionPrev,
     onionNext,
+    activeSceneId,
+    timelapseRecording,
+    performanceMode,
+    invertSelectionTrigger
+  } = useHarmonyStore(
+    useShallow((s) => ({
+      canvasWidth: s.canvasWidth,
+      canvasHeight: s.canvasHeight,
+      layers: s.layers,
+      activeLayerId: s.activeLayerId,
+      activeTool: s.activeTool,
+      activeBrushPreset: s.activeBrushPreset,
+      activeArtLayer: s.activeArtLayer,
+      activeColor: s.activeColor,
+      secondaryColor: s.secondaryColor,
+      gradientMode: s.gradientMode,
+      gradientToTransparent: s.gradientToTransparent,
+      brushSize: s.brushSize,
+      brushMinSize: s.brushMinSize,
+      usePressure: s.usePressure,
+      brushOpacity: s.brushOpacity,
+      brushSmoothing: s.brushSmoothing,
+      eraserSize: s.eraserSize,
+      eraserMinSize: s.eraserMinSize,
+      eraserOpacity: s.eraserOpacity,
+      eraserPreset: s.eraserPreset,
+      textFontFamily: s.textFontFamily,
+      textFontSize: s.textFontSize,
+      textBold: s.textBold,
+      textItalic: s.textItalic,
+      shapeFilled: s.shapeFilled,
+      bucketReference: s.bucketReference,
+      bucketTolerance: s.bucketTolerance,
+      bucketExpand: s.bucketExpand,
+      bucketCloseGap: s.bucketCloseGap,
+      bucketBehind: s.bucketBehind,
+      liquifyMode: s.liquifyMode,
+      liquifySize: s.liquifySize,
+      liquifyStrength: s.liquifyStrength,
+      swatches: s.swatches,
+      activeSwatchId: s.activeSwatchId,
+      currentFrame: s.currentFrame,
+      zoom: s.zoom,
+      panX: s.panX,
+      panY: s.panY,
+      rotation: s.rotation,
+      flipX: s.flipX,
+      grayscaleMode: s.grayscaleMode,
+      hsvPreview: s.hsvPreview,
+      levelsPreview: s.levelsPreview,
+      blurPreview: s.blurPreview,
+      postProcess: s.postProcess,
+      cropMode: s.cropMode,
+      showGrid: s.showGrid,
+      perspectiveMode: s.perspectiveMode,
+      symmetryMode: s.symmetryMode,
+      showCameraFrame: s.showCameraFrame,
+      cameraViewMode: s.cameraViewMode,
+      cameraGuides: s.cameraGuides,
+      totalFrames: s.totalFrames,
+      lightTable: s.lightTable,
+      onionSkin: s.onionSkin,
+      onionPrev: s.onionPrev,
+      onionNext: s.onionNext,
+      activeSceneId: s.activeSceneId,
+      timelapseRecording: s.timelapseRecording,
+      performanceMode: s.performanceMode,
+      invertSelectionTrigger: s.invertSelectionTrigger
+    }))
+  );
+
+  // Actions are stable function references — read once via getState()
+  const {
     setZoom,
     setPan,
     setRotation,
@@ -149,15 +339,54 @@ export const CanvasStage: React.FC = () => {
     setCropMode,
     resizeCanvas,
     addStroke,
+    addStrokesBatch,
+    pushUndoSnapshot,
     moveStrokes,
     replaceStrokes,
     deleteStrokes,
     setActiveLayer,
     setClipboardStrokes,
-    timelapseRecording,
-    performanceMode,
-    pushTimelapseFrame
-  } = useHarmonyStore();
+    setActiveSelectionPoly,
+    pushTimelapseFrame,
+    setCameraKeyframe,
+    setCameraViewMode
+  } = useHarmonyStore.getState();
+
+  // Clear per-layer bitmap cache when switching scenes to avoid retaining old scene bitmaps in GPU/RAM
+  useEffect(() => {
+    layerBitmapCacheRef.current.clear();
+  }, [activeSceneId]);
+
+  // Repaint stage cleanly whenever window or DockablePanel splitters resize the container
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(() => {
+      setViewportTick((t) => t + 1);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  // Reset in-progress drawing states cleanly if the user switches tool mid-drag
+  useEffect(() => {
+    if (isDrawing) {
+      setIsDrawing(false);
+      draftStrokeRef.current = null;
+      stabilizerCursorRef.current = null;
+      setLiquifyPreview(null);
+      liquifyLastPtRef.current = null;
+      liquifyModifiedRef.current = false;
+      setSelectShapeStart(null);
+    }
+    if (activeTool !== 'text' && textDraft) {
+      setTextDraft(null);
+    }
+  }, [activeTool]);
+
+  useEffect(() => {
+    if (textDraft) setTextDraft(null);
+  }, [activeLayerId, currentFrame]);
 
   const isEcoMode =
     performanceMode === 'eco' || (performanceMode === 'auto' && detectIsWeakHardware());
@@ -166,12 +395,30 @@ export const CanvasStage: React.FC = () => {
     setGlobalEcoMode(isEcoMode);
   }, [isEcoMode]);
 
+  // Sync active closed selection polygons + inverted flag to store so Ctrl+U (HsvModal) & UI buttons stay in sync!
+  useEffect(() => {
+    const hasClosed = lassoClosed && selectionPolys.length > 0;
+    setActiveSelectionPoly(hasClosed ? selectionPolys[0] : null, hasClosed ? lassoInverted : false, hasClosed ? selectionPolys : null);
+  }, [lassoClosed, selectionPolys, lassoInverted, setActiveSelectionPoly]);
+
+  // Respond to Invert Selection button / Ctrl+Shift+I shortcut
+  useEffect(() => {
+    if (invertSelectionTrigger === 0) return;
+    if (lassoClosed && selectionPolys.length > 0) {
+      setLassoInverted((v) => !v);
+    }
+  }, [invertSelectionTrigger]);
+
   const sceneStepCounterRef = useRef<Record<string, number>>({});
+  const sceneStepInitPromiseRef = useRef<Record<string, Promise<number>>>({});
+  const hsvPreviewCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const hsvPreviewKeyRef = useRef<string>('');
+  const hsvPreviewStrokesRef = useRef<Stroke[] | null>(null);
 
   // Capture a lightweight timelapse snapshot whenever a stroke is committed while recording
   const captureTimelapseStep = useCallback(() => {
     if (!timelapseRecording) return;
-    window.setTimeout(() => {
+    window.setTimeout(async () => {
       const s = useHarmonyStore.getState();
       const src = document.createElement('canvas');
       renderFrameToCanvas(src, s.layers, s.currentFrame, s.canvasWidth, s.canvasHeight, '#ffffff');
@@ -186,8 +433,20 @@ export const CanvasStage: React.FC = () => {
         pushTimelapseFrame(dataUrl);
         if (s.timelapseRootDir && window.harmonyAPI?.writeFrameToDir) {
           const safeScene = (s.projectName || 'Cena').replace(/[<>:"/\\|?*]+/g, '_').trim() || 'Cena';
-          const nextNum = (sceneStepCounterRef.current[safeScene] || 0) + 1;
-          sceneStepCounterRef.current[safeScene] = nextNum;
+          const key = `${s.timelapseRootDir}::${safeScene}`;
+          if (sceneStepCounterRef.current[key] === undefined) {
+            if (!sceneStepInitPromiseRef.current[key]) {
+              sceneStepInitPromiseRef.current[key] = window.harmonyAPI.getNextStepNumber
+                ? window.harmonyAPI.getNextStepNumber(s.timelapseRootDir, safeScene).catch(() => 1)
+                : Promise.resolve(1);
+            }
+            const startNum = await sceneStepInitPromiseRef.current[key];
+            if (sceneStepCounterRef.current[key] === undefined) {
+              sceneStepCounterRef.current[key] = Math.max(0, startNum - 1);
+            }
+          }
+          const nextNum = (sceneStepCounterRef.current[key] || 0) + 1;
+          sceneStepCounterRef.current[key] = nextNum;
           const fileName = `${safeScene}/step_${String(nextNum).padStart(4, '0')}.jpg`;
           window.harmonyAPI.writeFrameToDir(s.timelapseRootDir, fileName, dataUrl).catch(() => {});
         }
@@ -265,24 +524,110 @@ export const CanvasStage: React.FC = () => {
   const activeSwatch = swatches.find((s) => s.id === activeSwatchId) || swatches[0];
 
   const closeLassoAndSelect = useCallback(
-    (poly: Point[]) => {
+    (poly: Point[], inverted = false, opMode: 'replace' | 'add' | 'subtract' = 'replace') => {
       if (poly.length < 3) {
+        if (opMode === 'replace') {
+          setSelectionPolys([]);
+          setLassoPoints([]);
+          setLassoClosed(false);
+          setLassoInverted(false);
+          setSelectedStrokeIds([]);
+        } else {
+          // Aborted tiny drag while adding/subtracting -> keep existing selection intact!
+          setLassoPoints([]);
+          setLassoCursor(null);
+        }
+        return;
+      }
+
+      const combined = combineSelections(
+        lassoClosed ? selectionPolys : [],
+        lassoInverted,
+        poly,
+        inverted,
+        opMode,
+        canvasWidth,
+        canvasHeight
+      );
+
+      if (combined.polys.length === 0) {
+        setSelectionPolys([]);
         setLassoPoints([]);
         setLassoClosed(false);
+        setLassoInverted(false);
+        setLassoCursor(null);
         setSelectedStrokeIds([]);
         return;
       }
+
       const activeLayer = layers.find((l) => l.id === activeLayerId);
-      const strokes = activeLayer?.frames[currentFrame] || [];
+      const strokes = activeLayer ? getEffectiveFrameStrokes(activeLayer, currentFrame) : [];
+      const bounds = getSelectionBounds(combined.polys, combined.inverted, canvasWidth, canvasHeight);
+      const pMinX = bounds ? bounds.minX : 0;
+      const pMinY = bounds ? bounds.minY : 0;
+      const pMaxX = bounds ? bounds.maxX : canvasWidth;
+      const pMaxY = bounds ? bounds.maxY : canvasHeight;
+
       const hits = strokes
-        .filter((st) => st.points.some((p) => isPointInPolygon(p, poly)))
+        .filter((st) => {
+          if (st.tool === 'image') {
+            const ix = st.imageX ?? 0;
+            const iy = st.imageY ?? 0;
+            const iw = st.imageW ?? canvasWidth;
+            const ih = st.imageH ?? canvasHeight;
+            const samples: Point[] = st.imageQuad
+              ? [
+                  st.imageQuad.tl,
+                  st.imageQuad.tr,
+                  st.imageQuad.br,
+                  st.imageQuad.bl,
+                  {
+                    x: (st.imageQuad.tl.x + st.imageQuad.tr.x + st.imageQuad.br.x + st.imageQuad.bl.x) / 4,
+                    y: (st.imageQuad.tl.y + st.imageQuad.tr.y + st.imageQuad.br.y + st.imageQuad.bl.y) / 4
+                  }
+                ]
+              : [
+                  { x: ix, y: iy },
+                  { x: ix + iw, y: iy },
+                  { x: ix + iw, y: iy + ih },
+                  { x: ix, y: iy + ih },
+                  { x: ix + iw / 2, y: iy + ih / 2 }
+                ];
+            if (samples.some((p) => isPointInSelection(p, combined.polys, combined.inverted))) return true;
+            return !combined.inverted && pMaxX >= ix && pMinX <= ix + iw && pMaxY >= iy && pMinY <= iy + ih;
+          }
+          if (st.tool === 'text' && st.points.length >= 1) {
+            const tx = st.points[0].x;
+            const ty = st.points[0].y;
+            const fs = st.fontSize || 48;
+            const lines = (st.text || '').split(/\r?\n/);
+            const maxChars = Math.max(1, ...lines.map((l) => l.length));
+            const tw = maxChars * fs * 0.6;
+            const th = lines.length * fs * 1.2;
+            return isPointInSelection({ x: tx + tw / 2, y: ty + th / 2 }, combined.polys, combined.inverted);
+          }
+          if ((st.tool === 'rectangle' || st.tool === 'ellipse' || st.tool === 'line') && st.points.length >= 2) {
+            const a = st.points[0];
+            const b = st.points[st.points.length - 1];
+            const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+            return (
+              isPointInSelection(a, combined.polys, combined.inverted) ||
+              isPointInSelection(b, combined.polys, combined.inverted) ||
+              isPointInSelection(mid, combined.polys, combined.inverted)
+            );
+          }
+          return st.points.some((p) => isPointInSelection(p, combined.polys, combined.inverted));
+        })
         .map((st) => st.id);
-      setLassoPoints(poly);
+
+      setSelectionPolys(combined.polys);
+      setLassoPoints([]);
       setLassoClosed(true);
+      setLassoInverted(combined.inverted);
       setLassoCursor(null);
       setSelectedStrokeIds(hits);
     },
-    [layers, activeLayerId, currentFrame]
+    [lassoClosed, selectionPolys, lassoInverted, layers, activeLayerId, currentFrame, canvasWidth, canvasHeight]
   );
 
   const commitPolyFill = useCallback(
@@ -318,7 +663,7 @@ export const CanvasStage: React.FC = () => {
   );
 
   const fillSelection = useCallback(() => {
-    if (!lassoClosed || lassoPoints.length < 3) return;
+    if (!lassoClosed || selectionPolys.length === 0) return;
     const newStroke: Stroke = {
       id: `st-fill-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       tool: 'fill',
@@ -328,15 +673,17 @@ export const CanvasStage: React.FC = () => {
       size: 1,
       opacity: brushOpacity,
       smoothing: 0,
-      points: lassoPoints.map((p) => ({ x: p.x, y: p.y })),
-      filled: true
+      points: selectionPolys[0].map((p) => ({ x: p.x, y: p.y })),
+      extraPolys: selectionPolys.length > 1 ? selectionPolys.slice(1).map((poly) => poly.map((p) => ({ x: p.x, y: p.y }))) : undefined,
+      filled: true,
+      inverted: lassoInverted
     };
     addStroke(newStroke);
-  }, [lassoClosed, lassoPoints, activeArtLayer, activeSwatch.id, activeColor, brushOpacity, addStroke]);
+  }, [lassoClosed, selectionPolys, lassoInverted, activeArtLayer, activeSwatch.id, activeColor, brushOpacity, addStroke]);
 
   const deleteSelection = useCallback(() => {
-    if (!lassoClosed || lassoPoints.length < 3) return;
-    // Exact polygon erase mask: ONLY erases pixels strictly inside the selection on the active layer!
+    if (!lassoClosed || selectionPolys.length === 0) return;
+    // Exact polygon erase mask: erases pixels inside selection (supports multi-contour, holes & inverted!)
     const eraseMask: Stroke = {
       id: `st-erase-poly-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       tool: 'erase_poly',
@@ -346,17 +693,23 @@ export const CanvasStage: React.FC = () => {
       size: 1,
       opacity: 1,
       smoothing: 0,
-      points: lassoPoints.map((p) => ({ x: p.x, y: p.y })),
-      filled: true
+      points: selectionPolys[0].map((p) => ({ x: p.x, y: p.y })),
+      extraPolys: selectionPolys.length > 1 ? selectionPolys.slice(1).map((poly) => poly.map((p) => ({ x: p.x, y: p.y }))) : undefined,
+      filled: true,
+      inverted: lassoInverted
     };
     addStroke(eraseMask);
     setSelectedStrokeIds([]);
-  }, [lassoClosed, lassoPoints, activeArtLayer, activeSwatch.id, addStroke]);
+  }, [lassoClosed, selectionPolys, lassoInverted, activeArtLayer, activeSwatch.id, addStroke]);
 
   const mapStrokesToQuad = useCallback(
     (origStrokes: Stroke[], bounds: { minX: number; minY: number; maxX: number; maxY: number }, quad: Quad): Stroke[] => {
       const bw = Math.max(1, bounds.maxX - bounds.minX);
       const bh = Math.max(1, bounds.maxY - bounds.minY);
+      const curW = (Math.hypot(quad.tr.x - quad.tl.x, quad.tr.y - quad.tl.y) + Math.hypot(quad.br.x - quad.bl.x, quad.br.y - quad.bl.y)) / 2;
+      const curH = (Math.hypot(quad.bl.x - quad.tl.x, quad.bl.y - quad.tl.y) + Math.hypot(quad.br.x - quad.tr.x, quad.br.y - quad.tr.y)) / 2;
+      const avgScale = Math.max(0.05, Math.min(20, (curW / bw + curH / bh) / 2));
+
       const mapPt = (px: number, py: number) => {
         const u = (px - bounds.minX) / bw;
         const v = (py - bounds.minY) / bh;
@@ -376,22 +729,44 @@ export const CanvasStage: React.FC = () => {
 
       return origStrokes.map((st) => {
         if (st.tool === 'image') {
-          const ix = st.imageX ?? 0;
-          const iy = st.imageY ?? 0;
-          const iw = st.imageW ?? canvasWidth;
-          const ih = st.imageH ?? canvasHeight;
-          const p1 = mapPt(ix, iy);
-          const p2 = mapPt(ix + iw, iy + ih);
+          const srcQuad = st.imageQuad || {
+            tl: { x: st.imageX ?? 0, y: st.imageY ?? 0 },
+            tr: { x: (st.imageX ?? 0) + (st.imageW ?? canvasWidth), y: st.imageY ?? 0 },
+            br: { x: (st.imageX ?? 0) + (st.imageW ?? canvasWidth), y: (st.imageY ?? 0) + (st.imageH ?? canvasHeight) },
+            bl: { x: st.imageX ?? 0, y: (st.imageY ?? 0) + (st.imageH ?? canvasHeight) }
+          };
+          const newQuad = {
+            tl: mapPt(srcQuad.tl.x, srcQuad.tl.y),
+            tr: mapPt(srcQuad.tr.x, srcQuad.tr.y),
+            br: mapPt(srcQuad.br.x, srcQuad.br.y),
+            bl: mapPt(srcQuad.bl.x, srcQuad.bl.y)
+          };
+          const xs = [newQuad.tl.x, newQuad.tr.x, newQuad.br.x, newQuad.bl.x];
+          const ys = [newQuad.tl.y, newQuad.tr.y, newQuad.br.y, newQuad.bl.y];
+          const minX = Math.min(...xs);
+          const minY = Math.min(...ys);
           return {
             ...st,
-            imageX: Math.min(p1.x, p2.x),
-            imageY: Math.min(p1.y, p2.y),
-            imageW: Math.max(4, Math.abs(p2.x - p1.x)),
-            imageH: Math.max(4, Math.abs(p2.y - p1.y))
+            imageX: minX,
+            imageY: minY,
+            imageW: Math.max(2, Math.max(...xs) - minX),
+            imageH: Math.max(2, Math.max(...ys) - minY),
+            imageQuad: newQuad
+          };
+        }
+        if (st.tool === 'text') {
+          return {
+            ...st,
+            fontSize: Math.max(8, Math.min(400, Math.round((st.fontSize || 48) * avgScale))),
+            points: st.points.map((pt) => {
+              const m = mapPt(pt.x, pt.y);
+              return { ...pt, x: m.x, y: m.y };
+            })
           };
         }
         return {
           ...st,
+          size: Math.max(0.5, Math.min(400, st.size * avgScale)),
           points: st.points.map((pt) => {
             const m = mapPt(pt.x, pt.y);
             return { ...pt, x: m.x, y: m.y };
@@ -404,24 +779,139 @@ export const CanvasStage: React.FC = () => {
 
   const openTransform = useCallback(() => {
     const activeLayer = layers.find((l) => l.id === activeLayerId);
-    const frameStrokes = activeLayer?.frames[currentFrame] || [];
-    const targetStrokes =
-      selectedStrokeIds.length > 0
-        ? frameStrokes.filter((s) => selectedStrokeIds.includes(s.id))
-        : frameStrokes;
-    if (targetStrokes.length === 0) return;
+    if (!activeLayer || activeLayer.locked || activeLayer.type === 'folder') return;
+    const frameStrokes = getEffectiveFrameStrokes(activeLayer, currentFrame);
+    if (frameStrokes.length === 0) return;
 
+    // Never allow Crop Mode and Free Transform to overlap
+    if (cropMode) setCropMode(false);
+
+    // If a Lasso / Rect / Ellipse / Magic Wand selection is active -> cut exact pixels inside (supports multi-contour, holes & inverted!)
+    if (lassoClosed && selectionPolys.length > 0) {
+      const bounds = getSelectionBounds(selectionPolys, lassoInverted, canvasWidth, canvasHeight);
+      if (!bounds) return;
+      const { minX, minY, maxX, maxY } = bounds;
+      if (maxX <= 0 || maxY <= 0 || minX >= canvasWidth || minY >= canvasHeight) return;
+      const bx = Math.max(0, Math.floor(minX));
+      const by = Math.max(0, Math.floor(minY));
+      const ex = Math.min(canvasWidth, Math.ceil(maxX));
+      const ey = Math.min(canvasHeight, Math.ceil(maxY));
+      const bw = ex - bx;
+      const bh = ey - by;
+      if (bw < 2 || bh < 2) return;
+
+      const full = document.createElement('canvas');
+      full.width = canvasWidth;
+      full.height = canvasHeight;
+      const fctx = full.getContext('2d');
+      if (!fctx) return;
+      for (const st of frameStrokes) renderStroke(fctx, st);
+
+      const cropCanvas = document.createElement('canvas');
+      cropCanvas.width = bw;
+      cropCanvas.height = bh;
+      const cctx = cropCanvas.getContext('2d');
+      if (!cctx) return;
+      traceSelectionPath(cctx, selectionPolys, lassoInverted, canvasWidth, canvasHeight, bx, by);
+      cctx.clip('evenodd');
+      cctx.drawImage(full, bx, by, bw, bh, 0, 0, bw, bh);
+
+      const floatingStroke: Stroke = {
+        id: `st-tf-sel-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+        tool: 'image',
+        artLayer: activeArtLayer,
+        swatchId: activeSwatch.id,
+        color: '#ffffff',
+        size: 1,
+        opacity: 1,
+        smoothing: 0,
+        points: [{ x: bx, y: by }],
+        imageDataUrl: cropCanvas.toDataURL('image/png'),
+        imageX: bx,
+        imageY: by,
+        imageW: bw,
+        imageH: bh,
+        imageQuad: {
+          tl: { x: bx, y: by },
+          tr: { x: bx + bw, y: by },
+          br: { x: bx + bw, y: by + bh },
+          bl: { x: bx, y: by + bh }
+        }
+      };
+      const eraseMask: Stroke = {
+        id: `st-tf-cut-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+        tool: 'erase_poly',
+        artLayer: activeArtLayer,
+        swatchId: activeSwatch.id,
+        color: '#000000',
+        size: 1,
+        opacity: 1,
+        smoothing: 0,
+        points: selectionPolys[0].map((p) => ({ x: p.x, y: p.y })),
+        extraPolys: selectionPolys.length > 1 ? selectionPolys.slice(1).map((poly) => poly.map((p) => ({ x: p.x, y: p.y }))) : undefined,
+        filled: true,
+        inverted: lassoInverted || undefined
+      };
+
+      // Save selection polygons + inverted flag so Esc restores them cleanly!
+      transformSavedLassoRef.current = selectionPolys.map((poly) => poly.map((p) => ({ ...p })));
+      transformSavedLassoInvertedRef.current = lassoInverted;
+      setSelectionPolys([]);
+      setLassoPoints([]);
+      setLassoClosed(false);
+      setLassoInverted(false);
+      setLassoCursor(null);
+      setSelectedStrokeIds([]);
+      setTransformCutEraseMask(eraseMask);
+      setTransformOrigStrokes([floatingStroke]);
+      setTransformOrigBounds({ minX: bx, minY: by, maxX: bx + bw, maxY: by + bh });
+      setTransformQuad({
+        tl: { x: bx, y: by },
+        tr: { x: bx + bw, y: by },
+        br: { x: bx + bw, y: by + bh },
+        bl: { x: bx, y: by + bh }
+      });
+      setTransformQuadHistory([]);
+      setTransformQuadRedo([]);
+      setTransformSubMode('scale');
+      setTransformMenuPos(null);
+      setTransformActive(true);
+      return;
+    }
+
+    // No selection active -> transform all strokes on the current frame!
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    for (const st of targetStrokes) {
+    for (const st of frameStrokes) {
       if (st.tool === 'image') {
-        const ix = st.imageX ?? 0;
-        const iy = st.imageY ?? 0;
-        const iw = st.imageW ?? canvasWidth;
-        const ih = st.imageH ?? canvasHeight;
-        if (ix < minX) minX = ix;
-        if (iy < minY) minY = iy;
-        if (ix + iw > maxX) maxX = ix + iw;
-        if (iy + ih > maxY) maxY = iy + ih;
+        if (st.imageQuad) {
+          for (const p of [st.imageQuad.tl, st.imageQuad.tr, st.imageQuad.br, st.imageQuad.bl]) {
+            if (p.x < minX) minX = p.x;
+            if (p.y < minY) minY = p.y;
+            if (p.x > maxX) maxX = p.x;
+            if (p.y > maxY) maxY = p.y;
+          }
+        } else {
+          const ix = st.imageX ?? 0;
+          const iy = st.imageY ?? 0;
+          const iw = st.imageW ?? canvasWidth;
+          const ih = st.imageH ?? canvasHeight;
+          if (ix < minX) minX = ix;
+          if (iy < minY) minY = iy;
+          if (ix + iw > maxX) maxX = ix + iw;
+          if (iy + ih > maxY) maxY = iy + ih;
+        }
+      } else if (st.tool === 'text' && st.points.length >= 1) {
+        const tx = st.points[0].x;
+        const ty = st.points[0].y;
+        const fs = st.fontSize || 48;
+        const lines = (st.text || '').split(/\r?\n/);
+        const maxChars = Math.max(1, ...lines.map((l) => l.length));
+        const tw = Math.max(fs, maxChars * fs * 0.62);
+        const th = Math.max(fs, lines.length * fs * 1.2);
+        if (tx < minX) minX = tx;
+        if (ty < minY) minY = ty;
+        if (tx + tw > maxX) maxX = tx + tw;
+        if (ty + th > maxY) maxY = ty + th;
       } else {
         for (const p of st.points) {
           if (p.x < minX) minX = p.x;
@@ -435,7 +925,11 @@ export const CanvasStage: React.FC = () => {
     if (maxX - minX < 10) { minX -= 5; maxX += 5; }
     if (maxY - minY < 10) { minY -= 5; maxY += 5; }
 
-    setTransformOrigStrokes(JSON.parse(JSON.stringify(targetStrokes)));
+    transformSavedLassoRef.current = null;
+    setTransformCutEraseMask(null);
+    setTransformOrigStrokes(
+      typeof structuredClone === 'function' ? structuredClone(frameStrokes) : JSON.parse(JSON.stringify(frameStrokes))
+    );
     setTransformOrigBounds({ minX, minY, maxX, maxY });
     setTransformQuad({
       tl: { x: minX, y: minY },
@@ -443,30 +937,109 @@ export const CanvasStage: React.FC = () => {
       br: { x: maxX, y: maxY },
       bl: { x: minX, y: maxY }
     });
+    setTransformQuadHistory([]);
+    setTransformQuadRedo([]);
     setTransformSubMode('scale');
+    setTransformMenuPos(null);
     setTransformActive(true);
-  }, [layers, activeLayerId, currentFrame, selectedStrokeIds, canvasWidth, canvasHeight]);
+  }, [layers, activeLayerId, currentFrame, cropMode, setCropMode, lassoClosed, selectionPolys, lassoInverted, activeArtLayer, activeSwatch.id, canvasWidth, canvasHeight]);
 
   const commitTransform = useCallback(() => {
     if (!transformActive || !transformOrigBounds || !transformQuad) return;
     const mapped = mapStrokesToQuad(transformOrigStrokes, transformOrigBounds, transformQuad);
-    replaceStrokes(mapped);
+    if (transformCutEraseMask) {
+      addStrokesBatch([transformCutEraseMask, ...mapped], true, true);
+    } else {
+      replaceStrokes(mapped);
+    }
+    transformSavedLassoRef.current = null;
+    transformSavedLassoInvertedRef.current = false;
     setTransformActive(false);
     setTransformQuad(null);
+    setTransformQuadHistory([]);
+    setTransformQuadRedo([]);
     setTransformOrigBounds(null);
     setTransformOrigStrokes([]);
-  }, [transformActive, transformOrigBounds, transformQuad, transformOrigStrokes, mapStrokesToQuad, replaceStrokes]);
+    setTransformCutEraseMask(null);
+    setTransformMenuPos(null);
+    setActiveTransformHandle(null);
+    setTransformDragStart(null);
+    captureTimelapseStep();
+  }, [transformActive, transformOrigBounds, transformQuad, transformOrigStrokes, transformCutEraseMask, mapStrokesToQuad, addStrokesBatch, replaceStrokes, captureTimelapseStep]);
 
   const cancelTransform = useCallback(() => {
+    if (transformSavedLassoRef.current && transformSavedLassoRef.current.length > 0) {
+      setSelectionPolys(transformSavedLassoRef.current);
+      setLassoPoints([]);
+      setLassoClosed(true);
+      setLassoInverted(transformSavedLassoInvertedRef.current);
+    }
+    transformSavedLassoRef.current = null;
+    transformSavedLassoInvertedRef.current = false;
     setTransformActive(false);
     setTransformQuad(null);
+    setTransformQuadHistory([]);
+    setTransformQuadRedo([]);
     setTransformOrigBounds(null);
     setTransformOrigStrokes([]);
+    setTransformCutEraseMask(null);
+    setTransformMenuPos(null);
+    setActiveTransformHandle(null);
+    setTransformDragStart(null);
   }, []);
 
-  const rotateQuadBy = useCallback((deg: number) => {
-    setTransformQuad((q) => {
-      if (!q) return q;
+  // Automatically cancel transform if user switches layer or frame
+  useEffect(() => {
+    if (transformActive) cancelTransform();
+  }, [activeLayerId, currentFrame]);
+
+  const cloneQuad = (q: Quad): Quad => ({
+    tl: { ...q.tl },
+    tr: { ...q.tr },
+    br: { ...q.br },
+    bl: { ...q.bl }
+  });
+
+  const undoTransformStep = useCallback(() => {
+    if (!transformActive || !transformQuad) return;
+    if (transformQuadHistory.length === 0) {
+      cancelTransform();
+      return;
+    }
+    const prevQuad = transformQuadHistory[transformQuadHistory.length - 1];
+    setTransformQuadHistory((h) => h.slice(0, -1));
+    setTransformQuadRedo((r) => [...r, cloneQuad(transformQuad)]);
+    setTransformQuad(prevQuad);
+  }, [transformActive, transformQuad, transformQuadHistory, cancelTransform]);
+
+  const redoTransformStep = useCallback(() => {
+    if (!transformActive || !transformQuad || transformQuadRedo.length === 0) return;
+    const nextQuad = transformQuadRedo[transformQuadRedo.length - 1];
+    setTransformQuadRedo((r) => r.slice(0, -1));
+    setTransformQuadHistory((h) => [...h, cloneQuad(transformQuad)]);
+    setTransformQuad(nextQuad);
+  }, [transformActive, transformQuad, transformQuadRedo]);
+
+  const flipQuadH = useCallback(() => {
+    if (!transformQuad) return;
+    setTransformQuadHistory((h) => [...h.slice(-29), cloneQuad(transformQuad)]);
+    setTransformQuadRedo([]);
+    setTransformQuad({ tl: transformQuad.tr, tr: transformQuad.tl, br: transformQuad.bl, bl: transformQuad.br });
+  }, [transformQuad]);
+
+  const flipQuadV = useCallback(() => {
+    if (!transformQuad) return;
+    setTransformQuadHistory((h) => [...h.slice(-29), cloneQuad(transformQuad)]);
+    setTransformQuadRedo([]);
+    setTransformQuad({ tl: transformQuad.bl, tr: transformQuad.br, br: transformQuad.tr, bl: transformQuad.tl });
+  }, [transformQuad]);
+
+  const rotateQuadBy = useCallback(
+    (deg: number) => {
+      if (!transformQuad) return;
+      setTransformQuadHistory((h) => [...h.slice(-29), cloneQuad(transformQuad)]);
+      setTransformQuadRedo([]);
+      const q = transformQuad;
       const cx = (q.tl.x + q.tr.x + q.br.x + q.bl.x) / 4;
       const cy = (q.tl.y + q.tr.y + q.br.y + q.bl.y) / 4;
       const rad = (deg * Math.PI) / 180;
@@ -476,9 +1049,10 @@ export const CanvasStage: React.FC = () => {
         x: cx + (p.x - cx) * cos - (p.y - cy) * sin,
         y: cy + (p.x - cx) * sin + (p.y - cy) * cos
       });
-      return { tl: r(q.tl), tr: r(q.tr), br: r(q.br), bl: r(q.bl) };
-    });
-  }, []);
+      setTransformQuad({ tl: r(q.tl), tr: r(q.tr), br: r(q.br), bl: r(q.bl) });
+    },
+    [transformQuad]
+  );
 
   const hitTestTransformHandle = useCallback(
     (pt: Point, q: Quad): TransformHandle | null => {
@@ -504,53 +1078,79 @@ export const CanvasStage: React.FC = () => {
     [zoom]
   );
 
-  // Ctrl+T to open Transform, Enter to commit, Escape to cancel
+  // Ctrl+T to open Transform, Ctrl+Z / Ctrl+Shift+Z step undo/redo inside Transform, Enter to commit, Escape to cancel, Arrow keys to nudge
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      if (isTextEditingTarget(e.target)) return;
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 't') {
         e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation();
         if (transformActive) commitTransform();
         else openTransform();
+      } else if (transformActive && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+        e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+        if (e.shiftKey) redoTransformStep();
+        else undoTransformStep();
       } else if (transformActive && e.key === 'Enter') {
         e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation();
         commitTransform();
       } else if (transformActive && e.key === 'Escape') {
         e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation();
         cancelTransform();
+      } else if (
+        transformActive &&
+        (e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.key === 'ArrowLeft' || e.key === 'ArrowRight')
+      ) {
+        e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+        const step = e.shiftKey ? 10 : 1;
+        const dx = e.key === 'ArrowLeft' ? -step : e.key === 'ArrowRight' ? step : 0;
+        const dy = e.key === 'ArrowUp' ? -step : e.key === 'ArrowDown' ? step : 0;
+        if (transformQuad) {
+          setTransformQuadHistory((h) => [...h.slice(-29), cloneQuad(transformQuad)]);
+          setTransformQuadRedo([]);
+          setTransformQuad({
+            tl: { x: transformQuad.tl.x + dx, y: transformQuad.tl.y + dy },
+            tr: { x: transformQuad.tr.x + dx, y: transformQuad.tr.y + dy },
+            br: { x: transformQuad.br.x + dx, y: transformQuad.br.y + dy },
+            bl: { x: transformQuad.bl.x + dx, y: transformQuad.bl.y + dy }
+          });
+        }
       }
     };
     window.addEventListener('keydown', onKeyDown, { capture: true });
     return () => window.removeEventListener('keydown', onKeyDown, { capture: true });
-  }, [transformActive, openTransform, commitTransform, cancelTransform]);
+  }, [transformActive, transformQuad, openTransform, commitTransform, cancelTransform, undoTransformStep, redoTransformStep]);
 
   // Selection keyboard controls: Ctrl+A (Select All), Alt+Backspace (Fill), Delete/Backspace, Enter, Esc/Ctrl+D
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      if (isTextEditingTarget(e.target)) return;
 
-      if ((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === 'c' || e.key.toLowerCase() === 'x') && lassoClosed && lassoPoints.length >= 3) {
+      if ((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === 'c' || e.key.toLowerCase() === 'x') && lassoClosed && selectionPolys.length > 0) {
         e.preventDefault();
         e.stopPropagation();
         e.stopImmediatePropagation();
         const isCut = e.key.toLowerCase() === 'x';
-        // Crop ONLY the exact pixels inside the selection polygon from the active layer!
         const activeLayer = layers.find((l) => l.id === activeLayerId);
         if (!activeLayer) return;
         const strokes = getEffectiveFrameStrokes(activeLayer, currentFrame);
         if (strokes.length === 0) return;
 
-        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-        for (const p of lassoPoints) {
-          if (p.x < minX) minX = p.x;
-          if (p.y < minY) minY = p.y;
-          if (p.x > maxX) maxX = p.x;
-          if (p.y > maxY) maxY = p.y;
-        }
-        const bx = Math.max(0, Math.floor(minX));
-        const by = Math.max(0, Math.floor(minY));
-        const bw = Math.max(2, Math.min(canvasWidth - bx, Math.ceil(maxX - bx)));
-        const bh = Math.max(2, Math.min(canvasHeight - by, Math.ceil(maxY - by)));
+        const bounds = getSelectionBounds(selectionPolys, lassoInverted, canvasWidth, canvasHeight);
+        if (!bounds) return;
+        const bx = Math.max(0, Math.floor(bounds.minX));
+        const by = Math.max(0, Math.floor(bounds.minY));
+        const bw = Math.max(2, Math.min(canvasWidth - bx, Math.ceil(bounds.maxX - bx)));
+        const bh = Math.max(2, Math.min(canvasHeight - by, Math.ceil(bounds.maxY - by)));
 
         const full = document.createElement('canvas');
         full.width = canvasWidth;
@@ -566,13 +1166,8 @@ export const CanvasStage: React.FC = () => {
         cropCanvas.height = bh;
         const cctx = cropCanvas.getContext('2d');
         if (!cctx) return;
-        cctx.beginPath();
-        cctx.moveTo(lassoPoints[0].x - bx, lassoPoints[0].y - by);
-        for (let i = 1; i < lassoPoints.length; i++) {
-          cctx.lineTo(lassoPoints[i].x - bx, lassoPoints[i].y - by);
-        }
-        cctx.closePath();
-        cctx.clip();
+        traceSelectionPath(cctx, selectionPolys, lassoInverted, canvasWidth, canvasHeight, bx, by);
+        cctx.clip('evenodd');
         cctx.drawImage(full, bx, by, bw, bh, 0, 0, bw, bh);
 
         const croppedStroke: Stroke = {
@@ -606,35 +1201,38 @@ export const CanvasStage: React.FC = () => {
           { x: canvasWidth, y: canvasHeight },
           { x: 0, y: canvasHeight }
         ];
-        closeLassoAndSelect(fullRect);
+        closeLassoAndSelect(fullRect, false, 'replace');
         return;
       }
 
-      if (e.altKey && e.key === 'Backspace' && lassoClosed && lassoPoints.length >= 3) {
+      if (e.altKey && e.key === 'Backspace' && lassoClosed && selectionPolys.length > 0) {
         e.preventDefault();
         fillSelection();
         return;
       }
 
-      if ((e.key === 'Delete' || e.key === 'Backspace') && lassoClosed && lassoPoints.length >= 3) {
+      if ((e.key === 'Delete' || e.key === 'Backspace') && lassoClosed && selectionPolys.length > 0) {
         e.preventDefault();
         e.stopPropagation();
         e.stopImmediatePropagation();
         deleteSelection();
       } else if (e.key === 'Escape' || ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'd')) {
-        if (lassoPoints.length > 0) {
+        if (lassoPoints.length > 0 || selectionPolys.length > 0) {
           e.preventDefault();
+          setSelectionPolys([]);
           setLassoPoints([]);
           setLassoClosed(false);
+          setLassoInverted(false);
           setLassoCursor(null);
           setSelectedStrokeIds([]);
         }
-      } else if (e.key === 'Enter' && lassoPoints.length >= 3 && !lassoClosed) {
+      } else if (e.key === 'Enter' && lassoPoints.length >= 3) {
         e.preventDefault();
         if (activeTool === 'polylassofill') {
           commitPolyFill(lassoPoints);
         } else {
-          closeLassoAndSelect(lassoPoints);
+          closeLassoAndSelect(lassoPoints, false, selectionOpModeRef.current);
+          selectionOpModeRef.current = 'replace';
         }
       }
     };
@@ -643,8 +1241,12 @@ export const CanvasStage: React.FC = () => {
   }, [
     canvasWidth,
     canvasHeight,
+    selectionPolys,
     lassoPoints,
     lassoClosed,
+    lassoInverted,
+    activeTool,
+    commitPolyFill,
     closeLassoAndSelect,
     fillSelection,
     deleteSelection,
@@ -659,7 +1261,7 @@ export const CanvasStage: React.FC = () => {
   // Hold Space to pan, Hold R to rotate canvas
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      if (isTextEditingTarget(e.target)) return;
       if (e.code === 'Space' && !e.shiftKey) {
         e.preventDefault();
         setSpaceHeld(true);
@@ -683,13 +1285,7 @@ export const CanvasStage: React.FC = () => {
         setDHeld(false);
       } else if (e.key === 'Alt') {
         setAltHeld(false);
-        setEyedropperPreviewHex((hex) => {
-          if (hex) {
-            setActiveColor(hex);
-            pushRecentColor(hex);
-          }
-          return null;
-        });
+        setEyedropperPreviewHex(null);
       }
     };
     const onBlur = () => {
@@ -734,8 +1330,11 @@ export const CanvasStage: React.FC = () => {
     [panX, panY, rotation, zoom, flipX, canvasWidth, canvasHeight]
   );
 
-  // Main render loop
+  // Main render loop (also exposed via drawStageRef for zero-React-re-render rAF pen painting!)
   useEffect(() => {
+    const paintStage = () => {
+    const draftStroke = draftStrokeRef.current;
+    const stabilizerCursor = stabilizerCursorRef.current;
     const canvas = canvasRef.current;
     const container = containerRef.current;
     if (!canvas || !container) return;
@@ -871,54 +1470,68 @@ export const CanvasStage: React.FC = () => {
     };
 
     // Render all visible layers bottom-to-top, clipped strictly to the canvas bounds!
+    const activeCamLayer = getActiveCameraLayer(layers);
+    const activeCamState = activeCamLayer ? getInterpolatedCamera(activeCamLayer, currentFrame) : null;
+    const isThroughCamera = Boolean(cameraViewMode && activeCamLayer && activeCamState);
+    const useLivePostProcess = hasActivePostProcess(postProcess);
+
     if (lctx) {
-      ctx.save();
-      ctx.beginPath();
-      ctx.rect(0, 0, canvasWidth, canvasHeight);
-      ctx.clip();
-
-      const ordered = [...layers].reverse();
-      for (const layer of ordered) {
-        if (!isLayerEffectivelyVisible(layer, layers)) continue;
-        const isCurrent = layer.id === activeLayerId;
-
-        if (onionSkin && !layer.holdFrames) {
-          // Previous frames (reddish tint — cached!)
-          for (let offset = onionPrev; offset >= 1; offset--) {
-            const f = currentFrame - offset;
-            if (f < 1) continue;
-            const prevStrokes = layer.frames[f];
-            if (!prevStrokes || prevStrokes.length === 0) continue;
-            const bmp = getCachedLayerBitmap(`${layer.id}:${f}:prev`, prevStrokes, '#e04848');
-            ctx.save();
-            ctx.globalAlpha = 0.45 / offset;
-            ctx.drawImage(bmp, 0, 0);
-            ctx.restore();
-          }
-          // Next frames (greenish tint — cached!)
-          for (let offset = 1; offset <= onionNext; offset++) {
-            const f = currentFrame + offset;
-            const nextStrokes = layer.frames[f];
-            if (!nextStrokes || nextStrokes.length === 0) continue;
-            const bmp = getCachedLayerBitmap(`${layer.id}:${f}:next`, nextStrokes, '#32b85c');
-            ctx.save();
-            ctx.globalAlpha = 0.45 / offset;
-            ctx.drawImage(bmp, 0, 0);
-            ctx.restore();
-          }
+      let stageCtx: CanvasRenderingContext2D = ctx;
+      if (useLivePostProcess) {
+        if (!postProcessCanvasRef.current) {
+          postProcessCanvasRef.current = document.createElement('canvas');
         }
+        const ppCanvas = postProcessCanvasRef.current;
+        if (ppCanvas.width !== canvasWidth || ppCanvas.height !== canvasHeight) {
+          ppCanvas.width = canvasWidth;
+          ppCanvas.height = canvasHeight;
+        }
+        const ppCtx = ppCanvas.getContext('2d');
+        if (ppCtx) {
+          ppCtx.setTransform(1, 0, 0, 1, 0, 0);
+          ppCtx.clearRect(0, 0, canvasWidth, canvasHeight);
+          ppCtx.fillStyle = '#ffffff';
+          ppCtx.fillRect(0, 0, canvasWidth, canvasHeight);
+          stageCtx = ppCtx;
+        }
+      }
 
+      stageCtx.save();
+      stageCtx.beginPath();
+      stageCtx.rect(0, 0, canvasWidth, canvasHeight);
+      stageCtx.clip();
+
+      // If "Ver pela Câmera" (Camera View Mode) is ON, apply the exact 2D Camera lens transform!
+      if (isThroughCamera && activeCamState) {
+        applyCameraTransformToCtx(stageCtx, activeCamState, canvasWidth, canvasHeight);
+      }
+
+      const ordered = [...layers].reverse().filter((l) => l.type !== 'camera');
+      const renderLayerInto = (
+        targetCtx: CanvasRenderingContext2D,
+        layer: (typeof ordered)[number],
+        compositeOp: GlobalCompositeOperation
+      ) => {
+        const isCurrent = layer.id === activeLayerId;
         const strokes = getEffectiveFrameStrokes(layer, currentFrame);
-
-        if (strokes.length === 0 && !(isCurrent && draftStroke)) continue;
+        if (strokes.length === 0 && !(isCurrent && draftStroke)) return;
 
         let sourceCanvas: HTMLCanvasElement;
-        if (isCurrent && transformActive) {
+        if (isCurrent && liquifyPreview) {
+          lctx.clearRect(0, 0, canvasWidth, canvasHeight);
+          for (const st of liquifyPreview) {
+            renderStroke(lctx, st);
+          }
+          sourceCanvas = layerBuffer;
+        } else if (isCurrent && transformActive) {
           lctx.clearRect(0, 0, canvasWidth, canvasHeight);
           const transformingIds = new Set(transformOrigStrokes.map((s) => s.id));
           for (const st of strokes) {
             if (transformingIds.has(st.id)) continue;
             renderStroke(lctx, st);
+          }
+          if (transformCutEraseMask) {
+            renderStroke(lctx, transformCutEraseMask);
           }
           if (transformOrigBounds && transformQuad) {
             const previewStrokes = mapStrokesToQuad(transformOrigStrokes, transformOrigBounds, transformQuad);
@@ -938,18 +1551,20 @@ export const CanvasStage: React.FC = () => {
               ? { ...draftStroke, alphaLock: true }
               : draftStroke;
           renderStroke(lctx, effectiveDraft);
+          if (symmetryMode === 'vertical' && effectiveDraft.points.length > 0) {
+            renderStroke(lctx, {
+              ...effectiveDraft,
+              points: effectiveDraft.points.map((p) => ({ ...p, x: canvasWidth - p.x }))
+            });
+          }
           sourceCanvas = layerBuffer;
         } else {
           sourceCanvas = getCachedLayerBitmap(`${layer.id}:${currentFrame}:base`, strokes);
         }
 
         const kf = getInterpolatedLayerTransform(layer, currentFrame);
-        ctx.save();
+        const effOpacity = getLayerEffectiveOpacity(layer, layers, currentFrame);
         const lightTableDim = lightTable && !isCurrent ? 0.3 : 1;
-        ctx.globalAlpha = kf.opacity * lightTableDim;
-        ctx.globalCompositeOperation = layer.clippingMask
-          ? 'source-atop'
-          : layer.blendMode || 'source-over';
 
         const filters: string[] = [];
         if (layer.effects) {
@@ -961,20 +1576,225 @@ export const CanvasStage: React.FC = () => {
             filters.push('drop-shadow(6px 6px 8px rgba(0,0,0,0.45))');
           }
         }
-        if (isCurrent && hsvPreview) {
-          const satPct = Math.max(0, 100 + hsvPreview.s);
-          const briPct = Math.max(0, 100 + hsvPreview.v);
-          filters.push(`hue-rotate(${hsvPreview.h}deg) saturate(${satPct}%) brightness(${briPct}%)`);
-        }
-        if (filters.length > 0) {
-          ctx.filter = filters.join(' ');
+        const activeHsv = isCurrent && hsvPreview && !isNoopHsv(hsvPreview) ? hsvPreview : null;
+        const activeLevels = isCurrent && levelsPreview && !isNoopLevels(levelsPreview) ? levelsPreview : null;
+        const activeBlur = isCurrent && blurPreview && !isNoopBlur(blurPreview) ? blurPreview : null;
+        const activeColorAdj = activeHsv || activeLevels || activeBlur;
+        const adjAllFrames = activeHsv
+          ? activeHsv.allFrames
+          : activeLevels
+            ? activeLevels.allFrames
+            : activeBlur
+              ? activeBlur.allFrames
+              : false;
+        const hasSelectionHsv = Boolean(activeColorAdj && !adjAllFrames && lassoClosed && selectionPolys.length > 0);
+
+        let hsvFilteredCanvas: HTMLCanvasElement | null = null;
+        if (activeColorAdj) {
+          const adjSig = activeHsv
+            ? `hsv:${activeHsv.h},${activeHsv.s},${activeHsv.v}`
+            : activeLevels
+              ? `lvl:${activeLevels.blackPoint},${activeLevels.gamma},${activeLevels.whitePoint},${activeLevels.brightness},${activeLevels.contrast}`
+              : `blur:${activeBlur!.mode},${activeBlur!.radius},${activeBlur!.angle},${activeBlur!.direction},${activeBlur!.radialStyle},${activeBlur!.centerX},${activeBlur!.centerY}`;
+          const cacheKey = `${layer.id}:${currentFrame}:${canvasWidth}x${canvasHeight}:${adjSig}:${strokes.length}`;
+          if (!hsvPreviewCanvasRef.current) {
+            hsvPreviewCanvasRef.current = document.createElement('canvas');
+          }
+          if (hsvPreviewKeyRef.current !== cacheKey || hsvPreviewStrokesRef.current !== strokes || sourceCanvas === layerBuffer) {
+            if (activeHsv) {
+              applyHslToCanvas(sourceCanvas, hsvPreviewCanvasRef.current, activeHsv);
+            } else if (activeLevels) {
+              applyLevelsToCanvas(sourceCanvas, hsvPreviewCanvasRef.current, activeLevels);
+            } else if (activeBlur) {
+              applyBlurToCanvas(sourceCanvas, hsvPreviewCanvasRef.current, activeBlur);
+            }
+            hsvPreviewKeyRef.current = cacheKey;
+            hsvPreviewStrokesRef.current = strokes;
+          }
+          hsvFilteredCanvas = hsvPreviewCanvasRef.current;
         }
 
-        ctx.translate(canvasWidth / 2 + kf.x, canvasHeight / 2 + kf.y);
-        ctx.rotate((kf.rotation * Math.PI) / 180);
-        ctx.scale(kf.scale, kf.scale);
-        ctx.drawImage(sourceCanvas, -canvasWidth / 2, -canvasHeight / 2);
+        const clipSelectedRegion = (c: CanvasRenderingContext2D) => {
+          traceSelectionPath(c, selectionPolys, lassoInverted, canvasWidth, canvasHeight);
+          c.clip('evenodd');
+        };
+        const clipUnselectedRegion = (c: CanvasRenderingContext2D) => {
+          traceSelectionPath(c, selectionPolys, !lassoInverted, canvasWidth, canvasHeight);
+          c.clip('evenodd');
+        };
+
+        targetCtx.save();
+        targetCtx.globalAlpha = effOpacity * lightTableDim;
+        targetCtx.globalCompositeOperation = compositeOp;
+        if (filters.length > 0) {
+          targetCtx.filter = filters.join(' ');
+        }
+        if (hasSelectionHsv) {
+          clipUnselectedRegion(targetCtx);
+        }
+        targetCtx.translate(canvasWidth / 2 + kf.x, canvasHeight / 2 + kf.y);
+        targetCtx.rotate((kf.rotation * Math.PI) / 180);
+        targetCtx.scale(kf.scale, kf.scale);
+        targetCtx.drawImage(
+          activeColorAdj && !hasSelectionHsv && hsvFilteredCanvas ? hsvFilteredCanvas : sourceCanvas,
+          -canvasWidth / 2,
+          -canvasHeight / 2
+        );
+        targetCtx.restore();
+
+        if (hasSelectionHsv && hsvFilteredCanvas) {
+          targetCtx.save();
+          clipSelectedRegion(targetCtx);
+          targetCtx.globalAlpha = effOpacity * lightTableDim;
+          targetCtx.globalCompositeOperation = compositeOp;
+          if (filters.length > 0) {
+            targetCtx.filter = filters.join(' ');
+          }
+          targetCtx.translate(canvasWidth / 2 + kf.x, canvasHeight / 2 + kf.y);
+          targetCtx.rotate((kf.rotation * Math.PI) / 180);
+          targetCtx.scale(kf.scale, kf.scale);
+          targetCtx.drawImage(hsvFilteredCanvas, -canvasWidth / 2, -canvasHeight / 2);
+          targetCtx.restore();
+        }
+      };
+
+      let idx = 0;
+      while (idx < ordered.length) {
+        const layer = ordered[idx];
+        if (!isLayerEffectivelyVisible(layer, layers)) {
+          idx++;
+          continue;
+        }
+
+        if (onionSkin && !layer.holdFrames) {
+          // Drawing-aware Onion Skin: step through distinct drawn cels (works cleanly on 2s/3s & celDurations!)
+          const drawnFrames = Object.entries(layer.frames)
+            .filter(([, st]) => st && st.length > 0)
+            .map(([k]) => Number(k))
+            .sort((a, b) => a - b);
+          let activeCelStart = currentFrame;
+          if (layer.frames[currentFrame] === undefined && layer.celDurations) {
+            for (const f of drawnFrames) {
+              if (f < currentFrame && f + Math.max(1, layer.celDurations[f] || 1) > currentFrame) {
+                activeCelStart = f;
+              }
+            }
+          }
+          const prevDrawn = drawnFrames.filter((f) => f < activeCelStart);
+          const nextDrawn = drawnFrames.filter((f) => f > activeCelStart);
+
+          const prevSlice = prevDrawn.slice(-onionPrev);
+          for (let i = 0; i < prevSlice.length; i++) {
+            const f = prevSlice[i];
+            const stepDist = prevSlice.length - i;
+            const prevStrokes = layer.frames[f];
+            if (!prevStrokes || prevStrokes.length === 0) continue;
+            const bmp = getCachedLayerBitmap(`${layer.id}:${f}:prev`, prevStrokes, '#e04848');
+            const okf = getInterpolatedLayerTransform(layer, f);
+            ctx.save();
+            ctx.globalAlpha = 0.45 / stepDist;
+            ctx.translate(canvasWidth / 2 + okf.x, canvasHeight / 2 + okf.y);
+            ctx.rotate((okf.rotation * Math.PI) / 180);
+            ctx.scale(okf.scale, okf.scale);
+            ctx.drawImage(bmp, -canvasWidth / 2, -canvasHeight / 2);
+            ctx.restore();
+          }
+          const nextSlice = nextDrawn.slice(0, onionNext);
+          for (let i = 0; i < nextSlice.length; i++) {
+            const f = nextSlice[i];
+            const stepDist = i + 1;
+            const nextStrokes = layer.frames[f];
+            if (!nextStrokes || nextStrokes.length === 0) continue;
+            const bmp = getCachedLayerBitmap(`${layer.id}:${f}:next`, nextStrokes, '#32b85c');
+            const okf = getInterpolatedLayerTransform(layer, f);
+            ctx.save();
+            ctx.globalAlpha = 0.45 / stepDist;
+            ctx.translate(canvasWidth / 2 + okf.x, canvasHeight / 2 + okf.y);
+            ctx.rotate((okf.rotation * Math.PI) / 180);
+            ctx.scale(okf.scale, okf.scale);
+            ctx.drawImage(bmp, -canvasWidth / 2, -canvasHeight / 2);
+            ctx.restore();
+          }
+        }
+
+        // Collect any consecutive clippingMask layers directly above this base layer (WYSIWYG with export!)
+        const clippedChildren: typeof ordered = [];
+        let look = idx + 1;
+        while (look < ordered.length && ordered[look].clippingMask) {
+          if (isLayerEffectivelyVisible(ordered[look], layers)) {
+            clippedChildren.push(ordered[look]);
+          }
+          look++;
+        }
+
+        if (clippedChildren.length > 0 && !layer.clippingMask) {
+          if (!clipGroupCanvasRef.current) {
+            clipGroupCanvasRef.current = document.createElement('canvas');
+          }
+          const gCanvas = clipGroupCanvasRef.current;
+          if (gCanvas.width !== canvasWidth || gCanvas.height !== canvasHeight) {
+            gCanvas.width = canvasWidth;
+            gCanvas.height = canvasHeight;
+          }
+          const gctx = gCanvas.getContext('2d');
+          if (gctx) {
+            gctx.clearRect(0, 0, canvasWidth, canvasHeight);
+            renderLayerInto(gctx, layer, 'source-over');
+            for (const clipChild of clippedChildren) {
+              renderLayerInto(gctx, clipChild, 'source-atop');
+            }
+            stageCtx.save();
+            stageCtx.globalCompositeOperation = layer.blendMode || 'source-over';
+            stageCtx.drawImage(gCanvas, 0, 0);
+            stageCtx.restore();
+          }
+          idx = look;
+          continue;
+        }
+
+        renderLayerInto(stageCtx, layer, layer.blendMode || 'source-over');
+        idx++;
+      }
+      stageCtx.restore();
+
+      if (useLivePostProcess && postProcessCanvasRef.current) {
+        applyPostProcessToCanvas(postProcessCanvasRef.current, postProcess);
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(0, 0, canvasWidth, canvasHeight);
+        ctx.clip();
+        ctx.drawImage(postProcessCanvasRef.current, 0, 0);
         ctx.restore();
+      }
+    }
+
+    // Live Gradient Tool drag guide line (start -> end handle)
+    if (isDrawing && draftStroke && draftStroke.tool === 'gradient' && draftStroke.points.length >= 2) {
+      const p0 = draftStroke.points[0];
+      const p1 = draftStroke.points[draftStroke.points.length - 1];
+      ctx.save();
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 2 / zoom;
+      ctx.beginPath();
+      ctx.moveTo(p0.x, p0.y);
+      ctx.lineTo(p1.x, p1.y);
+      ctx.stroke();
+      ctx.strokeStyle = '#111111';
+      ctx.lineWidth = 1.2 / zoom;
+      ctx.setLineDash([5 / zoom, 4 / zoom]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      for (const [pt, col] of [
+        [p0, activeColor],
+        [p1, gradientToTransparent ? '#ffffff' : secondaryColor]
+      ] as [Point, string][]) {
+        ctx.fillStyle = col;
+        ctx.strokeStyle = '#111111';
+        ctx.lineWidth = 1.5 / zoom;
+        ctx.beginPath();
+        ctx.arc(pt.x, pt.y, 6 / zoom, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
       }
       ctx.restore();
     }
@@ -1080,7 +1900,26 @@ export const CanvasStage: React.FC = () => {
       ctx.restore();
     }
 
-    // Lasso Selection Overlay (Photoshop-style marching ants)
+    // Lasso Selection Overlay (Photoshop-style marching ants — supports multi-island Shift=Add, Alt=Subtract & inverted!)
+    if (lassoClosed && selectionPolys.length > 0) {
+      ctx.save();
+      traceSelectionPath(ctx, selectionPolys, lassoInverted, canvasWidth, canvasHeight);
+      ctx.fillStyle = 'rgba(58, 134, 255, 0.11)';
+      ctx.fill('evenodd');
+
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 1.5 / zoom;
+      ctx.setLineDash([]);
+      ctx.stroke();
+
+      ctx.strokeStyle = '#111111';
+      ctx.lineWidth = 1.5 / zoom;
+      ctx.setLineDash([6 / zoom, 5 / zoom]);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // In-progress draft selection contour (shown alongside existing selection when Shift=Add or Alt=Subtract!)
     if (lassoPoints.length > 0) {
       ctx.save();
       ctx.beginPath();
@@ -1088,11 +1927,7 @@ export const CanvasStage: React.FC = () => {
       for (let i = 1; i < lassoPoints.length; i++) {
         ctx.lineTo(lassoPoints[i].x, lassoPoints[i].y);
       }
-      if (lassoClosed) {
-        ctx.closePath();
-        ctx.fillStyle = 'rgba(58, 134, 255, 0.10)';
-        ctx.fill();
-      } else if (lassoCursor) {
+      if (lassoCursor) {
         ctx.lineTo(lassoCursor.x, lassoCursor.y);
         if (activeTool === 'polylassofill' && lassoPoints.length >= 2) {
           ctx.save();
@@ -1104,9 +1939,9 @@ export const CanvasStage: React.FC = () => {
         }
       }
 
-      // White base + black dashed outline
-      ctx.strokeStyle = '#ffffff';
-      ctx.lineWidth = 1.5 / zoom;
+      const opMode = selectionOpModeRef.current;
+      ctx.strokeStyle = opMode === 'add' ? '#4ade80' : opMode === 'subtract' ? '#f87171' : '#ffffff';
+      ctx.lineWidth = 1.6 / zoom;
       ctx.setLineDash([]);
       ctx.stroke();
 
@@ -1115,9 +1950,8 @@ export const CanvasStage: React.FC = () => {
       ctx.setLineDash([6 / zoom, 5 / zoom]);
       ctx.stroke();
 
-      // Vertex dots for polygonal lasso
-      if (!lassoClosed && (activeTool === 'polylasso' || activeTool === 'polylassofill' || lassoPoints.length < 30)) {
-        ctx.fillStyle = '#3a86ff';
+      if (activeTool === 'polylasso' || activeTool === 'polylassofill' || lassoPoints.length < 30) {
+        ctx.fillStyle = opMode === 'add' ? '#22c55e' : opMode === 'subtract' ? '#ef4444' : '#3a86ff';
         for (const p of lassoPoints) {
           ctx.beginPath();
           ctx.arc(p.x, p.y, 3.5 / zoom, 0, Math.PI * 2);
@@ -1245,8 +2079,195 @@ export const CanvasStage: React.FC = () => {
       ctx.restore();
     }
 
-    // Camera Safe Frame Border
-    if (showCameraFrame) {
+    // Interactive 2D Camera Overlay (Stage Mode) OR Cinema Passepartout (Camera View Mode)
+    if (activeCamLayer && activeCamState && !cropMode) {
+      const isCamSelected = activeLayerId === activeCamLayer.id;
+      if (isThroughCamera) {
+        // Cinema passepartout dark border outside the camera output frame + subtle safe guides
+        ctx.save();
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.72)';
+        ctx.beginPath();
+        ctx.rect(-10000, -10000, 20000, 20000);
+        ctx.rect(0, 0, canvasWidth, canvasHeight);
+        ctx.fill('evenodd');
+
+        ctx.strokeStyle = '#38bdf8';
+        ctx.lineWidth = 2 / zoom;
+        ctx.strokeRect(0, 0, canvasWidth, canvasHeight);
+
+        if (cameraGuides) {
+          // Rule of Thirds
+          ctx.strokeStyle = 'rgba(56, 189, 248, 0.28)';
+          ctx.lineWidth = 1 / zoom;
+          ctx.beginPath();
+          ctx.moveTo(canvasWidth / 3, 0);
+          ctx.lineTo(canvasWidth / 3, canvasHeight);
+          ctx.moveTo((canvasWidth * 2) / 3, 0);
+          ctx.lineTo((canvasWidth * 2) / 3, canvasHeight);
+          ctx.moveTo(0, canvasHeight / 3);
+          ctx.lineTo(canvasWidth, canvasHeight / 3);
+          ctx.moveTo(0, (canvasHeight * 2) / 3);
+          ctx.lineTo(canvasWidth, (canvasHeight * 2) / 3);
+          ctx.stroke();
+
+          // Action Safe (90%) & Title Safe (80%)
+          ctx.setLineDash([7 / zoom, 5 / zoom]);
+          ctx.strokeStyle = 'rgba(255, 165, 0, 0.35)';
+          ctx.strokeRect(canvasWidth * 0.05, canvasHeight * 0.05, canvasWidth * 0.9, canvasHeight * 0.9);
+          ctx.strokeStyle = 'rgba(56, 189, 248, 0.25)';
+          ctx.strokeRect(canvasWidth * 0.1, canvasHeight * 0.1, canvasWidth * 0.8, canvasHeight * 0.8);
+        }
+        ctx.restore();
+      } else {
+        // Stage / Edit View: draw the animated 2D Camera framing box + Motion Path + Interactive Handles!
+        const corners = getCameraFrameCorners(activeCamState, canvasWidth, canvasHeight);
+        ctx.save();
+
+        // Subtle darkened surround when Camera layer is selected so framing stands out immediately
+        if (isCamSelected) {
+          ctx.fillStyle = 'rgba(0, 0, 0, 0.26)';
+          ctx.beginPath();
+          ctx.rect(-10000, -10000, 20000, 20000);
+          ctx.moveTo(corners.tl.x, corners.tl.y);
+          ctx.lineTo(corners.tr.x, corners.tr.y);
+          ctx.lineTo(corners.br.x, corners.br.y);
+          ctx.lineTo(corners.bl.x, corners.bl.y);
+          ctx.closePath();
+          ctx.fill('evenodd');
+        }
+
+        // Camera Motion Path (trajectory curve + per-frame timing dots + keyframe diamonds — Harmony / After Effects style!)
+        const motionPts = sampleCameraMotionPath(activeCamLayer, totalFrames);
+        if (motionPts.length >= 2) {
+          ctx.save();
+          ctx.strokeStyle = isCamSelected ? 'rgba(56, 189, 248, 0.85)' : 'rgba(56, 189, 248, 0.45)';
+          ctx.lineWidth = (isCamSelected ? 2 : 1.2) / zoom;
+          ctx.setLineDash([6 / zoom, 4 / zoom]);
+          ctx.beginPath();
+          ctx.moveTo(canvasWidth / 2 + motionPts[0].x, canvasHeight / 2 + motionPts[0].y);
+          for (let i = 1; i < motionPts.length; i++) {
+            ctx.lineTo(canvasWidth / 2 + motionPts[i].x, canvasHeight / 2 + motionPts[i].y);
+          }
+          ctx.stroke();
+          ctx.setLineDash([]);
+
+          // Per-frame timing dots & keyframe diamonds
+          for (const mp of motionPts) {
+            const px = canvasWidth / 2 + mp.x;
+            const py = canvasHeight / 2 + mp.y;
+            if (mp.isKey) {
+              const d = (isCamSelected ? 6 : 4.5) / zoom;
+              ctx.fillStyle = mp.frame === currentFrame ? '#f59e0b' : '#38bdf8';
+              ctx.strokeStyle = '#0f172a';
+              ctx.lineWidth = 1.2 / zoom;
+              ctx.beginPath();
+              ctx.moveTo(px, py - d);
+              ctx.lineTo(px + d, py);
+              ctx.lineTo(px, py + d);
+              ctx.lineTo(px - d, py);
+              ctx.closePath();
+              ctx.fill();
+              ctx.stroke();
+            } else if (isCamSelected) {
+              ctx.fillStyle = 'rgba(224, 242, 254, 0.85)';
+              ctx.beginPath();
+              ctx.arc(px, py, 2.2 / zoom, 0, Math.PI * 2);
+              ctx.fill();
+            }
+          }
+          ctx.restore();
+        }
+
+        // Camera Framing Box
+        ctx.strokeStyle = isCamSelected ? '#38bdf8' : 'rgba(56, 189, 248, 0.75)';
+        ctx.lineWidth = (isCamSelected ? 2.4 : 1.6) / zoom;
+        ctx.beginPath();
+        ctx.moveTo(corners.tl.x, corners.tl.y);
+        ctx.lineTo(corners.tr.x, corners.tr.y);
+        ctx.lineTo(corners.br.x, corners.br.y);
+        ctx.lineTo(corners.bl.x, corners.bl.y);
+        ctx.closePath();
+        ctx.stroke();
+
+        // Internal Guides (Rule of Thirds + Action Safe 90% + Center Crosshair)
+        if (cameraGuides) {
+          const lerp2 = (a: Point, b: Point, t: number) => ({
+            x: a.x + (b.x - a.x) * t,
+            y: a.y + (b.y - a.y) * t
+          });
+          ctx.strokeStyle = isCamSelected ? 'rgba(56, 189, 248, 0.35)' : 'rgba(56, 189, 248, 0.2)';
+          ctx.lineWidth = 1 / zoom;
+          ctx.beginPath();
+          for (const t of [1 / 3, 2 / 3]) {
+            const topP = lerp2(corners.tl, corners.tr, t);
+            const botP = lerp2(corners.bl, corners.br, t);
+            ctx.moveTo(topP.x, topP.y);
+            ctx.lineTo(botP.x, botP.y);
+            const leftP = lerp2(corners.tl, corners.bl, t);
+            const rightP = lerp2(corners.tr, corners.br, t);
+            ctx.moveTo(leftP.x, leftP.y);
+            ctx.lineTo(rightP.x, rightP.y);
+          }
+          ctx.stroke();
+
+          // Center crosshair
+          const ch = 10 / zoom;
+          ctx.strokeStyle = '#38bdf8';
+          ctx.beginPath();
+          ctx.moveTo(corners.center.x - ch, corners.center.y);
+          ctx.lineTo(corners.center.x + ch, corners.center.y);
+          ctx.moveTo(corners.center.x, corners.center.y - ch);
+          ctx.lineTo(corners.center.x, corners.center.y + ch);
+          ctx.stroke();
+        }
+
+        // Interactive Corner Zoom Handles + Top Rotation Handle when Camera Layer is selected!
+        if (isCamSelected) {
+          const hs = 9 / zoom;
+          for (const hp of [corners.tl, corners.tr, corners.br, corners.bl]) {
+            ctx.fillStyle = '#e0f2fe';
+            ctx.strokeStyle = '#0284c7';
+            ctx.lineWidth = 1.6 / zoom;
+            ctx.fillRect(hp.x - hs / 2, hp.y - hs / 2, hs, hs);
+            ctx.strokeRect(hp.x - hs / 2, hp.y - hs / 2, hs, hs);
+          }
+          // Stem + circular rotation handle
+          const topMid = { x: (corners.tl.x + corners.tr.x) / 2, y: (corners.tl.y + corners.tr.y) / 2 };
+          ctx.strokeStyle = '#38bdf8';
+          ctx.lineWidth = 1.5 / zoom;
+          ctx.beginPath();
+          ctx.moveTo(topMid.x, topMid.y);
+          ctx.lineTo(corners.rotHandle.x, corners.rotHandle.y);
+          ctx.stroke();
+
+          ctx.fillStyle = '#38bdf8';
+          ctx.strokeStyle = '#0f172a';
+          ctx.beginPath();
+          ctx.arc(corners.rotHandle.x, corners.rotHandle.y, 6.5 / zoom, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.stroke();
+        }
+
+        // Compact Camera Label Badge on top-left of camera box
+        ctx.save();
+        ctx.translate(corners.tl.x, corners.tl.y);
+        ctx.rotate((activeCamState.rotation * Math.PI) / 180);
+        const labelText = `CAM  ${activeCamState.zoom.toFixed(2)}x${Math.abs(activeCamState.rotation) >= 0.5 ? `  ${activeCamState.rotation.toFixed(0)}°` : ''}`;
+        const fontSize = Math.max(10, Math.round(12 / zoom));
+        ctx.font = `600 ${fontSize}px 'Segoe UI', sans-serif`;
+        const tw = ctx.measureText(labelText).width + 12 / zoom;
+        const th = fontSize + 6 / zoom;
+        ctx.fillStyle = isCamSelected ? '#0284c7' : 'rgba(2, 132, 199, 0.75)';
+        ctx.fillRect(0, -th - 2 / zoom, tw, th);
+        ctx.fillStyle = '#ffffff';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(labelText, 6 / zoom, -th / 2 - 2 / zoom);
+        ctx.restore();
+
+        ctx.restore();
+      }
+    } else if (showCameraFrame) {
+      // Static Camera Safe Frame Border when no animated Camera layer exists
       ctx.save();
       ctx.strokeStyle = '#3a86ff';
       ctx.lineWidth = 2 / zoom;
@@ -1261,6 +2282,9 @@ export const CanvasStage: React.FC = () => {
     }
 
     ctx.restore();
+    };
+    drawStageRef.current = paintStage;
+    paintStage();
   }, [
     canvasWidth,
     canvasHeight,
@@ -1274,16 +2298,18 @@ export const CanvasStage: React.FC = () => {
     flipX,
     showGrid,
     showCameraFrame,
+    cameraViewMode,
+    cameraGuides,
+    totalFrames,
     lightTable,
     onionSkin,
     onionPrev,
     onionNext,
-    draftStroke,
-    stabilizerCursor,
     brushSmoothing,
     isDrawing,
     lassoPoints,
     lassoClosed,
+    lassoInverted,
     lassoCursor,
     activeTool,
     cropMode,
@@ -1292,14 +2318,21 @@ export const CanvasStage: React.FC = () => {
     transformQuad,
     transformSubMode,
     transformOrigStrokes,
+    transformCutEraseMask,
     transformOrigBounds,
     mapStrokesToQuad,
     imageTick,
+    viewportTick,
     perspectiveMode,
     symmetryMode,
     vanishingPoints,
     hsvPreview,
-    isEcoMode
+    levelsPreview,
+    blurPreview,
+    postProcess,
+    isEcoMode,
+    liquifyPreview,
+    selectionPolys
   ]);
 
   const getPointFromEvent = useCallback(
@@ -1308,8 +2341,8 @@ export const CanvasStage: React.FC = () => {
       const isPen = ev.pointerType === 'pen';
       let pressure = 1;
       if (usePressure && isPen) {
-        // Universal tablet pressure (Wacom, Huion, XP-Pen, Gaomon, Surface, etc.)
-        pressure = Math.max(0.02, Math.min(1, ev.pressure && ev.pressure > 0 ? ev.pressure : 0.5));
+        // Universal tablet pressure — avoid spiking zero-pressure touch-down/lift-off to 0.5!
+        pressure = ev.pressure !== undefined && ev.pressure > 0 ? Math.max(0.02, Math.min(1, ev.pressure)) : 0.05;
       } else if (usePressure && ev.pressure !== undefined && ev.pressure > 0 && ev.pressure !== 0.5 && ev.pressure !== 1) {
         // Fallback for tablet drivers that report pointerType='mouse' or 'touch' with real pressure
         pressure = Math.max(0.02, Math.min(1, ev.pressure));
@@ -1319,19 +2352,39 @@ export const CanvasStage: React.FC = () => {
     [screenToCanvas, usePressure]
   );
 
-  const readColorAtClient = useCallback((clientX: number, clientY: number): string | null => {
-    const canvas = canvasRef.current;
-    if (!canvas) return null;
-    const rect = canvas.getBoundingClientRect();
-    const dpr = window.devicePixelRatio || 1;
-    const px = Math.floor((clientX - rect.left) * dpr);
-    const py = Math.floor((clientY - rect.top) * dpr);
-    const ctx = canvas.getContext('2d');
-    if (!ctx || px < 0 || py < 0 || px >= canvas.width || py >= canvas.height) return null;
-    const data = ctx.getImageData(px, py, 1, 1).data;
-    const toHex = (n: number) => n.toString(16).padStart(2, '0');
-    return `#${toHex(data[0])}${toHex(data[1])}${toHex(data[2])}`;
-  }, []);
+  const readColorAtClient = useCallback(
+    (clientX: number, clientY: number): string | null => {
+      const pt = screenToCanvas(clientX, clientY);
+      const px = Math.floor(pt.x);
+      const py = Math.floor(pt.y);
+      if (px < 0 || py < 0 || px >= canvasWidth || py >= canvasHeight) return null;
+
+      // Render clean artwork (no Grid, Onion Skin, Marching Ants, or Guides) into a cached offscreen canvas!
+      if (!eyedropperCanvasRef.current) {
+        eyedropperCanvasRef.current = document.createElement('canvas');
+      }
+      const key = `${currentFrame}:${canvasWidth}x${canvasHeight}:${imageTick}`;
+      if (eyedropperKeyRef.current !== key || eyedropperLayersRef.current !== layers) {
+        renderFrameToCanvas(
+          eyedropperCanvasRef.current,
+          layers,
+          currentFrame,
+          canvasWidth,
+          canvasHeight,
+          '#ffffff',
+          false
+        );
+        eyedropperKeyRef.current = key;
+        eyedropperLayersRef.current = layers;
+      }
+      const ectx = eyedropperCanvasRef.current.getContext('2d', { willReadFrequently: true });
+      if (!ectx) return null;
+      const data = ectx.getImageData(px, py, 1, 1).data;
+      const toHex = (n: number) => n.toString(16).padStart(2, '0');
+      return `#${toHex(data[0])}${toHex(data[1])}${toHex(data[2])}`;
+    },
+    [screenToCanvas, layers, currentFrame, canvasWidth, canvasHeight, imageTick]
+  );
 
   const sampleColorAtClient = useCallback(
     (clientX: number, clientY: number) => {
@@ -1396,17 +2449,34 @@ export const CanvasStage: React.FC = () => {
   );
 
   const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    // Allow middle-click pan, ignore right-click (button 2) and extra buttons so context menus/barrel buttons never draw!
+    if (e.button === 1) {
+      e.currentTarget.setPointerCapture(e.pointerId);
+      setIsPanning(true);
+      setPanStart({ x: e.clientX - panX, y: e.clientY - panY });
+      return;
+    }
+    if (e.button !== 0) return;
+
     e.currentTarget.setPointerCapture(e.pointerId);
 
-    // Hold D + Click -> pick the topmost layer containing pixels under the cursor!
-    if (dHeld && e.button === 0) {
+    // Hold D + Click -> pick the topmost layer containing pixels under the cursor! (disabled during Transform/Crop)
+    if (dHeld && !transformActive && !cropMode) {
       const pt = getPointFromEvent(e);
       pickLayerAtCanvasPoint(pt, e.clientX, e.clientY);
       return;
     }
 
-    // Hold Alt (when not using Lasso) or Eyedropper tool -> pick color from canvas!
-    if ((e.altKey && activeTool !== 'lasso' && activeTool !== 'zoom') || activeTool === 'eyedropper') {
+    // Hold Alt (when not using Selection/Zoom/Transform/Crop tools) or Eyedropper tool -> pick color from canvas!
+    const isAltBlockedTool =
+      activeTool === 'lasso' ||
+      activeTool === 'polylasso' ||
+      activeTool === 'polylassofill' ||
+      activeTool === 'rectselect' ||
+      activeTool === 'ellipseselect' ||
+      activeTool === 'magicwand' ||
+      activeTool === 'zoom';
+    if (!transformActive && !cropMode && ((e.altKey && !isAltBlockedTool) || activeTool === 'eyedropper')) {
       sampleColorAtClient(e.clientX, e.clientY);
       return;
     }
@@ -1423,14 +2493,23 @@ export const CanvasStage: React.FC = () => {
       return;
     }
 
-    if (e.button === 1 || activeTool === 'hand' || spaceHeld) {
+    if (activeTool === 'hand' || spaceHeld) {
       setIsPanning(true);
       setPanStart({ x: e.clientX - panX, y: e.clientY - panY });
       return;
     }
 
     if (activeTool === 'zoom') {
-      setZoom(e.altKey ? zoom * 0.8 : zoom * 1.25);
+      const rect = containerRef.current?.getBoundingClientRect();
+      const factor = e.altKey ? 0.8 : 1.25;
+      const nextZoom = Math.max(0.1, Math.min(8, zoom * factor));
+      if (rect) {
+        const mx = e.clientX - (rect.left + rect.width / 2);
+        const my = e.clientY - (rect.top + rect.height / 2);
+        const ratio = nextZoom / zoom;
+        setPan(mx - (mx - panX) * ratio, my - (my - panY) * ratio);
+      }
+      setZoom(nextZoom);
       return;
     }
 
@@ -1470,7 +2549,141 @@ export const CanvasStage: React.FC = () => {
       return;
     }
 
+    // Interactive 2D Camera direct manipulation (when Camera layer is active & not in Camera View Mode)
+    const activeLayerObj = layers.find((l) => l.id === activeLayerId);
+    if (activeLayerObj && activeLayerObj.type === 'camera' && activeLayerObj.visible && !activeLayerObj.locked && !cameraViewMode) {
+      const cam = getInterpolatedCamera(activeLayerObj, currentFrame, false);
+      const corners = getCameraFrameCorners(cam, canvasWidth, canvasHeight);
+      const handleTol = 16 / zoom;
+
+      // 1. Top circular rotation handle
+      if (Math.hypot(pt.x - corners.rotHandle.x, pt.y - corners.rotHandle.y) <= handleTol) {
+        pushUndoSnapshot();
+        cameraDragRef.current = {
+          layerId: activeLayerObj.id,
+          mode: 'rotate',
+          startPt: pt,
+          origX: cam.x,
+          origY: cam.y,
+          origZoom: cam.zoom,
+          origRot: cam.rotation,
+          startDist: 1,
+          startAngle: Math.atan2(pt.y - corners.center.y, pt.x - corners.center.x)
+        };
+        return;
+      }
+
+      // 2. Any of the 4 corner handles -> smooth proportional camera zoom!
+      const hitCorner = [corners.tl, corners.tr, corners.br, corners.bl].some(
+        (c) => Math.hypot(pt.x - c.x, pt.y - c.y) <= handleTol
+      );
+      if (hitCorner) {
+        pushUndoSnapshot();
+        cameraDragRef.current = {
+          layerId: activeLayerObj.id,
+          mode: 'zoom',
+          startPt: pt,
+          origX: cam.x,
+          origY: cam.y,
+          origZoom: cam.zoom,
+          origRot: cam.rotation,
+          startDist: Math.max(10, Math.hypot(pt.x - corners.center.x, pt.y - corners.center.y)),
+          startAngle: 0
+        };
+        return;
+      }
+
+      // 3. Drag anywhere on stage while Camera layer is selected -> pan camera position (X, Y) smoothly!
+      pushUndoSnapshot();
+      cameraDragRef.current = {
+        layerId: activeLayerObj.id,
+        mode: 'move',
+        startPt: pt,
+        origX: cam.x,
+        origY: cam.y,
+        origZoom: cam.zoom,
+        origRot: cam.rotation,
+        startDist: 1,
+        startAngle: 0
+      };
+      return;
+    }
+
+    // Magic Wand (Varinha Mágica — W) with Shift=Add, Alt=Subtract, Reference, Tolerance, Close Gap, Expand & Exterior Detection!
+    if (activeTool === 'magicwand') {
+      const opMode: 'replace' | 'add' | 'subtract' = e.shiftKey ? 'add' : e.altKey ? 'subtract' : 'replace';
+      const wandRes = performMagicWandPolygon(
+        layers,
+        activeLayerId,
+        bucketReference,
+        currentFrame,
+        canvasWidth,
+        canvasHeight,
+        pt.x,
+        pt.y,
+        bucketTolerance,
+        bucketExpand,
+        bucketCloseGap
+      );
+      if (wandRes && wandRes.poly.length >= 3) {
+        closeLassoAndSelect(wandRes.poly, wandRes.inverted, opMode);
+      } else if (opMode === 'replace') {
+        setSelectionPolys([]);
+        setLassoPoints([]);
+        setLassoClosed(false);
+        setLassoInverted(false);
+        setSelectedStrokeIds([]);
+      }
+      return;
+    }
+
+    // Liquify (Deformar traços ao vivo — J): Empurrar / Inflar / Comprimir
+    if (activeTool === 'liquify') {
+      const activeLayer = layers.find((l) => l.id === activeLayerId);
+      if (!activeLayer || activeLayer.locked || activeLayer.type === 'folder') return;
+      const strokes = getEffectiveFrameStrokes(activeLayer, currentFrame);
+      if (strokes.length === 0) return;
+      // Densify freehand stroke segments (>10px) so lines curve smoothly under Liquify (skip shapes/images/text)
+      const cloned: Stroke[] = (typeof structuredClone === 'function' ? structuredClone(strokes) : JSON.parse(JSON.stringify(strokes))).map((st: Stroke) => {
+        if (
+          st.tool === 'image' ||
+          st.tool === 'text' ||
+          st.tool === 'line' ||
+          st.tool === 'rectangle' ||
+          st.tool === 'ellipse' ||
+          st.points.length < 2
+        ) {
+          return st;
+        }
+        const dense: Point[] = [st.points[0]];
+        for (let i = 1; i < st.points.length; i++) {
+          const a = st.points[i - 1];
+          const b = st.points[i];
+          const dist = Math.hypot(b.x - a.x, b.y - a.y);
+          if (dist > 10) {
+            const steps = Math.min(24, Math.ceil(dist / 8));
+            for (let k = 1; k < steps; k++) {
+              const t = k / steps;
+              dense.push({
+                x: a.x + (b.x - a.x) * t,
+                y: a.y + (b.y - a.y) * t,
+                pressure: (a.pressure ?? 1) + ((b.pressure ?? 1) - (a.pressure ?? 1)) * t
+              });
+            }
+          }
+          dense.push(b);
+        }
+        return { ...st, points: dense };
+      });
+      liquifyModifiedRef.current = false;
+      setLiquifyPreview(cloned);
+      liquifyLastPtRef.current = pt;
+      setIsDrawing(true);
+      return;
+    }
+
     // Selection tools: Lasso, Polygonal Lasso, Lasso Fill, Polygonal Lasso Fill, Rect Select, Ellipse Select
+    // Shift = Add to existing selection; Alt = Subtract from existing selection!
     if (
       activeTool === 'lasso' ||
       activeTool === 'polylasso' ||
@@ -1479,28 +2692,57 @@ export const CanvasStage: React.FC = () => {
       activeTool === 'rectselect' ||
       activeTool === 'ellipseselect'
     ) {
-      // If we already have a closed selection and user clicks inside it -> drag to move strokes!
-      if (lassoClosed && lassoPoints.length >= 3 && isPointInPolygon(pt, lassoPoints)) {
+      const isFillTool = activeTool === 'lassofill' || activeTool === 'polylassofill';
+      const opMode: 'replace' | 'add' | 'subtract' = isFillTool
+        ? 'replace'
+        : e.shiftKey
+          ? 'add'
+          : e.altKey
+            ? 'subtract'
+            : 'replace';
+
+      // Only drag existing selection when NOT holding Shift (Add) or Alt (Subtract) and NOT mid-poly!
+      const inSelectedRegion =
+        opMode === 'replace' &&
+        lassoClosed &&
+        selectionPolys.length > 0 &&
+        lassoPoints.length === 0 &&
+        isPointInSelection(pt, selectionPolys, lassoInverted);
+      if (inSelectedRegion) {
+        const activeLayer = layers.find((l) => l.id === activeLayerId);
+        if (activeLayer && !activeLayer.locked && activeLayer.type !== 'folder' && selectedStrokeIds.length > 0) {
+          pushUndoSnapshot();
+        }
         setIsDraggingSelection(true);
         setDragLastPt(pt);
         return;
       }
 
       if (activeTool === 'rectselect' || activeTool === 'ellipseselect') {
-        setLassoClosed(false);
-        setSelectedStrokeIds([]);
+        selectionOpModeRef.current = opMode;
+        if (opMode === 'replace') {
+          setSelectionPolys([]);
+          setLassoClosed(false);
+          setLassoInverted(false);
+          setSelectedStrokeIds([]);
+        }
         setSelectShapeStart(pt);
         setLassoPoints([pt]);
         setIsDrawing(true);
         return;
       }
 
-      // Polygonal mode: dedicated polylasso, polylassofill, OR normal lasso with Alt held!
-      const isPolyMode = activeTool === 'polylasso' || activeTool === 'polylassofill' || e.altKey;
+      // Polygonal mode: dedicated polylasso or polylassofill
+      const isPolyMode = activeTool === 'polylasso' || activeTool === 'polylassofill';
       if (isPolyMode) {
-        if (lassoClosed) {
-          setLassoClosed(false);
-          setSelectedStrokeIds([]);
+        if (lassoPoints.length === 0) {
+          selectionOpModeRef.current = opMode;
+          if (opMode === 'replace' && lassoClosed) {
+            setSelectionPolys([]);
+            setLassoClosed(false);
+            setLassoInverted(false);
+            setSelectedStrokeIds([]);
+          }
           setLassoPoints([pt]);
           setLassoCursor(pt);
           return;
@@ -1513,7 +2755,8 @@ export const CanvasStage: React.FC = () => {
             if (activeTool === 'polylassofill') {
               commitPolyFill(lassoPoints);
             } else {
-              closeLassoAndSelect(lassoPoints);
+              closeLassoAndSelect(lassoPoints, false, selectionOpModeRef.current);
+              selectionOpModeRef.current = 'replace';
             }
             return;
           }
@@ -1523,19 +2766,30 @@ export const CanvasStage: React.FC = () => {
         return;
       }
 
-      // Freehand Lasso start
-      setLassoClosed(false);
-      setSelectedStrokeIds([]);
+      // Freehand Lasso / LassoFill start
+      selectionOpModeRef.current = opMode;
+      if (opMode === 'replace') {
+        setSelectionPolys([]);
+        setLassoClosed(false);
+        setLassoInverted(false);
+        setSelectedStrokeIds([]);
+      }
       setLassoPoints([pt]);
       setIsDrawing(true);
       return;
     }
 
-    // Support stylus eraser end (buttons === 32) automatically
-    const isStylusEraser = e.pointerType === 'pen' && e.buttons === 32;
+    // Block drawing/painting/text on locked, hidden, camera, or folder layers right on pointer-down!
+    const activeLayer = layers.find((l) => l.id === activeLayerId);
+    if (!activeLayer || activeLayer.locked || activeLayer.type === 'folder' || activeLayer.type === 'camera' || !activeLayer.visible) {
+      return;
+    }
+
+    // Support stylus eraser end (bitmask 32, works when buttons === 32 or 33) automatically
+    const isStylusEraser = e.pointerType === 'pen' && (e.buttons & 32) !== 0;
     const effectiveTool = isStylusEraser ? 'eraser' : activeTool;
 
-    // Real Scanline Flood-Fill Paint Bucket with Close Gap (G)
+    // Real Scanline Flood-Fill Paint Bucket with Close Gap & Active Selection clip (G)
     if (effectiveTool === 'paint') {
       pushRecentColor(activeColor);
       const fillRes = performFloodFill(
@@ -1550,7 +2804,9 @@ export const CanvasStage: React.FC = () => {
         activeColor,
         bucketTolerance,
         bucketExpand,
-        bucketCloseGap
+        bucketCloseGap,
+        lassoClosed && selectionPolys.length > 0 ? selectionPolys : null,
+        lassoInverted
       );
       if (fillRes) {
         addStroke(
@@ -1577,30 +2833,52 @@ export const CanvasStage: React.FC = () => {
       return;
     }
 
+    // Text Tool (T): click anywhere on canvas to place a styled live text editor with PC fonts!
+    if (effectiveTool === 'text') {
+      const rect = containerRef.current?.getBoundingClientRect();
+      const sx = rect ? e.clientX - rect.left : e.clientX;
+      const sy = rect ? e.clientY - rect.top : e.clientY;
+      setTextDraft({ canvasX: pt.x, canvasY: pt.y, screenX: sx, screenY: sy, value: '' });
+      return;
+    }
+
     if (
       effectiveTool === 'brush' ||
       effectiveTool === 'pencil' ||
       effectiveTool === 'eraser' ||
       effectiveTool === 'line' ||
       effectiveTool === 'rectangle' ||
-      effectiveTool === 'ellipse'
+      effectiveTool === 'ellipse' ||
+      effectiveTool === 'gradient'
     ) {
+      const isEr = effectiveTool === 'eraser';
+      const hasSelClip = lassoClosed && selectionPolys.length > 0;
+      shiftLineAxisRef.current = null;
+      shiftLineOriginRef.current = pt;
       const newStroke: Stroke = {
         id: `st-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
         tool: effectiveTool,
-        preset: activeBrushPreset,
+        preset: isEr ? eraserPreset : activeBrushPreset,
         artLayer: activeArtLayer,
         swatchId: activeSwatch.id,
         color: activeColor,
-        size: brushSize,
-        minSizeRatio: brushMinSize / 100,
-        opacity: brushOpacity,
+        secondaryColor: effectiveTool === 'gradient' ? secondaryColor : undefined,
+        gradientMode: effectiveTool === 'gradient' ? gradientMode : undefined,
+        gradientToTransparent: effectiveTool === 'gradient' ? gradientToTransparent : undefined,
+        size: isEr ? eraserSize : brushSize,
+        // When Pen Pressure is OFF, force minSizeRatio = 1 (100% uniform single-size stroke!)
+        minSizeRatio: usePressure ? (isEr ? eraserMinSize : brushMinSize) / 100 : 1,
+        opacity: isEr ? eraserOpacity : brushOpacity,
         smoothing: brushSmoothing,
-        points: [pt],
+        points: effectiveTool === 'gradient' ? [pt, pt] : [pt],
+        clipPolys: hasSelClip ? selectionPolys.map((poly) => poly.map((p) => ({ x: p.x, y: p.y }))) : undefined,
+        clipInverted: hasSelClip && lassoInverted ? true : undefined,
         filled: shapeFilled
       };
-      setDraftStroke(newStroke);
+      draftStrokeRef.current = newStroke;
+      stabilizerCursorRef.current = null;
       setIsDrawing(true);
+      scheduleLivePaint();
     }
   };
 
@@ -1619,12 +2897,22 @@ export const CanvasStage: React.FC = () => {
       }
     }
 
-    // Live Eyedropper color preview while holding Alt or using Dropper tool
-    if ((altHeld && activeTool !== 'lasso' && activeTool !== 'zoom') || activeTool === 'eyedropper') {
+    // Live Eyedropper color preview while holding Alt or using Dropper tool (disabled during Selection/Transform/Crop/Zoom!)
+    const isAltBlockedTool =
+      activeTool === 'lasso' ||
+      activeTool === 'polylasso' ||
+      activeTool === 'polylassofill' ||
+      activeTool === 'rectselect' ||
+      activeTool === 'ellipseselect' ||
+      activeTool === 'magicwand' ||
+      activeTool === 'zoom';
+    if (!transformActive && !cropMode && ((altHeld && !isAltBlockedTool) || activeTool === 'eyedropper')) {
       const hex = readColorAtClient(e.clientX, e.clientY);
-      if (hex) setEyedropperPreviewHex(hex);
-      if (e.buttons === 1) {
-        sampleColorAtClient(e.clientX, e.clientY);
+      if (hex) {
+        setEyedropperPreviewHex(hex);
+        if (e.buttons === 1) {
+          setActiveColor(hex);
+        }
       }
       return;
     }
@@ -1639,6 +2927,36 @@ export const CanvasStage: React.FC = () => {
 
     if (isPanning) {
       setPan(e.clientX - panStart.x, e.clientY - panStart.y);
+      return;
+    }
+
+    // Live Interactive 2D Camera drag (Move / Corner Zoom / Rotate)
+    if (cameraDragRef.current) {
+      const drag = cameraDragRef.current;
+      const pt = getPointFromEvent(e);
+      if (drag.mode === 'move') {
+        let dx = pt.x - drag.startPt.x;
+        let dy = pt.y - drag.startPt.y;
+        if (e.shiftKey) {
+          if (Math.abs(dx) >= Math.abs(dy)) dy = 0;
+          else dx = 0;
+        }
+        setCameraKeyframe(drag.layerId, currentFrame, { x: drag.origX + dx, y: drag.origY + dy }, false);
+      } else if (drag.mode === 'zoom') {
+        const cx = canvasWidth / 2 + drag.origX;
+        const cy = canvasHeight / 2 + drag.origY;
+        const currDist = Math.max(10, Math.hypot(pt.x - cx, pt.y - cy));
+        // Smaller box = higher zoom (zoom in); larger box = lower zoom (zoom out)
+        const nextZoom = Math.max(0.25, Math.min(6, drag.origZoom * (drag.startDist / currDist)));
+        setCameraKeyframe(drag.layerId, currentFrame, { zoom: nextZoom }, false);
+      } else if (drag.mode === 'rotate') {
+        const cx = canvasWidth / 2 + drag.origX;
+        const cy = canvasHeight / 2 + drag.origY;
+        const currAng = Math.atan2(pt.y - cy, pt.x - cx);
+        let nextRot = drag.origRot + ((currAng - drag.startAngle) * 180) / Math.PI;
+        if (e.shiftKey) nextRot = Math.round(nextRot / 15) * 15;
+        setCameraKeyframe(drag.layerId, currentFrame, { rotation: nextRot }, false);
+      }
       return;
     }
 
@@ -1663,10 +2981,17 @@ export const CanvasStage: React.FC = () => {
       const q = JSON.parse(JSON.stringify(transformDragStart.quad)) as Quad;
 
       if (activeTransformHandle === 'move') {
-        q.tl.x += dx; q.tl.y += dy;
-        q.tr.x += dx; q.tr.y += dy;
-        q.br.x += dx; q.br.y += dy;
-        q.bl.x += dx; q.bl.y += dy;
+        // Hold Shift while moving -> lock strictly to horizontal or vertical axis!
+        let mdx = dx;
+        let mdy = dy;
+        if (e.shiftKey) {
+          if (Math.abs(mdx) >= Math.abs(mdy)) mdy = 0;
+          else mdx = 0;
+        }
+        q.tl.x += mdx; q.tl.y += mdy;
+        q.tr.x += mdx; q.tr.y += mdy;
+        q.br.x += mdx; q.br.y += mdy;
+        q.bl.x += mdx; q.bl.y += mdy;
       } else if (activeTransformHandle === 'rot') {
         const cx = (q.tl.x + q.tr.x + q.br.x + q.bl.x) / 4;
         const cy = (q.tl.y + q.tr.y + q.br.y + q.bl.y) / 4;
@@ -1696,7 +3021,8 @@ export const CanvasStage: React.FC = () => {
         q[activeTransformHandle].x += dx;
         q[activeTransformHandle].y += dy;
       } else if (activeTransformHandle === 'tl' || activeTransformHandle === 'tr' || activeTransformHandle === 'br' || activeTransformHandle === 'bl') {
-        // Corner scale: proportional by default (Shift = free stretch, Alt = scale from center)
+        // Local-basis Corner Scale (works cleanly at ANY rotation angle — zero division-by-zero explosion!)
+        // Proportional by default; Shift = free stretch; Alt = scale from center
         const oppositeMap: Record<'tl' | 'tr' | 'br' | 'bl', 'br' | 'bl' | 'tl' | 'tr'> = {
           tl: 'br',
           tr: 'bl',
@@ -1707,36 +3033,79 @@ export const CanvasStage: React.FC = () => {
         const cy = (q.tl.y + q.tr.y + q.br.y + q.bl.y) / 4;
         const anchor = e.altKey ? { x: cx, y: cy } : q[oppositeMap[activeTransformHandle]];
         const origCorner = q[activeTransformHandle];
-        const origDx = origCorner.x - anchor.x;
-        const origDy = origCorner.y - anchor.y;
-        const newDx = origCorner.x + dx - anchor.x;
-        const newDy = origCorner.y + dy - anchor.y;
-        let sx = Math.abs(origDx) > 1 ? newDx / origDx : 1;
-        let sy = Math.abs(origDy) > 1 ? newDy / origDy : 1;
+
+        // Compute quad local U and V unit axes
+        const uVec = { x: q.tr.x - q.tl.x, y: q.tr.y - q.tl.y };
+        const vVec = { x: q.bl.x - q.tl.x, y: q.bl.y - q.tl.y };
+        const uLen = Math.hypot(uVec.x, uVec.y) || 1;
+        const vLen = Math.hypot(vVec.x, vVec.y) || 1;
+        const uHat = { x: uVec.x / uLen, y: uVec.y / uLen };
+        const vHat = { x: vVec.x / vLen, y: vVec.y / vLen };
+
+        const origRel = { x: origCorner.x - anchor.x, y: origCorner.y - anchor.y };
+        const newRel = { x: origRel.x + dx, y: origRel.y + dy };
+
+        const origU = origRel.x * uHat.x + origRel.y * uHat.y;
+        const origV = origRel.x * vHat.x + origRel.y * vHat.y;
+        const newU = newRel.x * uHat.x + newRel.y * uHat.y;
+        const newV = newRel.x * vHat.x + newRel.y * vHat.y;
+
+        let su = Math.abs(origU) > 1 ? newU / origU : 1;
+        let sv = Math.abs(origV) > 1 ? newV / origV : 1;
         if (!e.shiftKey) {
-          // Proportional scale by default
-          const uniform = (sx + sy) / 2;
-          sx = uniform;
-          sy = uniform;
+          // Project newRel onto origRel diagonal for silky proportional scaling at any angle!
+          const diagLenSq = origRel.x * origRel.x + origRel.y * origRel.y;
+          const uniform = diagLenSq > 1 ? (newRel.x * origRel.x + newRel.y * origRel.y) / diagLenSq : 1;
+          su = uniform;
+          sv = uniform;
         }
-        const scalePt = (p: Point): Point => ({
-          x: anchor.x + (p.x - anchor.x) * sx,
-          y: anchor.y + (p.y - anchor.y) * sy
-        });
+        // Clamp away from exact 0 so quad never collapses irreversibly
+        if (Math.abs(su) < 0.03) su = su < 0 ? -0.03 : 0.03;
+        if (Math.abs(sv) < 0.03) sv = sv < 0 ? -0.03 : 0.03;
+
+        const scalePt = (p: Point): Point => {
+          const rx = p.x - anchor.x;
+          const ry = p.y - anchor.y;
+          const pu = rx * uHat.x + ry * uHat.y;
+          const pv = rx * vHat.x + ry * vHat.y;
+          return {
+            x: anchor.x + uHat.x * (pu * su) + vHat.x * (pv * sv),
+            y: anchor.y + uHat.y * (pu * su) + vHat.y * (pv * sv)
+          };
+        };
         q.tl = scalePt(q.tl);
         q.tr = scalePt(q.tr);
         q.br = scalePt(q.br);
         q.bl = scalePt(q.bl);
       } else {
-        // Edge stretch (top, bottom, left, right)
+        // Local-basis Edge Stretch (works cleanly even when box is rotated! Alt = symmetric stretch)
+        const uVec = { x: q.tr.x - q.tl.x, y: q.tr.y - q.tl.y };
+        const vVec = { x: q.bl.x - q.tl.x, y: q.bl.y - q.tl.y };
+        const uLen = Math.hypot(uVec.x, uVec.y) || 1;
+        const vLen = Math.hypot(vVec.x, vVec.y) || 1;
+        const uHat = { x: uVec.x / uLen, y: uVec.y / uLen };
+        const vHat = { x: vVec.x / vLen, y: vVec.y / vLen };
+        const projU = dx * uHat.x + dy * uHat.y;
+        const projV = dx * vHat.x + dy * vHat.y;
+        const du = { x: uHat.x * projU, y: uHat.y * projU };
+        const dv = { x: vHat.x * projV, y: vHat.y * projV };
+
         if (activeTransformHandle === 't') {
-          q.tl.y += dy; q.tr.y += dy;
+          q.tl.x += dv.x; q.tl.y += dv.y;
+          q.tr.x += dv.x; q.tr.y += dv.y;
+          if (e.altKey) { q.bl.x -= dv.x; q.bl.y -= dv.y; q.br.x -= dv.x; q.br.y -= dv.y; }
         } else if (activeTransformHandle === 'b') {
-          q.bl.y += dy; q.br.y += dy;
+          q.bl.x += dv.x; q.bl.y += dv.y;
+          q.br.x += dv.x; q.br.y += dv.y;
+          if (e.altKey) { q.tl.x -= dv.x; q.tl.y -= dv.y; q.tr.x -= dv.x; q.tr.y -= dv.y; }
         } else if (activeTransformHandle === 'l') {
-          q.tl.x += dx; q.bl.x += dx;
+          q.tl.x += du.x; q.tl.y += du.y;
+          q.bl.x += du.x; q.bl.y += du.y;
+          if (e.altKey) { q.tr.x -= du.x; q.tr.y -= du.y; q.br.x -= du.x; q.br.y -= du.y; }
         } else if (activeTransformHandle === 'r') {
-          q.tr.x += dx; q.br.x += dx;
+          q.tr.x += du.x; q.tr.y += du.y;
+          q.br.x += du.x; q.br.y += du.y;
+          if (e.altKey) { q.tl.x -= du.x; q.tl.y -= du.y; q.bl.x -= du.x; q.bl.y -= du.y; }
         }
       }
       setTransformQuad(q);
@@ -1776,13 +3145,13 @@ export const CanvasStage: React.FC = () => {
       if (selectedStrokeIds.length > 0) {
         moveStrokes(selectedStrokeIds, dx, dy);
       }
-      setLassoPoints((prev) => prev.map((p) => ({ ...p, x: p.x + dx, y: p.y + dy })));
+      setSelectionPolys((prev) => prev.map((poly) => poly.map((p) => ({ ...p, x: p.x + dx, y: p.y + dy }))));
       setDragLastPt(pt);
       return;
     }
 
     // Polygonal lasso rubber-band cursor preview
-    if ((activeTool === 'polylasso' || activeTool === 'polylassofill' || (activeTool === 'lasso' && e.altKey)) && lassoPoints.length > 0 && !lassoClosed) {
+    if ((activeTool === 'polylasso' || activeTool === 'polylassofill') && lassoPoints.length > 0) {
       setLassoCursor(pt);
       return;
     }
@@ -1815,15 +3184,59 @@ export const CanvasStage: React.FC = () => {
       return;
     }
 
+    // Live Liquify deformation on pointer move
+    if (activeTool === 'liquify' && isDrawing && liquifyPreview && liquifyLastPtRef.current) {
+      const prevPt = liquifyLastPtRef.current;
+      const dx = pt.x - prevPt.x;
+      const dy = pt.y - prevPt.y;
+      liquifyLastPtRef.current = pt;
+      const radius = Math.max(10, liquifySize / 2);
+      const rSq = radius * radius;
+      const strength = liquifyStrength / 100;
+
+      setLiquifyPreview((curr) => {
+        if (!curr) return curr;
+        return curr.map((st) => {
+          if (st.tool === 'image') return st;
+          let changed = false;
+          const nextPts = st.points.map((p) => {
+            const ox = p.x - pt.x;
+            const oy = p.y - pt.y;
+            const dSq = ox * ox + oy * oy;
+            if (dSq >= rSq) return p;
+            changed = true;
+            liquifyModifiedRef.current = true;
+            const d = Math.sqrt(dSq);
+            const falloff = Math.pow(1 - d / radius, 2) * strength;
+            if (liquifyMode === 'push') {
+              return { ...p, x: p.x + dx * falloff, y: p.y + dy * falloff };
+            } else if (liquifyMode === 'expand') {
+              const len = Math.max(1, d);
+              const push = radius * 0.12 * falloff;
+              return { ...p, x: p.x + (ox / len) * push, y: p.y + (oy / len) * push };
+            } else {
+              // pinch
+              const len = Math.max(1, d);
+              const pull = Math.min(d * 0.5, radius * 0.12 * falloff);
+              return { ...p, x: p.x - (ox / len) * pull, y: p.y - (oy / len) * pull };
+            }
+          });
+          return changed ? { ...st, points: nextPts } : st;
+        });
+      });
+      return;
+    }
+
     // Freehand lasso / Lasso Fill drawing
     if ((activeTool === 'lasso' || activeTool === 'lassofill') && isDrawing && !lassoClosed) {
       setLassoPoints((prev) => [...prev, pt]);
       return;
     }
 
-    if (!isDrawing || !draftStroke) return;
+    const prev = draftStrokeRef.current;
+    if (!isDrawing || !prev) return;
 
-    // Use coalesced events for high-polling-rate drawing tablets (200Hz+)
+    // Use coalesced events for high-polling-rate drawing tablets (200Hz+) — ZERO React setState per pointermove!
     const nativeEv = e.nativeEvent as PointerEvent;
     const coalesced = typeof nativeEv.getCoalescedEvents === 'function'
       ? nativeEv.getCoalescedEvents()
@@ -1833,78 +3246,96 @@ export const CanvasStage: React.FC = () => {
     const newPoints = eventsToProcess.map((ev) => getPointFromEvent(ev));
     const lastPt = newPoints[newPoints.length - 1];
     const now = performance.now();
-    if (now - penHudTimerRef.current > 120) {
+    if (now - penHudTimerRef.current > 180) {
       penHudTimerRef.current = now;
       setPenStatus({ type: e.pointerType || 'mouse', pressure: lastPt.pressure ?? 1 });
     }
     if (brushSmoothing > 0) {
-      setStabilizerCursor(lastPt);
+      stabilizerCursorRef.current = lastPt;
     }
 
-    setDraftStroke((prev) => {
-      if (!prev) return prev;
-      if (prev.tool === 'line' || prev.tool === 'rectangle' || prev.tool === 'ellipse') {
-        return {
-          ...prev,
-          points: [prev.points[0], lastPt]
-        };
-      } else if (prev.tool !== 'fill') {
-        // Hold Shift while drawing -> lock perfectly straight Horizontal or Vertical line!
-        if (e.shiftKey && prev.points.length > 0) {
-          const origin = prev.points[0];
-          const adx = Math.abs(lastPt.x - origin.x);
-          const ady = Math.abs(lastPt.y - origin.y);
-          const lockedPt: Point =
-            adx >= ady
-              ? { x: lastPt.x, y: origin.y, pressure: lastPt.pressure }
-              : { x: origin.x, y: lastPt.y, pressure: lastPt.pressure };
-          return {
-            ...prev,
-            points: [origin, lockedPt]
-          };
+    if (prev.tool === 'line' || prev.tool === 'rectangle' || prev.tool === 'ellipse' || prev.tool === 'gradient') {
+      const p0 = prev.points[0];
+      let endPt = lastPt;
+      if (e.shiftKey) {
+        const dx = lastPt.x - p0.x;
+        const dy = lastPt.y - p0.y;
+        if (prev.tool === 'line' || prev.tool === 'gradient') {
+          const ang = Math.round(Math.atan2(dy, dx) / (Math.PI / 4)) * (Math.PI / 4);
+          const dist = Math.hypot(dx, dy);
+          endPt = { ...lastPt, x: p0.x + Math.cos(ang) * dist, y: p0.y + Math.sin(ang) * dist };
+        } else {
+          const side = Math.max(Math.abs(dx), Math.abs(dy));
+          endPt = { ...lastPt, x: p0.x + Math.sign(dx || 1) * side, y: p0.y + Math.sign(dy || 1) * side };
         }
-        if (brushSmoothing <= 0) {
-          const prevLast = prev.points[prev.points.length - 1];
-          const filtered = newPoints.filter((np) => {
-            if (!prevLast) return true;
-            return Math.hypot(np.x - prevLast.x, np.y - prevLast.y) >= 0.6;
+      }
+      draftStrokeRef.current = { ...prev, points: [p0, endPt] };
+    } else if (prev.tool !== 'fill') {
+      // Hold Shift while drawing -> lock perfectly faithful straight Horizontal or Vertical line!
+      if (e.shiftKey && prev.points.length > 0) {
+        const origin = shiftLineOriginRef.current || prev.points[0];
+        const adx = Math.abs(lastPt.x - origin.x);
+        const ady = Math.abs(lastPt.y - origin.y);
+        if (!shiftLineAxisRef.current && Math.max(adx, ady) >= 3) {
+          shiftLineAxisRef.current = adx >= ady ? 'h' : 'v';
+        }
+        const axis = shiftLineAxisRef.current || (adx >= ady ? 'h' : 'v');
+        const endX = axis === 'h' ? lastPt.x : origin.x;
+        const endY = axis === 'v' ? lastPt.y : origin.y;
+        const steadyPressure = usePressure ? Math.max(0.55, lastPt.pressure ?? 1) : 1;
+        const segs = 24;
+        const straightPts: Point[] = [];
+        for (let i = 0; i <= segs; i++) {
+          const t = i / segs;
+          straightPts.push({
+            x: origin.x + (endX - origin.x) * t,
+            y: origin.y + (endY - origin.y) * t,
+            pressure: steadyPressure
           });
-          if (filtered.length === 0) return prev;
-          return {
-            ...prev,
-            points: [...prev.points, ...filtered]
-          };
         }
-        // Photoshop-style Pulled-String / Lazy-Mouse real-time stabilization
-        const stringRadius = (brushSmoothing / 100) * (28 / zoom);
-        const followFactor = Math.max(0.08, 1 - (brushSmoothing / 100) * 0.88);
-        const updated = [...prev.points];
-        let currTip = updated[updated.length - 1];
+        draftStrokeRef.current = { ...prev, smoothing: 0, points: straightPts };
+      } else if (brushSmoothing <= 0) {
+        if (shiftLineAxisRef.current) {
+          shiftLineAxisRef.current = null;
+          prev.smoothing = brushSmoothing;
+        }
+        let prevLast = prev.points[prev.points.length - 1];
+        for (const np of newPoints) {
+          if (!prevLast || Math.hypot(np.x - prevLast.x, np.y - prevLast.y) >= 0.6) {
+            prev.points.push(np);
+            prevLast = np;
+          }
+        }
+      } else {
+        if (shiftLineAxisRef.current) {
+          shiftLineAxisRef.current = null;
+          prev.smoothing = brushSmoothing;
+        }
+        // Smooth continuous Clip Studio / SAI Stabilizer (ZERO dead-zone jump / ZERO sawtooth waves!)
+        const sNorm = brushSmoothing / 100;
+        const alpha = Math.max(0.06, Math.pow(1 - sNorm, 1.65));
+        let currTip = prev.points[prev.points.length - 1];
 
         for (const target of newPoints) {
-          const dx = target.x - currTip.x;
-          const dy = target.y - currTip.y;
-          const dist = Math.hypot(dx, dy);
-          if (dist > stringRadius) {
-            const nextPt: Point = {
-              x: currTip.x + dx * followFactor,
-              y: currTip.y + dy * followFactor,
-              pressure: (currTip.pressure ?? 1) + ((target.pressure ?? 1) - (currTip.pressure ?? 1)) * 0.45
-            };
-            updated.push(nextPt);
+          const nx = currTip.x + (target.x - currTip.x) * alpha;
+          const ny = currTip.y + (target.y - currTip.y) * alpha;
+          const np = (currTip.pressure ?? 1) + ((target.pressure ?? 1) - (currTip.pressure ?? 1)) * 0.35;
+          if (Math.hypot(nx - currTip.x, ny - currTip.y) >= 0.75) {
+            const nextPt: Point = { x: nx, y: ny, pressure: np };
+            prev.points.push(nextPt);
             currTip = nextPt;
           }
         }
-        return {
-          ...prev,
-          points: updated
-        };
       }
-      return prev;
-    });
+    }
+    scheduleLivePaint();
   };
 
   const handlePointerUp = () => {
+    if (cameraDragRef.current) {
+      cameraDragRef.current = null;
+      return;
+    }
     if (draggingVpIndex !== null) {
       setDraggingVpIndex(null);
       return;
@@ -1918,6 +3349,22 @@ export const CanvasStage: React.FC = () => {
       return;
     }
     if (transformActive) {
+      if (transformDragStart && transformQuad) {
+        const s = transformDragStart.quad;
+        const moved =
+          Math.abs(s.tl.x - transformQuad.tl.x) > 0.2 ||
+          Math.abs(s.tl.y - transformQuad.tl.y) > 0.2 ||
+          Math.abs(s.tr.x - transformQuad.tr.x) > 0.2 ||
+          Math.abs(s.tr.y - transformQuad.tr.y) > 0.2 ||
+          Math.abs(s.br.x - transformQuad.br.x) > 0.2 ||
+          Math.abs(s.br.y - transformQuad.br.y) > 0.2 ||
+          Math.abs(s.bl.x - transformQuad.bl.x) > 0.2 ||
+          Math.abs(s.bl.y - transformQuad.bl.y) > 0.2;
+        if (moved) {
+          setTransformQuadHistory((h) => [...h.slice(-29), cloneQuad(s)]);
+          setTransformQuadRedo([]);
+        }
+      }
       setActiveTransformHandle(null);
       setTransformDragStart(null);
       return;
@@ -1930,6 +3377,17 @@ export const CanvasStage: React.FC = () => {
     if (isDraggingSelection) {
       setIsDraggingSelection(false);
       setDragLastPt(null);
+      return;
+    }
+    if (activeTool === 'liquify' && isDrawing && liquifyPreview) {
+      if (liquifyModifiedRef.current) {
+        replaceStrokes(liquifyPreview);
+        captureTimelapseStep();
+      }
+      setLiquifyPreview(null);
+      liquifyLastPtRef.current = null;
+      liquifyModifiedRef.current = false;
+      setIsDrawing(false);
       return;
     }
     if (activeTool === 'lassofill' && isDrawing) {
@@ -1956,51 +3414,109 @@ export const CanvasStage: React.FC = () => {
     }
     if (
       (activeTool === 'lasso' || activeTool === 'rectselect' || activeTool === 'ellipseselect') &&
-      isDrawing &&
-      !lassoClosed
+      isDrawing
     ) {
       setIsDrawing(false);
       setSelectShapeStart(null);
-      closeLassoAndSelect(lassoPoints);
+      const opMode = selectionOpModeRef.current;
+      selectionOpModeRef.current = 'replace';
+      closeLassoAndSelect(lassoPoints, false, opMode);
       return;
     }
-    if (isDrawing && draftStroke) {
-      if (draftStroke.tool !== 'eraser') {
-        pushRecentColor(draftStroke.color);
+    const activeDraft = draftStrokeRef.current;
+    if (isDrawing && activeDraft) {
+      // Freeze a clean copy before committing to store
+      const committed: Stroke = { ...activeDraft, points: [...activeDraft.points] };
+      if (committed.tool !== 'eraser') {
+        pushRecentColor(committed.color);
       }
-      addStroke(draftStroke);
-      // If Symmetry Ruler is ON, automatically add mirrored stroke across vertical center!
-      if (symmetryMode === 'vertical' && draftStroke.points.length > 0) {
+      // If Symmetry Ruler is ON, commit original + mirrored stroke in 1 atomic Undo step (skip for full-canvas gradient)!
+      if (symmetryMode === 'vertical' && committed.tool !== 'gradient' && committed.points.length > 0) {
         const mirrored: Stroke = {
-          ...draftStroke,
-          id: `${draftStroke.id}-sym`,
-          points: draftStroke.points.map((p) => ({
+          ...committed,
+          id: `${committed.id}-sym`,
+          points: committed.points.map((p) => ({
             ...p,
             x: canvasWidth - p.x
           }))
         };
-        addStroke(mirrored);
+        addStrokesBatch([committed, mirrored], committed.tool === 'eraser');
+      } else {
+        addStroke(committed);
       }
       captureTimelapseStep();
-      setDraftStroke(null);
-      setStabilizerCursor(null);
+      draftStrokeRef.current = null;
+      stabilizerCursorRef.current = null;
       setIsDrawing(false);
     }
   };
 
+  // On palm rejection / pointercancel, ABORT in-progress stroke instead of committing partial garbage!
+  const handlePointerCancel = () => {
+    cameraDragRef.current = null;
+    setDraggingVpIndex(null);
+    setIsRotating(false);
+    setIsPanning(false);
+    setActiveTransformHandle(null);
+    setTransformDragStart(null);
+    setActiveCropHandle(null);
+    setCropDragStart(null);
+    setIsDraggingSelection(false);
+    setDragLastPt(null);
+    setLiquifyPreview(null);
+    liquifyLastPtRef.current = null;
+    liquifyModifiedRef.current = false;
+    setSelectShapeStart(null);
+    draftStrokeRef.current = null;
+    stabilizerCursorRef.current = null;
+    setIsDrawing(false);
+    scheduleLivePaint();
+  };
+
   const handleDoubleClick = () => {
-    if (activeTool === 'polylassofill' && lassoPoints.length >= 3 && !lassoClosed) {
-      commitPolyFill(lassoPoints);
-    } else if ((activeTool === 'polylasso' || activeTool === 'lasso') && lassoPoints.length >= 3 && !lassoClosed) {
-      closeLassoAndSelect(lassoPoints);
+    if (transformActive) {
+      commitTransform();
+      return;
+    }
+    // Remove duplicate trailing point caused by double-click's second pointerdown
+    const cleanedPoly =
+      lassoPoints.length >= 2 &&
+      Math.hypot(
+        lassoPoints[lassoPoints.length - 1].x - lassoPoints[lassoPoints.length - 2].x,
+        lassoPoints[lassoPoints.length - 1].y - lassoPoints[lassoPoints.length - 2].y
+      ) < 2
+        ? lassoPoints.slice(0, -1)
+        : lassoPoints;
+    if (activeTool === 'polylassofill' && cleanedPoly.length >= 3) {
+      commitPolyFill(cleanedPoly);
+    } else if ((activeTool === 'polylasso' || activeTool === 'lasso') && cleanedPoly.length >= 3) {
+      const opMode = selectionOpModeRef.current;
+      selectionOpModeRef.current = 'replace';
+      closeLassoAndSelect(cleanedPoly, false, opMode);
     }
   };
 
-  const handleWheel = (e: React.WheelEvent<HTMLCanvasElement>) => {
-    e.preventDefault();
-    const factor = e.deltaY < 0 ? 1.1 : 0.9;
-    setZoom(zoom * factor);
-  };
+  // Native non-passive wheel listener for smooth Zoom-to-Cursor (zero Chromium passive warnings!)
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const s = useHarmonyStore.getState();
+      const factor = e.deltaY < 0 ? 1.1 : 0.9;
+      const nextZoom = Math.max(0.1, Math.min(8, s.zoom * factor));
+      const rect = containerRef.current?.getBoundingClientRect();
+      if (rect) {
+        const mx = e.clientX - (rect.left + rect.width / 2);
+        const my = e.clientY - (rect.top + rect.height / 2);
+        const ratio = nextZoom / s.zoom;
+        s.setPan(mx - (mx - s.panX) * ratio, my - (my - s.panY) * ratio);
+      }
+      s.setZoom(nextZoom);
+    };
+    canvas.addEventListener('wheel', onWheel, { passive: false });
+    return () => canvas.removeEventListener('wheel', onWheel);
+  }, []);
 
   const getCropCursor = (h: CropHandle | null) => {
     if (h === 'nw' || h === 'se') return 'nwse-resize';
@@ -2012,7 +3528,14 @@ export const CanvasStage: React.FC = () => {
   };
 
   const isEyedropperActive =
-    activeTool === 'eyedropper' || (altHeld && activeTool !== 'lasso' && activeTool !== 'zoom');
+    !transformActive &&
+    !cropMode &&
+    (activeTool === 'eyedropper' ||
+      (altHeld &&
+        activeTool !== 'lasso' &&
+        activeTool !== 'polylasso' &&
+        activeTool !== 'polylassofill' &&
+        activeTool !== 'zoom'));
 
   const showBrushRing =
     !cropMode &&
@@ -2023,9 +3546,12 @@ export const CanvasStage: React.FC = () => {
     !rHeld &&
     !isPanning &&
     !isRotating &&
-    (activeTool === 'brush' || activeTool === 'pencil' || activeTool === 'eraser');
+    (activeTool === 'brush' || activeTool === 'pencil' || activeTool === 'eraser' || activeTool === 'liquify');
 
-  const brushRingDiameter = Math.max(4, brushSize * zoom);
+  const brushRingDiameter = Math.max(
+    4,
+    (activeTool === 'liquify' ? liquifySize : activeTool === 'eraser' ? eraserSize : brushSize) * zoom
+  );
 
   const eyedropperCursor = `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%23ffffff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m2 22 1-1h3l9-9' stroke='%23000000' stroke-width='3.5'/%3E%3Cpath d='m2 22 1-1h3l9-9'/%3E%3Cpath d='M3 21v-3l9-9' stroke='%23000000' stroke-width='3.5'/%3E%3Cpath d='M3 21v-3l9-9'/%3E%3Cpath d='m15 6 3.4-3.4a2.1 2.1 0 1 1 3 3L18 9l.4.4a2.1 2.1 0 1 1-3 3l-3.8-3.8a2.1 2.1 0 1 1 3-3l.4.4Z' fill='%233a86ff' stroke='%23000000' stroke-width='1.5'/%3E%3C/svg%3E") 2 22, crosshair`;
 
@@ -2089,8 +3615,8 @@ export const CanvasStage: React.FC = () => {
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
+        onPointerCancel={handlePointerCancel}
         onPointerLeave={() => {
-          handlePointerUp();
           if (brushRingRef.current) brushRingRef.current.style.opacity = '0';
         }}
         onDoubleClick={handleDoubleClick}
@@ -2103,7 +3629,6 @@ export const CanvasStage: React.FC = () => {
             }
           }
         }}
-        onWheel={handleWheel}
         style={{
           display: 'block',
           cursor: cursorStyle,
@@ -2202,20 +3727,10 @@ export const CanvasStage: React.FC = () => {
             Perspectiva
           </button>
           <div className="tb-sep" />
-          <button
-            className="icon-btn"
-            onClick={() =>
-              setTransformQuad((q) => (q ? { tl: q.tr, tr: q.tl, br: q.bl, bl: q.br } : q))
-            }
-          >
+          <button className="icon-btn" onClick={flipQuadH}>
             Flip H
           </button>
-          <button
-            className="icon-btn"
-            onClick={() =>
-              setTransformQuad((q) => (q ? { tl: q.bl, tr: q.br, br: q.tr, bl: q.tl } : q))
-            }
-          >
+          <button className="icon-btn" onClick={flipQuadV}>
             Flip V
           </button>
           <button
@@ -2261,7 +3776,7 @@ export const CanvasStage: React.FC = () => {
           <button
             className="dropdown-item"
             onClick={() => {
-              setTransformQuad((q) => (q ? { tl: q.tr, tr: q.tl, br: q.bl, bl: q.br } : q));
+              flipQuadH();
               setTransformMenuPos(null);
             }}
           >
@@ -2270,7 +3785,7 @@ export const CanvasStage: React.FC = () => {
           <button
             className="dropdown-item"
             onClick={() => {
-              setTransformQuad((q) => (q ? { tl: q.bl, tr: q.br, br: q.tr, bl: q.tl } : q));
+              flipQuadV();
               setTransformMenuPos(null);
             }}
           >
@@ -2279,8 +3794,52 @@ export const CanvasStage: React.FC = () => {
         </div>
       )}
 
+      {/* Floating 2D Camera View Mode Banner (Cinema Preview HUD) */}
+      {cameraViewMode && getActiveCameraLayer(layers) && (
+        <div
+          style={{
+            position: 'absolute',
+            top: 10,
+            left: '50%',
+            transform: 'translateX(-50%)',
+            background: 'rgba(12, 26, 40, 0.94)',
+            border: '1px solid #0284c7',
+            borderRadius: 6,
+            padding: '5px 12px',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 10,
+            boxShadow: '0 6px 20px rgba(0,0,0,0.55)',
+            zIndex: 45,
+            fontSize: 11.5,
+            color: '#e0f2fe'
+          }}
+        >
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontWeight: 600 }}>
+            <span style={{ width: 8, height: 8, borderRadius: '50%', background: '#38bdf8', boxShadow: '0 0 8px #38bdf8' }} />
+            Visão da Câmera 2D
+          </span>
+          <span style={{ color: '#7dd3fc', fontFamily: 'monospace' }}>
+            Zoom {getInterpolatedCamera(getActiveCameraLayer(layers), currentFrame).zoom.toFixed(2)}x
+          </span>
+          <button
+            className="icon-btn"
+            onClick={() => setCameraViewMode(false)}
+            style={{
+              background: '#0284c7',
+              borderColor: '#38bdf8',
+              color: '#fff',
+              fontSize: 11,
+              padding: '2px 8px'
+            }}
+          >
+            Voltar p/ Edição
+          </button>
+        </div>
+      )}
+
       {/* Floating Selection Action Bar (Ctrl+A or Lasso) */}
-      {lassoClosed && lassoPoints.length >= 3 && !cropMode && (
+      {lassoClosed && selectionPolys.length > 0 && !cropMode && (
         <div
           style={{
             position: 'absolute',
@@ -2317,8 +3876,10 @@ export const CanvasStage: React.FC = () => {
           <button
             className="icon-btn"
             onClick={() => {
+              setSelectionPolys([]);
               setLassoPoints([]);
               setLassoClosed(false);
+              setLassoInverted(false);
               setSelectedStrokeIds([]);
             }}
             title="Desfazer seleção (Ctrl+D)"
@@ -2422,6 +3983,110 @@ export const CanvasStage: React.FC = () => {
                 Redefinir
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Floating Live Text Input Overlay (Text Tool — T) */}
+      {textDraft && (
+        <div
+          style={{
+            position: 'absolute',
+            left: Math.max(12, Math.min(textDraft.screenX, (containerRef.current?.clientWidth || 800) - 240)),
+            top: Math.max(12, Math.min(textDraft.screenY, (containerRef.current?.clientHeight || 600) - 90)),
+            zIndex: 85,
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 4
+          }}
+        >
+          <textarea
+            autoFocus
+            rows={2}
+            placeholder="Digite seu texto..."
+            value={textDraft.value}
+            onChange={(e) => setTextDraft((d) => (d ? { ...d, value: e.target.value } : d))}
+            onKeyDown={(e) => {
+              e.stopPropagation();
+              if (e.key === 'Escape') {
+                setTextDraft(null);
+              } else if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                if (textDraft.value.trim()) {
+                  addStroke({
+                    id: `st-txt-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+                    tool: 'text',
+                    artLayer: activeArtLayer,
+                    swatchId: activeSwatch.id,
+                    color: activeColor,
+                    size: 1,
+                    opacity: brushOpacity,
+                    smoothing: 0,
+                    points: [{ x: textDraft.canvasX, y: textDraft.canvasY }],
+                    text: textDraft.value,
+                    fontFamily: textFontFamily,
+                    fontSize: textFontSize,
+                    fontBold: textBold,
+                    fontItalic: textItalic
+                  });
+                  pushRecentColor(activeColor);
+                  captureTimelapseStep();
+                }
+                setTextDraft(null);
+              }
+            }}
+            style={{
+              minWidth: 200,
+              background: isDarkHexColor(activeColor) ? 'rgba(248, 248, 248, 0.92)' : 'rgba(20, 20, 20, 0.88)',
+              color: activeColor,
+              border: '1.5px dashed #3a86ff',
+              borderRadius: 4,
+              padding: '4px 8px',
+              fontFamily: `"${textFontFamily}", sans-serif`,
+              fontSize: Math.max(13, Math.min(48, Math.round(textFontSize * zoom))),
+              fontWeight: textBold ? 'bold' : 'normal',
+              fontStyle: textItalic ? 'italic' : 'normal',
+              outline: 'none',
+              resize: 'both'
+            }}
+          />
+          <div style={{ display: 'flex', gap: 4 }}>
+            <button
+              className="icon-btn active"
+              onClick={() => {
+                if (textDraft.value.trim()) {
+                  addStroke({
+                    id: `st-txt-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+                    tool: 'text',
+                    artLayer: activeArtLayer,
+                    swatchId: activeSwatch.id,
+                    color: activeColor,
+                    size: 1,
+                    opacity: brushOpacity,
+                    smoothing: 0,
+                    points: [{ x: textDraft.canvasX, y: textDraft.canvasY }],
+                    text: textDraft.value,
+                    fontFamily: textFontFamily,
+                    fontSize: textFontSize,
+                    fontBold: textBold,
+                    fontItalic: textItalic
+                  });
+                  pushRecentColor(activeColor);
+                  captureTimelapseStep();
+                }
+                setTextDraft(null);
+              }}
+              style={{ fontSize: 10.5, height: 22 }}
+            >
+              OK (Enter)
+            </button>
+            <button
+              className="icon-btn"
+              onClick={() => setTextDraft(null)}
+              style={{ fontSize: 10.5, height: 22 }}
+            >
+              Cancelar (Esc)
+            </button>
           </div>
         </div>
       )}

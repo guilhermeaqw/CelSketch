@@ -8,10 +8,12 @@ import {
   Minus,
   Square,
   X,
-  FileImage
+  FileImage,
+  Flame
 } from 'lucide-react';
 import { useHarmonyStore } from '../store/useHarmonyStore';
-import { renderFrameToCanvas } from '../utils/canvasRenderer';
+import { preloadFrameImages, renderFrameToCanvas } from '../utils/canvasRenderer';
+import { decodeAudioBufferTrack } from '../App';
 
 const RECENT_KEY = 'celsketch_recent_projects';
 const THUMBS_KEY = 'celsketch_recent_thumbs';
@@ -52,92 +54,65 @@ const PRESETS = [
 ];
 
 export const WelcomeScreen: React.FC = () => {
-  const { createNewScene, loadProjectData, setShowWelcome } = useHarmonyStore();
+  const { createNewScene, createWarmupScene, loadProjectData, setShowWelcome } = useHarmonyStore();
   const [recentProjects, setRecentProjects] = useState<string[]>(() => loadRecentPaths());
   const [recentThumbs, setRecentThumbs] = useState<Record<string, string>>(() => loadRecentThumbs());
-  const [recentAnimFrames, setRecentAnimFrames] = useState<Record<string, string[]>>({});
+  const [recentAnimData, setRecentAnimData] = useState<Record<string, { frames: string[]; fps: number; step: number }>>({});
   const [hoveredPath, setHoveredPath] = useState<string | null>(null);
   const [hoverFrameIdx, setHoverFrameIdx] = useState(0);
 
-  // Optimized hover animation playback for Recent Projects (8 fps)
+  // Real-FPS hover animation playback matching each project's exact FPS!
   useEffect(() => {
     if (!hoveredPath) return;
-    const frames = recentAnimFrames[hoveredPath];
-    if (!frames || frames.length <= 1) return;
+    const data = recentAnimData[hoveredPath];
+    if (!data || data.frames.length <= 1) return;
     setHoverFrameIdx(0);
+    const intervalMs = Math.max(16, Math.round((1000 / Math.max(1, data.fps)) * data.step));
     const id = window.setInterval(() => {
-      setHoverFrameIdx((prev) => (prev + 1) % frames.length);
-    }, 125);
+      setHoverFrameIdx((prev) => (prev + 1) % data.frames.length);
+    }, intervalMs);
     return () => window.clearInterval(id);
-  }, [hoveredPath, recentAnimFrames]);
+  }, [hoveredPath, recentAnimData]);
 
-  // Auto-generate real thumbnails + optimized animation preview frames (up to 12 frames)
+  const loadedPreviewsRef = React.useRef<Set<string>>(new Set());
+
+  // Lazy-load missing static thumbnails ONLY (1 single frame, never 60 frames × 12 projects on boot!)
   useEffect(() => {
     let cancelled = false;
     (async () => {
       if (!window.harmonyAPI) return;
       const currentThumbs = loadRecentThumbs();
-      const animMap: Record<string, string[]> = {};
-      let changed = false;
+      const missingThumbPaths = recentProjects.filter((fp) => !currentThumbs[fp]);
+      if (missingThumbPaths.length === 0) return;
 
-      for (const fp of recentProjects) {
+      let changed = false;
+      for (const fp of missingThumbPaths) {
+        if (cancelled) return;
         try {
           const res = await window.harmonyAPI.openProjectByPath(fp);
           if (!res.canceled && res.content) {
             const parsed = JSON.parse(res.content);
             if (parsed.layers && parsed.width && parsed.height) {
-              // Find all frames that have drawings (up to 12 evenly sampled)
-              let maxF = 1;
+              let previewFrame = 1;
+              let earliest = Infinity;
               for (const l of parsed.layers) {
                 for (const [k, v] of Object.entries(l.frames || {})) {
-                  if (Array.isArray(v) && v.length > 0) {
-                    maxF = Math.max(maxF, Number(k));
-                  }
+                  if (Array.isArray(v) && v.length > 0) earliest = Math.min(earliest, Number(k));
                 }
               }
-              const step = Math.max(1, Math.ceil(maxF / 12));
-              const sampleFrames: string[] = [];
+              if (Number.isFinite(earliest)) previewFrame = earliest;
+              await preloadFrameImages(parsed.layers, previewFrame, previewFrame);
               const src = document.createElement('canvas');
               const thumb = document.createElement('canvas');
-              thumb.width = 240;
-              thumb.height = Math.round((240 * parsed.height) / parsed.width) || 135;
+              thumb.width = 200;
+              thumb.height = Math.round((200 * parsed.height) / parsed.width) || 115;
               const tctx = thumb.getContext('2d');
-
               if (tctx) {
-                // Preload all Paint Bucket / imported image dataUrls so fills appear in previews!
-                const imgPromises: Promise<void>[] = [];
-                for (const l of parsed.layers) {
-                  for (const strokes of Object.values(l.frames || {})) {
-                    if (!Array.isArray(strokes)) continue;
-                    for (const st of strokes as { tool?: string; imageDataUrl?: string }[]) {
-                      if (st.tool === 'image' && st.imageDataUrl) {
-                        imgPromises.push(
-                          new Promise<void>((resolve) => {
-                            const im = new Image();
-                            im.onload = () => resolve();
-                            im.onerror = () => resolve();
-                            im.src = st.imageDataUrl!;
-                          })
-                        );
-                      }
-                    }
-                  }
-                }
-                if (imgPromises.length > 0) {
-                  await Promise.all(imgPromises);
-                }
-
-                for (let f = 1; f <= maxF; f += step) {
-                  renderFrameToCanvas(src, parsed.layers, f, parsed.width, parsed.height, '#ffffff');
-                  tctx.clearRect(0, 0, thumb.width, thumb.height);
-                  tctx.drawImage(src, 0, 0, thumb.width, thumb.height);
-                  sampleFrames.push(thumb.toDataURL('image/jpeg', 0.72));
-                }
-                if (sampleFrames.length > 0) {
-                  animMap[fp] = sampleFrames;
-                  currentThumbs[fp] = sampleFrames[0];
-                  changed = true;
-                }
+                renderFrameToCanvas(src, parsed.layers, previewFrame, parsed.width, parsed.height, '#ffffff');
+                tctx.clearRect(0, 0, thumb.width, thumb.height);
+                tctx.drawImage(src, 0, 0, thumb.width, thumb.height);
+                currentThumbs[fp] = thumb.toDataURL('image/jpeg', 0.72);
+                changed = true;
               }
             }
           }
@@ -145,16 +120,13 @@ export const WelcomeScreen: React.FC = () => {
           // skip unreadable files
         }
       }
-      if (!cancelled) {
-        if (changed) {
-          try {
-            localStorage.setItem(THUMBS_KEY, JSON.stringify(currentThumbs));
-          } catch {
-            // ignore
-          }
-          setRecentThumbs({ ...currentThumbs });
+      if (!cancelled && changed) {
+        try {
+          localStorage.setItem(THUMBS_KEY, JSON.stringify(currentThumbs));
+        } catch {
+          // ignore
         }
-        setRecentAnimFrames(animMap);
+        setRecentThumbs({ ...currentThumbs });
       }
     })();
     return () => {
@@ -162,12 +134,83 @@ export const WelcomeScreen: React.FC = () => {
     };
   }, [recentProjects]);
 
+  // On-demand (Lazy Hover) real-FPS animation preview: only reads & renders when user hovers a card!
+  useEffect(() => {
+    if (!hoveredPath || !window.harmonyAPI || loadedPreviewsRef.current.has(hoveredPath)) return;
+    let cancelled = false;
+    const fp = hoveredPath;
+    loadedPreviewsRef.current.add(fp);
+
+    (async () => {
+      try {
+        const res = await window.harmonyAPI!.openProjectByPath(fp);
+        if (cancelled || res.canceled || !res.content) return;
+        const parsed = JSON.parse(res.content);
+        if (!parsed.layers || !parsed.width || !parsed.height) return;
+
+        const projectFps = Math.max(1, Math.min(60, Number(parsed.fps) || 24));
+        let maxF = 1;
+        for (const l of parsed.layers) {
+          for (const [k, v] of Object.entries(l.frames || {})) {
+            if (Array.isArray(v) && v.length > 0) {
+              const fNum = Number(k);
+              const dur = l.celDurations?.[fNum] || 1;
+              maxF = Math.max(maxF, fNum + dur - 1);
+            }
+          }
+        }
+        if (typeof parsed.playEnd === 'number' && parsed.playEnd > 0) {
+          maxF = Math.min(maxF, parsed.playEnd);
+        }
+        const step = maxF <= 60 ? 1 : Math.ceil(maxF / 60);
+        const sampleFrames: string[] = [];
+        const src = document.createElement('canvas');
+        const thumb = document.createElement('canvas');
+        thumb.width = 200;
+        thumb.height = Math.round((200 * parsed.height) / parsed.width) || 115;
+        const tctx = thumb.getContext('2d');
+        if (!tctx) return;
+
+        await preloadFrameImages(parsed.layers, 1, maxF);
+        if (cancelled) return;
+        for (let f = 1; f <= maxF; f += step) {
+          renderFrameToCanvas(src, parsed.layers, f, parsed.width, parsed.height, '#ffffff');
+          tctx.clearRect(0, 0, thumb.width, thumb.height);
+          tctx.drawImage(src, 0, 0, thumb.width, thumb.height);
+          sampleFrames.push(thumb.toDataURL('image/jpeg', 0.68));
+        }
+        if (!cancelled && sampleFrames.length > 0) {
+          setRecentAnimData((prev) => ({ ...prev, [fp]: { frames: sampleFrames, fps: projectFps, step } }));
+          const currentThumbs = loadRecentThumbs();
+          currentThumbs[fp] = sampleFrames[0];
+          try {
+            localStorage.setItem(THUMBS_KEY, JSON.stringify(currentThumbs));
+          } catch {
+            // ignore
+          }
+          setRecentThumbs({ ...currentThumbs });
+        }
+      } catch {
+        // skip unreadable files
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [hoveredPath]);
+
   const handleRemoveRecent = (e: React.MouseEvent, fp: string) => {
     e.stopPropagation();
     const updated = recentProjects.filter((p) => p !== fp);
     setRecentProjects(updated);
+    loadedPreviewsRef.current.delete(fp);
     try {
       localStorage.setItem(RECENT_KEY, JSON.stringify(updated));
+      const thumbs = loadRecentThumbs();
+      delete thumbs[fp];
+      localStorage.setItem(THUMBS_KEY, JSON.stringify(thumbs));
+      setRecentThumbs(thumbs);
     } catch {
       // ignore
     }
@@ -178,40 +221,133 @@ export const WelcomeScreen: React.FC = () => {
   const [width, setWidth] = useState(1920);
   const [height, setHeight] = useState(1080);
   const [fps, setFps] = useState(24);
+  const [draggingIdx, setDraggingIdx] = useState<number | null>(null);
+  const [dragOverIdx, setDragOverIdx] = useState<number | null>(null);
+  const cardRefs = React.useRef<Map<number, HTMLDivElement>>(new Map());
+  const didDragRef = React.useRef(false);
+
+  const startRecentDrag = (idx: number, e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    // Ignore clicks on the remove '×' button
+    if ((e.target as HTMLElement).closest('button')) return;
+    const startX = e.clientX;
+    const startY = e.clientY;
+    let active = false;
+    let currentOver = idx;
+
+    const onMove = (ev: PointerEvent) => {
+      if (!active && Math.hypot(ev.clientX - startX, ev.clientY - startY) > 6) {
+        active = true;
+        didDragRef.current = true;
+        setDraggingIdx(idx);
+        setDragOverIdx(idx);
+      }
+      if (!active) return;
+
+      // Hit-test which recent card the pointer is over
+      for (const [i, el] of cardRefs.current.entries()) {
+        const r = el.getBoundingClientRect();
+        if (ev.clientX >= r.left && ev.clientX <= r.right && ev.clientY >= r.top && ev.clientY <= r.bottom) {
+          currentOver = i;
+          setDragOverIdx(i);
+          break;
+        }
+      }
+    };
+
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
+      if (active && currentOver !== idx) {
+        setRecentProjects((prev) => {
+          const next = [...prev];
+          const [moved] = next.splice(idx, 1);
+          next.splice(currentOver, 0, moved);
+          try {
+            localStorage.setItem(RECENT_KEY, JSON.stringify(next));
+          } catch {
+            // ignore
+          }
+          return next;
+        });
+      }
+      setDraggingIdx(null);
+      setDragOverIdx(null);
+      if (active) {
+        window.setTimeout(() => {
+          didDragRef.current = false;
+        }, 60);
+      }
+    };
+
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
+  };
+
+  const restoreAudioIfSaved = async (audioTrackPath?: string | null) => {
+    if (!audioTrackPath || !window.harmonyAPI?.readAudioByPath) return;
+    const audioRes = await window.harmonyAPI.readAudioByPath(audioTrackPath);
+    if (!audioRes.canceled && audioRes.bytes && audioRes.name) {
+      const track = await decodeAudioBufferTrack(audioRes.bytes, audioRes.name, audioRes.filePath);
+      if (track) {
+        useHarmonyStore.getState().setAudioTrack(track);
+        useHarmonyStore.setState({ isDirty: false });
+      }
+    }
+  };
 
   const handleOpenExisting = async () => {
     if (!window.harmonyAPI) return;
     const res = await window.harmonyAPI.openProject();
+    if (res.error) {
+      window.alert(`Erro ao abrir projeto: ${res.error}`);
+      return;
+    }
     if (!res.canceled && res.content) {
       try {
         const parsed = JSON.parse(res.content);
         loadProjectData(parsed, res.filePath || null);
         if (res.filePath) setRecentProjects(saveRecentPath(res.filePath));
         setShowWelcome(false);
+        await restoreAudioIfSaved(parsed.audioTrackPath);
       } catch (err) {
         console.error('Failed to open project', err);
+        window.alert('Arquivo de projeto inválido ou corrompido.');
       }
     }
   };
 
   const handleOpenRecent = async (filePath: string) => {
+    if (didDragRef.current) return;
     if (!window.harmonyAPI) return;
     const res = await window.harmonyAPI.openProjectByPath(filePath);
+    if (res.error) {
+      window.alert(`Não foi possível abrir este projeto:\n${res.error}`);
+      return;
+    }
     if (!res.canceled && res.content) {
       try {
         const parsed = JSON.parse(res.content);
         loadProjectData(parsed, filePath);
-        setRecentProjects(saveRecentPath(filePath));
+        // Preserve the user's manual ordering of recent projects!
         setShowWelcome(false);
+        await restoreAudioIfSaved(parsed.audioTrackPath);
       } catch (err) {
         console.error('Failed to open recent project', err);
+        window.alert('Arquivo de projeto inválido ou corrompido.');
       }
     }
   };
 
   const handleClearRecents = () => {
     localStorage.removeItem(RECENT_KEY);
+    localStorage.removeItem(THUMBS_KEY);
+    loadedPreviewsRef.current.clear();
     setRecentProjects([]);
+    setRecentThumbs({});
+    setRecentAnimData({});
   };
 
   useEffect(() => {
@@ -304,6 +440,27 @@ export const WelcomeScreen: React.FC = () => {
           >
             <FilePlus size={16} />
             <span>Novo Projeto (Ctrl+N)</span>
+          </button>
+          <button
+            onClick={() => createWarmupScene()}
+            title="Criar folha de exercícios: elipses, pontos para conectar, linhas retas H/V e curvas em S"
+            style={{
+              background: 'linear-gradient(135deg, #d97706, #f59e0b)',
+              border: '1px solid #fbbf24',
+              color: '#111827',
+              padding: '9px 16px',
+              borderRadius: 6,
+              fontSize: 12.5,
+              fontWeight: 700,
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              gap: 7,
+              boxShadow: '0 4px 14px rgba(245, 158, 11, 0.28)'
+            }}
+          >
+            <Flame size={16} />
+            <span>Modo Aquecimento</span>
           </button>
           <button
             onClick={handleOpenExisting}
@@ -448,6 +605,9 @@ export const WelcomeScreen: React.FC = () => {
         <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}>
           <div style={{ display: 'flex', alignItems: 'baseline', gap: 14, marginBottom: 10 }}>
             <span style={{ fontSize: 16, fontWeight: 500, color: '#e6e6e6' }}>Projetos recentes</span>
+            {recentProjects.length > 1 && (
+              <span style={{ fontSize: 11, color: '#7a7a7a' }}>Arraste para reorganizar</span>
+            )}
             {recentProjects.length > 0 && (
               <button
                 onClick={handleClearRecents}
@@ -495,29 +655,43 @@ export const WelcomeScreen: React.FC = () => {
                   gap: 16
                 }}
               >
-                {recentProjects.map((fp) => {
+                {recentProjects.map((fp, idx) => {
                   const fileName = fp.split(/[\\/]/).pop() || fp;
-                  const animList = recentAnimFrames[fp];
+                  const animInfo = recentAnimData[fp];
                   const activeSrc =
-                    hoveredPath === fp && animList && animList.length > 1
-                      ? animList[hoverFrameIdx % animList.length]
+                    hoveredPath === fp && animInfo && animInfo.frames.length > 1
+                      ? animInfo.frames[hoverFrameIdx % animInfo.frames.length]
                       : recentThumbs[fp];
+                  const isBeingDragged = draggingIdx === idx;
+                  const isDropTarget = draggingIdx !== null && dragOverIdx === idx && draggingIdx !== idx;
 
                   return (
                     <div
                       key={fp}
+                      ref={(el) => {
+                        if (el) cardRefs.current.set(idx, el);
+                        else cardRefs.current.delete(idx);
+                      }}
+                      onPointerDown={(e) => startRecentDrag(idx, e)}
                       onClick={() => handleOpenRecent(fp)}
                       onMouseEnter={() => setHoveredPath(fp)}
                       onMouseLeave={() => setHoveredPath(null)}
-                      title={fp}
+                      title={`${fp}\n(Clique para abrir • Arraste para reorganizar)`}
                       style={{
                         position: 'relative',
-                        cursor: 'pointer',
+                        cursor: isBeingDragged ? 'grabbing' : 'grab',
                         display: 'flex',
                         flexDirection: 'column',
                         alignItems: 'center',
                         gap: 6,
-                        padding: 4
+                        padding: 4,
+                        borderRadius: 6,
+                        opacity: isBeingDragged ? 0.45 : 1,
+                        outline: isDropTarget ? '2px dashed #3a86ff' : 'none',
+                        background: isDropTarget ? 'rgba(58, 134, 255, 0.12)' : 'transparent',
+                        transition: 'background 0.12s, opacity 0.12s',
+                        touchAction: 'none',
+                        userSelect: 'none'
                       }}
                     >
                       <button
@@ -561,12 +735,32 @@ export const WelcomeScreen: React.FC = () => {
                           <img
                             src={activeSrc}
                             alt={fileName}
+                            draggable={false}
                             style={{ width: '100%', height: '100%', objectFit: 'contain', background: '#fff' }}
                           />
                         ) : (
                           <FileImage size={42} strokeWidth={1.3} />
                         )}
                       </div>
+                      {animInfo && (
+                        <span
+                          style={{
+                            position: 'absolute',
+                            left: 10,
+                            top: 96,
+                            background: 'rgba(15, 23, 42, 0.85)',
+                            color: '#93c5fd',
+                            fontSize: 9.5,
+                            fontWeight: 700,
+                            padding: '1px 5px',
+                            borderRadius: 3,
+                            border: '1px solid rgba(58,134,255,0.45)',
+                            pointerEvents: 'none'
+                          }}
+                        >
+                          {animInfo.fps} FPS
+                        </span>
+                      )}
                       <span
                         style={{
                           fontSize: 11.5,

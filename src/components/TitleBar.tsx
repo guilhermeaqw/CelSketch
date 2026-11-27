@@ -13,20 +13,37 @@ import {
   Download,
   FilePlus,
   RotateCcw,
-  Camera
+  Camera,
+  Sparkles,
+  Wind
 } from 'lucide-react';
+import { useShallow } from 'zustand/react/shallow';
 import { useHarmonyStore } from '../store/useHarmonyStore';
+import { hasActivePostProcess } from '../utils/postProcessUtils';
 import { parseExternalArtwork } from '../utils/importer';
-import { renderFrameToCanvas } from '../utils/canvasRenderer';
+import { preloadFrameImages, renderFrameToCanvas } from '../utils/canvasRenderer';
+import { pickSupportedVideoCodec } from '../utils/exporter';
+import { decodeAudioBufferTrack } from '../App';
 
 const RECENT_KEY = 'celsketch_recent_projects';
 const THUMBS_KEY = 'celsketch_recent_thumbs';
 
-function saveProjectThumbnail(filePath: string) {
+export async function saveProjectThumbnail(filePath: string) {
   try {
     const s = useHarmonyStore.getState();
+    // Pick the first drawn frame (fallback to frame 1) so thumbnails aren't blank when art starts later!
+    let previewFrame = 1;
+    let earliest = Infinity;
+    for (const l of s.layers) {
+      if (l.type === 'folder') continue;
+      for (const [k, st] of Object.entries(l.frames || {})) {
+        if (st && st.length > 0) earliest = Math.min(earliest, Number(k));
+      }
+    }
+    if (Number.isFinite(earliest)) previewFrame = earliest;
+    await preloadFrameImages(s.layers, previewFrame, previewFrame);
     const src = document.createElement('canvas');
-    renderFrameToCanvas(src, s.layers, 1, s.canvasWidth, s.canvasHeight, '#ffffff');
+    renderFrameToCanvas(src, s.layers, previewFrame, s.canvasWidth, s.canvasHeight, '#ffffff');
     const thumb = document.createElement('canvas');
     thumb.width = 240;
     thumb.height = Math.round((240 * s.canvasHeight) / s.canvasWidth) || 135;
@@ -53,7 +70,7 @@ function loadRecentPaths(): string[] {
 
 function saveRecentPath(filePath: string): string[] {
   const existing = loadRecentPaths().filter((p) => p !== filePath);
-  const updated = [filePath, ...existing].slice(0, 8);
+  const updated = [filePath, ...existing].slice(0, 12);
   try {
     localStorage.setItem(RECENT_KEY, JSON.stringify(updated));
   } catch {
@@ -65,7 +82,15 @@ function saveRecentPath(filePath: string): string[] {
 export const TitleBar: React.FC = () => {
   const [openMenu, setOpenMenu] = useState<string | null>(null);
   const [recentProjects, setRecentProjects] = useState<string[]>(() => loadRecentPaths());
+  const [timelapseBusy, setTimelapseBusy] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
+
+  // Refresh Recent Projects whenever File menu opens so Ctrl+S / Ctrl+O / Explorer opens show up immediately
+  useEffect(() => {
+    if (openMenu === 'file') {
+      setRecentProjects(loadRecentPaths());
+    }
+  }, [openMenu]);
 
   const {
     projectName,
@@ -76,37 +101,88 @@ export const TitleBar: React.FC = () => {
     perspectiveMode,
     symmetryMode,
     showCameraFrame,
+    cameraViewMode,
+    hasCameraLayer,
+    postProcessModalOpen,
+    postProcessActive,
     lightTable,
     onionSkin,
     grayscaleMode,
     rotation,
+    activeTool,
     brushSmoothing,
+    brushOpacity,
+    eraserOpacity,
     autoSaveEnabled,
     autoSaveIntervalSec,
     timelapseRecording,
     timelapseRootDir,
-    timelapseFrames,
+    timelapseCount,
     performanceMode,
-    undoStack,
-    redoStack,
+    referenceWindowOpen,
+    canUndo,
+    canRedo
+  } = useHarmonyStore(
+    useShallow((s) => ({
+      projectName: s.projectName,
+      projectPath: s.projectPath,
+      canvasWidth: s.canvasWidth,
+      canvasHeight: s.canvasHeight,
+      showGrid: s.showGrid,
+      perspectiveMode: s.perspectiveMode,
+      symmetryMode: s.symmetryMode,
+      showCameraFrame: s.showCameraFrame,
+      cameraViewMode: s.cameraViewMode,
+      hasCameraLayer: s.layers.some((l) => l.type === 'camera' && l.visible),
+      postProcessModalOpen: s.postProcessModalOpen,
+      postProcessActive: hasActivePostProcess(s.postProcess),
+      lightTable: s.lightTable,
+      onionSkin: s.onionSkin,
+      grayscaleMode: s.grayscaleMode,
+      rotation: s.rotation,
+      activeTool: s.activeTool,
+      brushSmoothing: s.brushSmoothing,
+      brushOpacity: s.brushOpacity,
+      eraserOpacity: s.eraserOpacity,
+      autoSaveEnabled: s.autoSaveEnabled,
+      autoSaveIntervalSec: s.autoSaveIntervalSec,
+      timelapseRecording: s.timelapseRecording,
+      timelapseRootDir: s.timelapseRootDir,
+      timelapseCount: s.timelapseFrames.length,
+      performanceMode: s.performanceMode,
+      referenceWindowOpen: s.referenceWindowOpen,
+      canUndo: s.undoStack.length > 0,
+      canRedo: s.redoStack.length > 0
+    }))
+  );
+
+  const {
     undo,
     redo,
     setBrushSmoothing,
+    setBrushOpacity,
+    setEraserOpacity,
     setAutoSaveEnabled,
     setAutoSaveIntervalSec,
     toggleTimelapseRecording,
     setTimelapseRootDir,
     setPerformanceMode,
+    toggleReferenceWindow,
     toggleSymmetry,
     setPerspectiveMode,
     setAudioTrack,
     resetRotation,
     toggleGrid,
     toggleCameraFrame,
+    toggleCameraViewMode,
+    addCameraLayer,
     toggleLightTable,
     toggleOnionSkin,
     toggleGrayscaleMode,
     setHsvModalOpen,
+    setLevelsModalOpen,
+    setBlurModalOpen,
+    setPostProcessModalOpen,
     setExportModalOpen,
     setShowWelcome,
     resetView,
@@ -117,9 +193,15 @@ export const TitleBar: React.FC = () => {
     loadProjectData,
     setProjectMeta,
     addLayer,
-    importImageLayer,
+    importArtworkLayersBatch,
+    clearTimelapse,
     togglePlay
-  } = useHarmonyStore();
+  } = useHarmonyStore.getState();
+
+  const [autoSaveDraft, setAutoSaveDraft] = useState(String(autoSaveIntervalSec));
+  useEffect(() => {
+    setAutoSaveDraft(String(autoSaveIntervalSec));
+  }, [autoSaveIntervalSec]);
 
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
@@ -133,66 +215,93 @@ export const TitleBar: React.FC = () => {
 
   const handleNewScene = () => {
     setOpenMenu(null);
-    if (window.confirm('Deseja realmente criar uma nova cena? Alterações não salvas na cena atual serão perdidas.')) {
-      newProject();
-    }
+    newProject();
   };
 
   const handleExportTimelapse = async () => {
-    if (!window.harmonyAPI || timelapseFrames.length === 0) return;
-    const firstImg = new Image();
-    firstImg.src = timelapseFrames[0];
-    await new Promise((r) => { firstImg.onload = r; });
-    const canvas = document.createElement('canvas');
-    canvas.width = firstImg.naturalWidth || 960;
-    canvas.height = firstImg.naturalHeight || 540;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
+    const timelapseFrames = useHarmonyStore.getState().timelapseFrames;
+    if (!window.harmonyAPI || timelapseFrames.length === 0 || timelapseBusy) return;
+    setTimelapseBusy(true);
+    let stream: MediaStream | null = null;
+    try {
+      const firstImg = new Image();
+      firstImg.src = timelapseFrames[0];
+      await new Promise<void>((r) => {
+        firstImg.onload = () => r();
+        firstImg.onerror = () => r();
+      });
+      const canvas = document.createElement('canvas');
+      canvas.width = firstImg.naturalWidth || 960;
+      canvas.height = firstImg.naturalHeight || 540;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
 
-    const mp4Supported = MediaRecorder.isTypeSupported('video/mp4;codecs=avc1.42E01E') || MediaRecorder.isTypeSupported('video/mp4');
-    const mimeType = MediaRecorder.isTypeSupported('video/mp4;codecs=avc1.42E01E')
-      ? 'video/mp4;codecs=avc1.42E01E'
-      : MediaRecorder.isTypeSupported('video/mp4')
-      ? 'video/mp4'
-      : 'video/webm;codecs=vp9';
-    const ext = mp4Supported ? 'mp4' : 'webm';
-    const stream = canvas.captureStream(15);
-    const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 6_000_000 });
-    const chunks: Blob[] = [];
-    recorder.ondataavailable = (ev) => { if (ev.data.size > 0) chunks.push(ev.data); };
-    const done = new Promise<Blob>((resolve) => {
-      recorder.onstop = () => resolve(new Blob(chunks, { type: mimeType }));
-    });
-    recorder.start();
-    for (const url of timelapseFrames) {
-      const img = new Image();
-      img.src = url;
-      await new Promise((r) => { img.onload = r; img.onerror = r; });
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-      await new Promise((r) => setTimeout(r, 66));
+      const codec = pickSupportedVideoCodec();
+      stream = canvas.captureStream(15);
+      const recorder = new MediaRecorder(stream, { mimeType: codec.mimeType, videoBitsPerSecond: 6_000_000 });
+      const chunks: Blob[] = [];
+      recorder.ondataavailable = (ev) => {
+        if (ev.data.size > 0) chunks.push(ev.data);
+      };
+      const done = new Promise<Blob>((resolve) => {
+        recorder.onstop = () => resolve(new Blob(chunks, { type: codec.mimeType }));
+      });
+      ctx.drawImage(firstImg, 0, 0, canvas.width, canvas.height);
+      recorder.start();
+      let nextTick = performance.now();
+      for (let i = 0; i < timelapseFrames.length; i++) {
+        if (i > 0) {
+          const img = new Image();
+          img.src = timelapseFrames[i];
+          await new Promise<void>((r) => {
+            img.onload = () => r();
+            img.onerror = () => r();
+          });
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        }
+        nextTick += 66.7;
+        const waitMs = Math.max(0, nextTick - performance.now());
+        await new Promise((r) => setTimeout(r, waitMs));
+      }
+      recorder.stop();
+      const blob = await done;
+      const buf = await blob.arrayBuffer();
+      const safeName = (projectName || 'CelSketch').replace(/[<>:"/\\|?*\x00-\x1f]/g, '_');
+      await window.harmonyAPI.saveBinaryFile(
+        `${safeName}_timelapse.${codec.ext}`,
+        `${codec.label} Timelapse`,
+        [codec.ext],
+        new Uint8Array(buf)
+      );
+    } catch (err) {
+      console.error('Timelapse export failed:', err);
+      window.alert('Não foi possível exportar o vídeo de Timelapse.');
+    } finally {
+      stream?.getTracks().forEach((t) => t.stop());
+      setTimelapseBusy(false);
     }
-    recorder.stop();
-    const blob = await done;
-    const buf = await blob.arrayBuffer();
-    await window.harmonyAPI.saveBinaryFile(
-      `${projectName}_timelapse.${ext}`,
-      mp4Supported ? 'MP4 Timelapse' : 'WebM Timelapse',
-      [ext],
-      new Uint8Array(buf)
-    );
   };
 
   const handleSave = async () => {
     setOpenMenu(null);
     const data = JSON.stringify(exportProjectData(), null, 2);
     if (window.harmonyAPI) {
-      const res = await window.harmonyAPI.saveProject(data, projectPath);
-      if (!res.canceled && res.filePath) {
-        const name = res.filePath.split(/[\\/]/).pop()?.replace(/\.(celsketch|nexo|hrm)$/i, '') || projectName;
-        setProjectMeta(name, res.filePath);
-        setRecentProjects(saveRecentPath(res.filePath));
-        saveProjectThumbnail(res.filePath);
+      try {
+        const res = await window.harmonyAPI.saveProject(data, projectPath, projectName);
+        if (res.error) {
+          window.alert(`Erro ao salvar projeto: ${res.error}`);
+          return;
+        }
+        if (!res.canceled && res.filePath) {
+          const name = res.filePath.split(/[\\/]/).pop()?.replace(/\.(celsketch|nexo|hrm)$/i, '') || projectName;
+          setProjectMeta(name, res.filePath);
+          setRecentProjects(saveRecentPath(res.filePath));
+          saveProjectThumbnail(res.filePath);
+        }
+      } catch (err) {
+        console.error('Save failed:', err);
+        window.alert('Falha ao salvar o projeto.');
       }
     }
   };
@@ -201,12 +310,33 @@ export const TitleBar: React.FC = () => {
     setOpenMenu(null);
     const data = JSON.stringify(exportProjectData(), null, 2);
     if (window.harmonyAPI) {
-      const res = await window.harmonyAPI.saveProjectAs(data);
-      if (!res.canceled && res.filePath) {
-        const name = res.filePath.split(/[\\/]/).pop()?.replace(/\.(celsketch|nexo|hrm)$/i, '') || projectName;
-        setProjectMeta(name, res.filePath);
-        setRecentProjects(saveRecentPath(res.filePath));
-        saveProjectThumbnail(res.filePath);
+      try {
+        const res = await window.harmonyAPI.saveProjectAs(data, projectName);
+        if (res.error) {
+          window.alert(`Erro ao salvar projeto: ${res.error}`);
+          return;
+        }
+        if (!res.canceled && res.filePath) {
+          const name = res.filePath.split(/[\\/]/).pop()?.replace(/\.(celsketch|nexo|hrm)$/i, '') || projectName;
+          setProjectMeta(name, res.filePath);
+          setRecentProjects(saveRecentPath(res.filePath));
+          saveProjectThumbnail(res.filePath);
+        }
+      } catch (err) {
+        console.error('Save As failed:', err);
+        window.alert('Falha ao salvar o projeto.');
+      }
+    }
+  };
+
+  const restoreProjectAudio = async (audioTrackPath?: string | null) => {
+    if (!audioTrackPath || !window.harmonyAPI?.readAudioByPath) return;
+    const audioRes = await window.harmonyAPI.readAudioByPath(audioTrackPath);
+    if (!audioRes.canceled && audioRes.bytes && audioRes.name) {
+      const track = await decodeAudioBufferTrack(audioRes.bytes, audioRes.name, audioRes.filePath);
+      if (track) {
+        setAudioTrack(track);
+        useHarmonyStore.setState({ isDirty: false });
       }
     }
   };
@@ -215,13 +345,19 @@ export const TitleBar: React.FC = () => {
     setOpenMenu(null);
     if (window.harmonyAPI) {
       const res = await window.harmonyAPI.openProject();
+      if (res.error) {
+        window.alert(`Erro ao abrir projeto: ${res.error}`);
+        return;
+      }
       if (!res.canceled && res.content) {
         try {
           const parsed = JSON.parse(res.content);
           loadProjectData(parsed, res.filePath || null);
           if (res.filePath) setRecentProjects(saveRecentPath(res.filePath));
+          await restoreProjectAudio(parsed.audioTrackPath);
         } catch (err) {
           console.error('Failed to parse project file', err);
+          window.alert('Arquivo de projeto inválido ou corrompido.');
         }
       }
     }
@@ -231,13 +367,19 @@ export const TitleBar: React.FC = () => {
     setOpenMenu(null);
     if (!window.harmonyAPI) return;
     const res = await window.harmonyAPI.openProjectByPath(filePath);
+    if (res.error) {
+      window.alert(`Não foi possível abrir o arquivo:\n${res.error}`);
+      return;
+    }
     if (!res.canceled && res.content) {
       try {
         const parsed = JSON.parse(res.content);
         loadProjectData(parsed, filePath);
         setRecentProjects(saveRecentPath(filePath));
+        await restoreProjectAudio(parsed.audioTrackPath);
       } catch (err) {
         console.error('Failed to parse recent project', err);
+        window.alert('Arquivo de projeto inválido ou corrompido.');
       }
     }
   };
@@ -247,29 +389,11 @@ export const TitleBar: React.FC = () => {
     if (!window.harmonyAPI) return;
     const res = await window.harmonyAPI.importAudio();
     if (!res.canceled && res.bytes && res.name) {
-      try {
-        const copy = new Uint8Array(res.bytes);
-        const blob = new Blob([copy.buffer as ArrayBuffer]);
-        const objectUrl = URL.createObjectURL(blob);
-        const audioCtx = new AudioContext();
-        const decoded = await audioCtx.decodeAudioData(copy.buffer.slice(0) as ArrayBuffer);
-        const channel = decoded.getChannelData(0);
-        const samples = 240;
-        const blockSize = Math.max(1, Math.floor(channel.length / samples));
-        const peaks: number[] = [];
-        for (let i = 0; i < samples; i++) {
-          let max = 0;
-          const start = i * blockSize;
-          for (let j = 0; j < blockSize && start + j < channel.length; j += 16) {
-            const v = Math.abs(channel[start + j]);
-            if (v > max) max = v;
-          }
-          peaks.push(max);
-        }
-        audioCtx.close();
-        setAudioTrack({ name: res.name, objectUrl, peaks, duration: decoded.duration });
-      } catch (err) {
-        console.error('Failed to decode audio', err);
+      const track = await decodeAudioBufferTrack(res.bytes, res.name, res.filePath);
+      if (track) {
+        setAudioTrack(track);
+      } else {
+        window.alert('Não foi possível decodificar o arquivo de áudio selecionado.');
       }
     }
   };
@@ -282,11 +406,14 @@ export const TitleBar: React.FC = () => {
       const fileName = res.filePath.split(/[\\/]/).pop() || 'Imported';
       try {
         const items = await parseExternalArtwork(fileName, res.ext, res.bytes);
-        for (const item of items) {
-          importImageLayer(item.name, item.dataUrl, item.x, item.y, item.w, item.h, item.opacity);
+        if (items.length === 0) {
+          window.alert('Nenhuma camada/imagem encontrada nesse arquivo.');
+          return;
         }
-      } catch (err) {
+        importArtworkLayersBatch(items);
+      } catch (err: any) {
         console.error('Failed to import external artwork', err);
+        window.alert(`Erro ao importar arquivo: ${err?.message || 'formato não suportado'}`);
       }
     }
   };
@@ -379,14 +506,33 @@ export const TitleBar: React.FC = () => {
             </button>
             {openMenu === 'edit' && (
               <div className="dropdown-menu">
-                <button className="dropdown-item" onClick={() => { undo(); setOpenMenu(null); }}>
+                <button
+                  className="dropdown-item"
+                  disabled={!canUndo}
+                  style={{ opacity: canUndo ? 1 : 0.45 }}
+                  onClick={() => { undo(); setOpenMenu(null); }}
+                >
                   <span>Undo</span><span style={{ color: '#888' }}>Ctrl+Z</span>
                 </button>
-                <button className="dropdown-item" onClick={() => { redo(); setOpenMenu(null); }}>
-                  <span>Redo</span><span style={{ color: '#888' }}>Ctrl+Y</span>
+                <button
+                  className="dropdown-item"
+                  disabled={!canRedo}
+                  style={{ opacity: canRedo ? 1 : 0.45 }}
+                  onClick={() => { redo(); setOpenMenu(null); }}
+                >
+                  <span>Redo</span><span style={{ color: '#888' }}>Ctrl+Shift+Z</span>
                 </button>
                 <button className="dropdown-item" onClick={() => { setHsvModalOpen(true); setOpenMenu(null); }}>
                   <span>Hue / Saturation / Value...</span><span style={{ color: '#888' }}>Ctrl+U</span>
+                </button>
+                <button className="dropdown-item" onClick={() => { setLevelsModalOpen(true); setOpenMenu(null); }}>
+                  <span>Níveis / Brilho & Contraste...</span><span style={{ color: '#888' }}>Ctrl+L</span>
+                </button>
+                <button className="dropdown-item" onClick={() => { setBlurModalOpen(true); setOpenMenu(null); }}>
+                  <span>Desfoque (Movimento / Gaussiano / Radial)...</span><span style={{ color: '#888' }}>Ctrl+Shift+B</span>
+                </button>
+                <button className="dropdown-item" onClick={() => { setPostProcessModalOpen(true); setOpenMenu(null); }}>
+                  <span>Pós-Produção / Look de Anime...</span><span style={{ color: '#c084fc' }}>FX</span>
                 </button>
                 <div className="dropdown-sep" />
                 <button className="dropdown-item" onClick={() => { clearCurrentFrame(); setOpenMenu(null); }}>
@@ -440,7 +586,7 @@ export const TitleBar: React.FC = () => {
                   <span>New Drawing Layer</span><span style={{ color: '#888' }}>Ctrl+R</span>
                 </button>
                 <button className="dropdown-item" onClick={() => { togglePlay(); setOpenMenu(null); }}>
-                  <span>Play / Stop</span><span style={{ color: '#888' }}>Space</span>
+                  <span>Play / Stop</span><span style={{ color: '#888' }}>Shift+Space</span>
                 </button>
               </div>
             )}
@@ -484,10 +630,10 @@ export const TitleBar: React.FC = () => {
 
         <div className="tb-sep" />
 
-        <button className="icon-btn" onClick={undo} disabled={undoStack.length === 0} title="Undo (Ctrl+Z)">
+        <button className="icon-btn" onClick={undo} disabled={!canUndo} title="Undo (Ctrl+Z)">
           <Undo2 size={14} />
         </button>
-        <button className="icon-btn" onClick={redo} disabled={redoStack.length === 0} title="Redo (Ctrl+Y)">
+        <button className="icon-btn" onClick={redo} disabled={!canRedo} title="Redo (Ctrl+Shift+Z)">
           <Redo2 size={14} />
         </button>
 
@@ -524,8 +670,58 @@ export const TitleBar: React.FC = () => {
         >
           <span>Simetria</span>
         </button>
-        <button className={`icon-btn ${showCameraFrame ? 'active' : ''}`} onClick={toggleCameraFrame} title="Camera Frame">
+        <button
+          className={`icon-btn ${referenceWindowOpen ? 'active' : ''}`}
+          onClick={toggleReferenceWindow}
+          title="Janela de Referência estilo PureRef (arraste imagens ou Ctrl+V)"
+        >
+          <span>Ref</span>
+        </button>
+        <button
+          className={`icon-btn ${hasCameraLayer ? (cameraViewMode ? 'active' : '') : showCameraFrame ? 'active' : ''}`}
+          onClick={() => {
+            if (hasCameraLayer) toggleCameraViewMode();
+            else addCameraLayer();
+          }}
+          style={
+            hasCameraLayer && cameraViewMode
+              ? { background: '#0284c7', borderColor: '#38bdf8', color: '#fff', gap: 4 }
+              : hasCameraLayer
+              ? { borderColor: '#0369a1', color: '#7dd3fc', gap: 4 }
+              : { gap: 4 }
+          }
+          title={
+            hasCameraLayer
+              ? cameraViewMode
+                ? 'Sair da Visão da Câmera (voltar para edição livre)'
+                : 'Ver pela Câmera 2D (enquadramento exato do vídeo final)'
+              : 'Adicionar Câmera 2D Animável à cena'
+          }
+        >
           <Camera size={14} />
+          <span>{hasCameraLayer ? (cameraViewMode ? 'Câmera ON' : 'Ver Câmera') : 'Câmera 2D'}</span>
+        </button>
+        <button
+          className="icon-btn"
+          onClick={() => setBlurModalOpen(true)}
+          style={{ gap: 4 }}
+          title="Desfoque na Camada / Quadro / Seleção (Movimento Direcional, Gaussiano, Radial — Ctrl+Shift+B)"
+        >
+          <Wind size={13} color="#38bdf8" />
+          <span>Desfoque</span>
+        </button>
+        <button
+          className={`icon-btn ${postProcessModalOpen || postProcessActive ? 'active' : ''}`}
+          onClick={() => setPostProcessModalOpen(!postProcessModalOpen)}
+          style={
+            postProcessActive
+              ? { background: 'rgba(168, 85, 247, 0.25)', borderColor: '#a855f7', color: '#e9d5ff', gap: 4 }
+              : { gap: 4 }
+          }
+          title="Pós-Produção / Look de Anime (Bloom, Aberração Cromática, Motion Blur, Vinheta, Grão)"
+        >
+          <Sparkles size={13} />
+          <span>Pós-Prod</span>
         </button>
         <button className="icon-btn" onClick={resetView} title="Reset View (5)">
           <RotateCcw size={14} />
@@ -542,8 +738,8 @@ export const TitleBar: React.FC = () => {
 
         {/* Brush Stabilizer */}
         <label
-          style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: '#ccc' }}
-          title="Brush Stabilizer (Pulled String)"
+          style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, color: '#ccc' }}
+          title="Estabilizador de Traço"
         >
           <span>Stabilizer:</span>
           <input
@@ -552,9 +748,34 @@ export const TitleBar: React.FC = () => {
             max={100}
             value={brushSmoothing}
             onChange={(e) => setBrushSmoothing(Number(e.target.value))}
-            style={{ width: 85, accentColor: '#3a86ff', cursor: 'pointer' }}
+            onPointerUp={(e) => (e.currentTarget as HTMLInputElement).blur()}
+            style={{ width: 76, accentColor: '#3a86ff', cursor: 'pointer' }}
           />
-          <span style={{ width: 32, color: '#fff', fontWeight: 600 }}>{brushSmoothing}%</span>
+          <span style={{ width: 30, color: '#fff', fontWeight: 600 }}>{brushSmoothing}%</span>
+        </label>
+
+        {/* Brush / Eraser Opacity right next to Stabilizer */}
+        <label
+          style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, color: '#ccc' }}
+          title={activeTool === 'eraser' ? 'Opacidade da Borracha (E)' : 'Opacidade do Pincel'}
+        >
+          <span>{activeTool === 'eraser' ? 'Opac. (E):' : 'Opacidade:'}</span>
+          <input
+            type="range"
+            min={5}
+            max={100}
+            value={Math.round((activeTool === 'eraser' ? eraserOpacity : brushOpacity) * 100)}
+            onChange={(e) => {
+              const v = Number(e.target.value) / 100;
+              if (activeTool === 'eraser') setEraserOpacity(v);
+              else setBrushOpacity(v);
+            }}
+            onPointerUp={(e) => (e.currentTarget as HTMLInputElement).blur()}
+            style={{ width: 76, accentColor: '#3a86ff', cursor: 'pointer' }}
+          />
+          <span style={{ width: 30, color: '#fff', fontWeight: 600 }}>
+            {Math.round((activeTool === 'eraser' ? eraserOpacity : brushOpacity) * 100)}%
+          </span>
         </label>
 
         <div className="tb-sep" />
@@ -572,15 +793,23 @@ export const TitleBar: React.FC = () => {
           <span>AutoSave:</span>
         </label>
         <input
-          type="number"
-          min={5}
-          max={3600}
-          value={autoSaveIntervalSec}
+          type="text"
+          inputMode="numeric"
+          value={autoSaveDraft}
           disabled={!autoSaveEnabled}
-          onChange={(e) => setAutoSaveIntervalSec(Number(e.target.value) || 60)}
-          className="harmony-input"
-          style={{ width: 46, opacity: autoSaveEnabled ? 1 : 0.45 }}
-          title="Intervalo do Auto-Save em segundos"
+          onChange={(e) => setAutoSaveDraft(e.target.value.replace(/[^0-9]/g, ''))}
+          onBlur={() => {
+            const v = parseInt(autoSaveDraft, 10);
+            const clamped = Number.isFinite(v) ? Math.max(5, Math.min(3600, v)) : autoSaveIntervalSec;
+            setAutoSaveIntervalSec(clamped);
+            setAutoSaveDraft(String(clamped));
+          }}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') e.currentTarget.blur();
+          }}
+          className="harmony-input timeline-num-input"
+          style={{ width: 44, opacity: autoSaveEnabled ? 1 : 0.45 }}
+          title="Intervalo do Auto-Save em segundos (5 a 3600)"
         />
         <span style={{ fontSize: 10.5, color: '#888' }}>s</span>
 
@@ -631,14 +860,26 @@ export const TitleBar: React.FC = () => {
         >
           <FolderOpen size={12} />
         </button>
-        {timelapseFrames.length > 0 && (
-          <button
-            className="icon-btn"
-            onClick={handleExportTimelapse}
-            title="Exportar vídeo do Timelapse gravado"
-          >
-            <span>Timelapse ({timelapseFrames.length})</span>
-          </button>
+        {timelapseCount > 0 && (
+          <div style={{ display: 'inline-flex', alignItems: 'center', gap: 2 }}>
+            <button
+              className="icon-btn"
+              onClick={handleExportTimelapse}
+              disabled={timelapseBusy}
+              title="Exportar vídeo do Timelapse gravado"
+            >
+              <span>{timelapseBusy ? 'Exportando...' : `Timelapse (${timelapseCount})`}</span>
+            </button>
+            <button
+              className="icon-btn"
+              onClick={() => clearTimelapse()}
+              disabled={timelapseBusy}
+              title="Limpar frames de Timelapse em memória"
+              style={{ minWidth: 18, padding: '0 4px', color: '#9ca3af' }}
+            >
+              ×
+            </button>
+          </div>
         )}
 
         <div className="tb-sep" />

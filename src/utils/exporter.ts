@@ -1,17 +1,25 @@
-import { GIFEncoder, quantize, applyPalette } from 'gifenc';
-import { DrawingLayer } from '../types/harmony';
-import { renderFrameToCanvas } from './canvasRenderer';
+import { DrawingLayer, PostProcessSettings } from '../types/harmony';
+import { preloadFrameImages, renderFrameToCanvas } from './canvasRenderer';
 
-function getLastUsedFrame(layers: DrawingLayer[], totalFrames: number): number {
-  let maxFrame = 1;
-  for (const layer of layers) {
-    for (const [fKey, strokes] of Object.entries(layer.frames)) {
-      if (strokes && strokes.length > 0) {
-        maxFrame = Math.max(maxFrame, Number(fKey));
-      }
+function sanitizeExportName(name: string): string {
+  const cleaned = (name || 'CelSketch').replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').trim();
+  return cleaned || 'CelSketch';
+}
+
+export function pickSupportedVideoCodec(): { mimeType: string; ext: 'mp4' | 'webm'; label: string } {
+  const candidates: { mimeType: string; ext: 'mp4' | 'webm'; label: string }[] = [
+    { mimeType: 'video/mp4;codecs=avc1.42E01E', ext: 'mp4', label: 'MP4 Video' },
+    { mimeType: 'video/mp4', ext: 'mp4', label: 'MP4 Video' },
+    { mimeType: 'video/webm;codecs=vp9', ext: 'webm', label: 'WebM Video' },
+    { mimeType: 'video/webm;codecs=vp8', ext: 'webm', label: 'WebM Video' },
+    { mimeType: 'video/webm', ext: 'webm', label: 'WebM Video' }
+  ];
+  for (const c of candidates) {
+    if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(c.mimeType)) {
+      return c;
     }
   }
-  return Math.min(totalFrames, Math.max(1, maxFrame));
+  return { mimeType: 'video/webm', ext: 'webm', label: 'WebM Video' };
 }
 
 export async function exportPngSequence(
@@ -21,28 +29,50 @@ export async function exportPngSequence(
   width: number,
   height: number,
   projectName: string,
-  onProgress?: (msg: string) => void
-): Promise<{ canceled?: boolean; dirPath?: string; count?: number }> {
+  onProgress?: (msg: string) => void,
+  transparentBg = false,
+  postProcess?: PostProcessSettings | null
+): Promise<{ canceled?: boolean; dirPath?: string; count?: number; error?: string }> {
   if (!window.harmonyAPI) return { canceled: true };
-  const pick = await window.harmonyAPI.pickDirectory();
+  const sFrame = Math.min(startFrame, endFrame);
+  const eFrame = Math.max(startFrame, endFrame);
+  const pick = await window.harmonyAPI.pickDirectory('Selecionar pasta para Sequência PNG');
   if (pick.canceled || !pick.dirPath) return { canceled: true };
 
+  onProgress?.('Preparando imagens...');
+  await preloadFrameImages(layers, sFrame, eFrame);
+
+  const safeName = sanitizeExportName(projectName);
   const offscreen = document.createElement('canvas');
   let count = 0;
 
-  for (let f = startFrame; f <= endFrame; f++) {
-    onProgress?.(`Exporting PNG ${f}/${endFrame}...`);
-    renderFrameToCanvas(offscreen, layers, f, width, height, '#ffffff');
-    const dataUrl = offscreen.toDataURL('image/png');
-    const pad = String(f).padStart(4, '0');
-    await window.harmonyAPI.writeFrameToDir(pick.dirPath, `${projectName}_${pad}.png`, dataUrl);
-    count++;
-    await new Promise((r) => setTimeout(r, 0));
-  }
+  try {
+    for (let f = sFrame; f <= eFrame; f++) {
+      onProgress?.(`Exportando PNG ${f}/${eFrame}...`);
+      renderFrameToCanvas(offscreen, layers, f, width, height, transparentBg ? null : '#ffffff', true, postProcess);
+      const dataUrl = offscreen.toDataURL('image/png');
+      const pad = String(f).padStart(4, '0');
+      const writeRes = await window.harmonyAPI.writeFrameToDir(pick.dirPath, `${safeName}_${pad}.png`, dataUrl);
+      if (!writeRes?.ok) {
+        return { canceled: false, error: writeRes?.error || 'Falha ao gravar PNG' };
+      }
+      count++;
+      await new Promise((r) => setTimeout(r, 0));
+    }
 
-  onProgress?.('');
-  await window.harmonyAPI.openPath(pick.dirPath);
-  return { canceled: false, dirPath: pick.dirPath, count };
+    await window.harmonyAPI.openPath(pick.dirPath);
+    return { canceled: false, dirPath: pick.dirPath, count };
+  } finally {
+    onProgress?.('');
+  }
+}
+
+export function computeGifDimensions(width: number, height: number): { gifW: number; gifH: number } {
+  const scale = Math.min(1, 960 / width, 960 / height);
+  return {
+    gifW: Math.max(2, Math.round(width * scale)),
+    gifH: Math.max(2, Math.round(height * scale))
+  };
 }
 
 export async function exportGifAnimation(
@@ -53,15 +83,17 @@ export async function exportGifAnimation(
   width: number,
   height: number,
   projectName: string,
-  onProgress?: (msg: string) => void
-): Promise<{ canceled?: boolean; filePath?: string }> {
+  onProgress?: (msg: string) => void,
+  postProcess?: PostProcessSettings | null
+): Promise<{ canceled?: boolean; filePath?: string; error?: string }> {
   if (!window.harmonyAPI) return { canceled: true };
+  const sFrame = Math.min(startFrame, endFrame);
+  const eFrame = Math.max(startFrame, endFrame);
 
-  // Scale down to 960x540 max for fast, crisp GIF encoding
-  const scale = Math.min(1, 960 / width);
-  const gifW = Math.round(width * scale);
-  const gifH = Math.round(height * scale);
+  onProgress?.('Preparando imagens...');
+  await preloadFrameImages(layers, sFrame, eFrame);
 
+  const { gifW, gifH } = computeGifDimensions(width, height);
   const srcCanvas = document.createElement('canvas');
   const gifCanvas = document.createElement('canvas');
   gifCanvas.width = gifW;
@@ -69,12 +101,13 @@ export async function exportGifAnimation(
   const gctx = gifCanvas.getContext('2d', { willReadFrequently: true });
   if (!gctx) return { canceled: true };
 
+  const { GIFEncoder, quantize, applyPalette } = await import('gifenc');
   const gif = GIFEncoder();
-  const delayMs = Math.max(20, Math.round(1000 / fps));
+  const delayMs = Math.max(20, Math.round(1000 / Math.max(1, fps)));
 
-  for (let f = startFrame; f <= endFrame; f++) {
-    onProgress?.(`Encoding GIF frame ${f}/${endFrame}...`);
-    renderFrameToCanvas(srcCanvas, layers, f, width, height, '#ffffff');
+  for (let f = sFrame; f <= eFrame; f++) {
+    onProgress?.(`Codificando GIF frame ${f}/${eFrame}...`);
+    renderFrameToCanvas(srcCanvas, layers, f, width, height, '#ffffff', true, postProcess);
     gctx.clearRect(0, 0, gifW, gifH);
     gctx.drawImage(srcCanvas, 0, 0, gifW, gifH);
     const { data } = gctx.getImageData(0, 0, gifW, gifH);
@@ -88,8 +121,9 @@ export async function exportGifAnimation(
   const bytes = gif.bytes();
   onProgress?.('');
 
+  const safeName = sanitizeExportName(projectName);
   const res = await window.harmonyAPI.saveBinaryFile(
-    `${projectName}.gif`,
+    `${safeName}.gif`,
     'Animated GIF',
     ['gif'],
     bytes
@@ -105,25 +139,32 @@ export async function exportVideoAnimation(
   width: number,
   height: number,
   projectName: string,
-  onProgress?: (msg: string) => void
-): Promise<{ canceled?: boolean; filePath?: string }> {
+  onProgress?: (msg: string) => void,
+  postProcess?: PostProcessSettings | null
+): Promise<{ canceled?: boolean; filePath?: string; error?: string }> {
   if (!window.harmonyAPI) return { canceled: true };
+  const sFrame = Math.min(startFrame, endFrame);
+  const eFrame = Math.max(startFrame, endFrame);
+
+  onProgress?.('Preparando imagens...');
+  await preloadFrameImages(layers, sFrame, eFrame);
 
   const canvas = document.createElement('canvas');
   canvas.width = width;
   canvas.height = height;
 
-  const mp4Supported = MediaRecorder.isTypeSupported('video/mp4;codecs=avc1.42E01E') || MediaRecorder.isTypeSupported('video/mp4');
-  const mimeType = MediaRecorder.isTypeSupported('video/mp4;codecs=avc1.42E01E')
-    ? 'video/mp4;codecs=avc1.42E01E'
-    : MediaRecorder.isTypeSupported('video/mp4')
-    ? 'video/mp4'
-    : 'video/webm;codecs=vp9';
-
-  const ext = mp4Supported ? 'mp4' : 'webm';
-  const stream = canvas.captureStream(fps);
+  const codec = pickSupportedVideoCodec();
+  const safeFps = Math.max(1, fps);
+  // Use manual frame capture (0) when requestFrame() is available so heavy frames never cause duplicate-frame drift!
+  let stream = canvas.captureStream(0);
+  let videoTrack = stream.getVideoTracks()[0] as MediaStreamTrack & { requestFrame?: () => void };
+  if (!videoTrack || typeof videoTrack.requestFrame !== 'function') {
+    stream.getTracks().forEach((t) => t.stop());
+    stream = canvas.captureStream(safeFps);
+    videoTrack = stream.getVideoTracks()[0] as MediaStreamTrack & { requestFrame?: () => void };
+  }
   const recorder = new MediaRecorder(stream, {
-    mimeType,
+    mimeType: codec.mimeType,
     videoBitsPerSecond: 8_000_000
   });
 
@@ -132,29 +173,43 @@ export async function exportVideoAnimation(
     if (e.data.size > 0) chunks.push(e.data);
   };
 
-  const donePromise = new Promise<Blob>((resolve) => {
-    recorder.onstop = () => resolve(new Blob(chunks, { type: mimeType }));
+  const donePromise = new Promise<Blob>((resolve, reject) => {
+    recorder.onstop = () => resolve(new Blob(chunks, { type: codec.mimeType }));
+    recorder.onerror = (ev) => reject(new Error(`Erro no MediaRecorder: ${(ev as ErrorEvent).message || 'falha na gravação'}`));
   });
 
-  recorder.start();
-  const frameDuration = 1000 / fps;
+  try {
+    // Draw initial frame BEFORE starting recorder so frame 1 is never blank!
+    renderFrameToCanvas(canvas, layers, sFrame, width, height, '#ffffff', true, postProcess);
+    recorder.start();
+    const frameDuration = 1000 / safeFps;
+    let nextTick = performance.now();
 
-  for (let f = startFrame; f <= endFrame; f++) {
-    onProgress?.(`Rendering Video frame ${f}/${endFrame}...`);
-    renderFrameToCanvas(canvas, layers, f, width, height, '#ffffff');
-    await new Promise((r) => setTimeout(r, frameDuration));
+    for (let f = sFrame; f <= eFrame; f++) {
+      onProgress?.(`Renderizando Vídeo frame ${f}/${eFrame}...`);
+      if (f > sFrame) {
+        renderFrameToCanvas(canvas, layers, f, width, height, '#ffffff', true, postProcess);
+      }
+      videoTrack?.requestFrame?.();
+      nextTick += frameDuration;
+      const waitMs = Math.max(0, nextTick - performance.now());
+      await new Promise((r) => setTimeout(r, waitMs));
+    }
+
+    if (recorder.state !== 'inactive') recorder.stop();
+    const blob = await donePromise;
+    const buffer = await blob.arrayBuffer();
+
+    const safeName = sanitizeExportName(projectName);
+    const res = await window.harmonyAPI.saveBinaryFile(
+      `${safeName}.${codec.ext}`,
+      codec.label,
+      [codec.ext],
+      new Uint8Array(buffer)
+    );
+    return res;
+  } finally {
+    onProgress?.('');
+    stream.getTracks().forEach((t) => t.stop());
   }
-
-  recorder.stop();
-  const blob = await donePromise;
-  const buffer = await blob.arrayBuffer();
-  onProgress?.('');
-
-  const res = await window.harmonyAPI.saveBinaryFile(
-    `${projectName}.${ext}`,
-    mp4Supported ? 'MP4 Video' : 'WebM Video',
-    [ext],
-    new Uint8Array(buffer)
-  );
-  return res;
 }

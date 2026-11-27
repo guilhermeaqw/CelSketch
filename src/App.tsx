@@ -1,6 +1,7 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Plus, X } from 'lucide-react';
-import { TitleBar } from './components/TitleBar';
+import { useShallow } from 'zustand/react/shallow';
+import { TitleBar, saveProjectThumbnail } from './components/TitleBar';
 import { ToolsBar } from './components/ToolsBar';
 import { CanvasStage } from './components/CanvasStage';
 import { RightPanel } from './components/RightPanel';
@@ -8,10 +9,81 @@ import { TimelinePanel } from './components/TimelinePanel';
 import { DockablePanel } from './components/DockablePanel';
 import { WelcomeScreen } from './components/WelcomeScreen';
 import { HsvModal } from './components/HsvModal';
+import { LevelsModal } from './components/LevelsModal';
+import { BlurModal } from './components/BlurModal';
+import { PostProcessModal } from './components/PostProcessModal';
 import { ExportModal } from './components/ExportModal';
+import { ReferenceWindow } from './components/ReferenceWindow';
+import { UnsavedCloseModal } from './components/UnsavedCloseModal';
 import { useHarmonyStore } from './store/useHarmonyStore';
 
+const TEXT_INPUT_TYPES = new Set(['text', 'search', 'number', 'email', 'password', 'url', 'tel']);
+
+export function isTextEditingTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  if (target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement) return true;
+  if (target.isContentEditable) return true;
+  if (target instanceof HTMLInputElement) {
+    return TEXT_INPUT_TYPES.has((target.type || 'text').toLowerCase());
+  }
+  return false;
+}
+
+export async function decodeAudioBufferTrack(
+  bytes: Uint8Array,
+  name: string,
+  filePath?: string
+): Promise<{ name: string; filePath?: string; objectUrl: string; peaks: number[]; duration: number } | null> {
+  const ext = (name.split('.').pop() || '').toLowerCase();
+  const mimeMap: Record<string, string> = {
+    mp3: 'audio/mpeg',
+    wav: 'audio/wav',
+    ogg: 'audio/ogg',
+    m4a: 'audio/mp4'
+  };
+  const copy = new Uint8Array(bytes);
+  const blob = new Blob([copy.buffer], { type: mimeMap[ext] || 'audio/mpeg' });
+  const objectUrl = URL.createObjectURL(blob);
+  const audioCtx = new AudioContext();
+  try {
+    const ab = copy.buffer.slice(0);
+    const decoded = await audioCtx.decodeAudioData(ab);
+    const raw = decoded.getChannelData(0);
+    const numBars = 220;
+    const blockSize = Math.max(1, Math.floor(raw.length / numBars));
+    const peaks: number[] = [];
+    for (let i = 0; i < numBars; i++) {
+      let max = 0;
+      const start = i * blockSize;
+      for (let j = 0; j < blockSize && start + j < raw.length; j += 8) {
+        const v = Math.abs(raw[start + j]);
+        if (v > max) max = v;
+      }
+      peaks.push(max);
+    }
+    return { name, filePath, objectUrl, peaks, duration: decoded.duration };
+  } catch (err) {
+    URL.revokeObjectURL(objectUrl);
+    console.error('Failed to decode audio:', err);
+    return null;
+  } finally {
+    await audioCtx.close().catch(() => {});
+  }
+}
+
 export const App: React.FC = () => {
+  const [recoveryOffer, setRecoveryOffer] = useState<{ content: string; mtimeMs: number } | null>(null);
+  const [closeConfirmOpen, setCloseConfirmOpen] = useState(false);
+
+  useEffect(() => {
+    const unsub = window.harmonyAPI?.onRequestClose?.(() => {
+      setCloseConfirmOpen(true);
+    });
+    return () => {
+      if (unsub) unsub();
+    };
+  }, []);
+
   const {
     showWelcome,
     openScenes,
@@ -25,216 +97,404 @@ export const App: React.FC = () => {
     layers,
     fps,
     currentFrame,
-    zoom,
-    projectName,
-    projectPath,
+    lastAutoSaveTime,
     autoSaveEnabled,
     autoSaveIntervalSec,
-    lastAutoSaveTime,
-    brushSize,
-    setTool,
-    activateSelectionGroup,
-    activateShapeGroup,
-    swapColors,
-    setZoom,
-    resetView,
-    setBrushSize,
-    setLastAutoSaveTime,
-    undo,
-    redo,
-    togglePlay,
-    toggleFlipX,
-    toggleGrayscaleMode,
-    setHsvModalOpen,
-    setCropMode,
-    cropMode,
-    nextFrame,
-    prevFrame,
-    duplicateFrameToNext,
-    copyCurrentFrame,
-    pasteToCurrentFrame,
-    extendExposureF5,
-    reduceExposureShiftF5,
-    exportProjectData,
-    setProjectMeta
-  } = useHarmonyStore();
+    setLastAutoSaveTime
+  } = useHarmonyStore(
+    useShallow((s) => ({
+      showWelcome: s.showWelcome,
+      openScenes: s.openScenes,
+      activeSceneId: s.activeSceneId,
+      isDirty: s.isDirty,
+      switchSceneTab: s.switchSceneTab,
+      closeSceneTab: s.closeSceneTab,
+      addBlankSceneTab: s.addBlankSceneTab,
+      activeTool: s.activeTool,
+      activeLayerId: s.activeLayerId,
+      layers: s.layers,
+      fps: s.fps,
+      currentFrame: s.currentFrame,
+      lastAutoSaveTime: s.lastAutoSaveTime,
+      autoSaveEnabled: s.autoSaveEnabled,
+      autoSaveIntervalSec: s.autoSaveIntervalSec,
+      setLastAutoSaveTime: s.setLastAutoSaveTime
+    }))
+  );
 
-  // Auto-Save timer every X seconds
+  // Open project helper (handles Explorer double-click + saved audio reload)
+  const openProjectPathDirectly = async (filePath: string) => {
+    if (!window.harmonyAPI) return;
+    try {
+      const res = await window.harmonyAPI.openProjectByPath(filePath);
+      if (res.canceled || !res.content || !res.filePath) return;
+      const parsed = JSON.parse(res.content);
+      const st = useHarmonyStore.getState();
+      st.loadProjectData(parsed, res.filePath);
+      if (parsed.audioTrackPath && window.harmonyAPI.readAudioByPath) {
+        const audioRes = await window.harmonyAPI.readAudioByPath(parsed.audioTrackPath);
+        if (!audioRes.canceled && audioRes.bytes && audioRes.name) {
+          const track = await decodeAudioBufferTrack(audioRes.bytes, audioRes.name, audioRes.filePath);
+          if (track) {
+            useHarmonyStore.getState().setAudioTrack(track);
+            useHarmonyStore.setState({ isDirty: false });
+          }
+        }
+      }
+      try {
+        const raw = localStorage.getItem('celsketch_recent_projects');
+        const list: string[] = raw ? JSON.parse(raw) : [];
+        const updated = [res.filePath, ...list.filter((p) => p !== res.filePath)].slice(0, 12);
+        localStorage.setItem('celsketch_recent_projects', JSON.stringify(updated));
+      } catch {
+        // ignore
+      }
+    } catch (err) {
+      console.error('Failed to open project file:', err);
+    }
+  };
+
+  // Startup: handle OS file association launch + second-instance + crash recovery check
+  useEffect(() => {
+    let active = true;
+    const api = window.harmonyAPI;
+    if (!api) return;
+
+    api.getLaunchFile?.().then((launchFile) => {
+      if (active && launchFile) {
+        openProjectPathDirectly(launchFile);
+      }
+    });
+
+    const unsubOpen = api.onOpenExternalFile?.((fp) => {
+      if (fp) openProjectPathDirectly(fp);
+    });
+
+    api.checkRecovery?.().then((rec) => {
+      if (active && rec?.exists && rec.content) {
+        setRecoveryOffer({ content: rec.content, mtimeMs: rec.mtimeMs || Date.now() });
+      }
+    });
+
+    return () => {
+      active = false;
+      unsubOpen?.();
+    };
+  }, []);
+
+  // Auto-Save timer: ONLY saves when user is inside a scene AND has unsaved edits (never overwrites backup on WelcomeScreen!)
   useEffect(() => {
     if (!autoSaveEnabled) return;
     const ms = Math.max(5, autoSaveIntervalSec) * 1000;
     const id = window.setInterval(async () => {
       if (!window.harmonyAPI) return;
       const state = useHarmonyStore.getState();
-      const data = JSON.stringify(state.exportProjectData(), null, 2);
-      const res = await window.harmonyAPI.autoSave(data, state.projectPath);
-      if (res?.ok) {
-        const now = new Date();
-        const hh = String(now.getHours()).padStart(2, '0');
-        const mm = String(now.getMinutes()).padStart(2, '0');
-        const ss = String(now.getSeconds()).padStart(2, '0');
-        setLastAutoSaveTime(`${hh}:${mm}:${ss}`);
+      if (state.showWelcome || !state.isDirty) return;
+      try {
+        const data = JSON.stringify(state.exportProjectData());
+        const res = await window.harmonyAPI.autoSave(data, state.projectPath);
+        if (res?.ok) {
+          const now = new Date();
+          const hh = String(now.getHours()).padStart(2, '0');
+          const mm = String(now.getMinutes()).padStart(2, '0');
+          const ss = String(now.getSeconds()).padStart(2, '0');
+          setLastAutoSaveTime(`${hh}:${mm}:${ss}`);
+        }
+      } catch (err) {
+        console.error('Auto-save error:', err);
       }
     }, ms);
     return () => window.clearInterval(id);
   }, [autoSaveEnabled, autoSaveIntervalSec, setLastAutoSaveTime]);
 
-  // Global Keyboard Shortcuts
+  // Global Keyboard Shortcuts (reads live store state via getState() — zero stale closures!)
   useEffect(() => {
     const onKeyDown = async (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      const s = useHarmonyStore.getState();
+      if (s.showWelcome || s.hsvModalOpen || s.levelsModalOpen || s.blurModalOpen || s.exportModalOpen) return;
+      if (isTextEditingTarget(e.target)) return;
 
       if (e.ctrlKey || e.metaKey) {
         const k = e.key.toLowerCase();
         if (k === 'z') {
           e.preventDefault();
-          if (e.shiftKey) redo();
-          else undo();
+          if (e.shiftKey) s.redo();
+          else s.undo();
         } else if (k === 'y') {
+          if (e.repeat) return;
           e.preventDefault();
-          toggleGrayscaleMode();
+          s.toggleGrayscaleMode();
         } else if (k === 'u') {
+          if (e.repeat) return;
           e.preventDefault();
-          setHsvModalOpen(true);
-        } else if (k === 'c') {
+          s.setHsvModalOpen(true);
+        } else if (k === 'l') {
+          if (e.repeat) return;
           e.preventDefault();
-          copyCurrentFrame();
-        } else if (k === 'v') {
+          s.setLevelsModalOpen(true);
+        } else if (k === 'b' && e.shiftKey) {
+          if (e.repeat) return;
           e.preventDefault();
-          pasteToCurrentFrame();
-        } else if (k === '=' || k === '+') {
+          s.setBlurModalOpen(true);
+        } else if (k === 'i' && e.shiftKey) {
+          if (e.repeat) return;
           e.preventDefault();
-          setZoom(zoom * 1.15);
-        } else if (k === '-') {
+          s.requestInvertSelection();
+        } else if (k === 'n') {
+          if (e.repeat) return;
           e.preventDefault();
-          setZoom(zoom * 0.85);
-        } else if (k === '0') {
+          s.addBlankSceneTab();
+        } else if (k === 'r') {
+          if (e.repeat) return;
           e.preventDefault();
-          resetView();
-        } else if (k === 's') {
+          s.addLayer();
+        } else if (k === 'o') {
+          if (e.repeat) return;
           e.preventDefault();
           if (!window.harmonyAPI) return;
-          const data = JSON.stringify(exportProjectData(), null, 2);
-          const res = e.shiftKey
-            ? await window.harmonyAPI.saveProjectAs(data)
-            : await window.harmonyAPI.saveProject(data, projectPath);
-          if (!res.canceled && res.filePath) {
-            const name = res.filePath.split(/[\\/]/).pop()?.replace(/\.(celsketch|nexo|hrm)$/i, '') || projectName;
-            setProjectMeta(name, res.filePath);
-            try {
-              const raw = localStorage.getItem('celsketch_recent_projects');
-              const list: string[] = raw ? JSON.parse(raw) : [];
-              const updated = [res.filePath, ...list.filter((p) => p !== res.filePath)].slice(0, 12);
-              localStorage.setItem('celsketch_recent_projects', JSON.stringify(updated));
-            } catch {
-              // ignore storage errors
+          try {
+            const res = await window.harmonyAPI.openProject();
+            if (!res.canceled && res.content && res.filePath) {
+              const parsed = JSON.parse(res.content);
+              useHarmonyStore.getState().loadProjectData(parsed, res.filePath);
+              try {
+                const raw = localStorage.getItem('celsketch_recent_projects');
+                const list: string[] = raw ? JSON.parse(raw) : [];
+                const updated = [res.filePath, ...list.filter((p) => p !== res.filePath)].slice(0, 12);
+                localStorage.setItem('celsketch_recent_projects', JSON.stringify(updated));
+              } catch {
+                // ignore storage errors
+              }
+              if (parsed.audioTrackPath && window.harmonyAPI.readAudioByPath) {
+                const audioRes = await window.harmonyAPI.readAudioByPath(parsed.audioTrackPath);
+                if (!audioRes.canceled && audioRes.bytes && audioRes.name) {
+                  const track = await decodeAudioBufferTrack(audioRes.bytes, audioRes.name, audioRes.filePath);
+                  if (track) {
+                    useHarmonyStore.getState().setAudioTrack(track);
+                    useHarmonyStore.setState({ isDirty: false });
+                  }
+                }
+              }
             }
+          } catch (err) {
+            console.error('Open failed:', err);
+          }
+        } else if (k === 'c') {
+          e.preventDefault();
+          s.copyCurrentFrame();
+        } else if (k === 'v') {
+          // Let ReferenceWindow receive native clipboard image paste when focused/hovered!
+          const targetEl = e.target instanceof HTMLElement ? e.target : null;
+          const insideRef = Boolean(targetEl?.closest('[data-ref-window]'));
+          const refHovered = Boolean(document.querySelector('[data-ref-window="active"]'));
+          if (insideRef || refHovered) return;
+          e.preventDefault();
+          s.pasteToCurrentFrame();
+        } else if (k === '=' || k === '+') {
+          e.preventDefault();
+          s.setZoom(s.zoom * 1.15);
+        } else if (k === '-') {
+          e.preventDefault();
+          s.setZoom(s.zoom * 0.85);
+        } else if (k === '0') {
+          e.preventDefault();
+          s.resetView();
+        } else if (k === 's') {
+          if (e.repeat) return;
+          e.preventDefault();
+          if (!window.harmonyAPI) return;
+          try {
+            const data = JSON.stringify(s.exportProjectData(), null, 2);
+            const res = e.shiftKey
+              ? await window.harmonyAPI.saveProjectAs(data, s.projectName)
+              : await window.harmonyAPI.saveProject(data, s.projectPath, s.projectName);
+            if (!res.canceled && res.filePath) {
+              const name = res.filePath.split(/[\\/]/).pop()?.replace(/\.(celsketch|nexo|hrm)$/i, '') || s.projectName;
+              s.setProjectMeta(name, res.filePath);
+              saveProjectThumbnail(res.filePath);
+              try {
+                const raw = localStorage.getItem('celsketch_recent_projects');
+                const list: string[] = raw ? JSON.parse(raw) : [];
+                const updated = [res.filePath, ...list.filter((p) => p !== res.filePath)].slice(0, 12);
+                localStorage.setItem('celsketch_recent_projects', JSON.stringify(updated));
+              } catch {
+                // ignore storage errors
+              }
+            }
+          } catch (err) {
+            console.error('Save failed:', err);
           }
         }
         return;
       }
 
       if (e.key === 'ArrowRight') {
+        if (e.target instanceof HTMLInputElement && e.target.type === 'range') return;
         e.preventDefault();
-        nextFrame();
+        if (e.altKey) s.jumpToNextDrawing();
+        else s.nextFrame();
         return;
       }
       if (e.key === 'ArrowLeft') {
+        if (e.target instanceof HTMLInputElement && e.target.type === 'range') return;
         e.preventDefault();
-        prevFrame();
+        if (e.altKey) s.jumpToPrevDrawing();
+        else s.prevFrame();
         return;
       }
 
-      // Brush size shortcuts (ABNT2: '[' increases, '´' decreases)
-      if (e.key === '[' || e.code === 'BracketRight') {
+      // Brush / Eraser / Liquify size shortcuts — physical BracketRight increases, BracketLeft decreases (works on US & ABNT2!)
+      if (e.code === 'BracketRight') {
         e.preventDefault();
-        setBrushSize(brushSize + (brushSize >= 20 ? 4 : 2));
+        if (s.activeTool === 'eraser') s.setEraserSize(s.eraserSize + (s.eraserSize >= 20 ? 4 : 2));
+        else if (s.activeTool === 'liquify') s.setLiquifySize(s.liquifySize + 10);
+        else s.setBrushSize(s.brushSize + (s.brushSize >= 20 ? 4 : 2));
         return;
       }
-      if (e.key === '´' || e.code === 'BracketLeft') {
+      if (e.code === 'BracketLeft') {
         e.preventDefault();
-        setBrushSize(brushSize - (brushSize > 20 ? 4 : 2));
+        if (s.activeTool === 'eraser') s.setEraserSize(s.eraserSize - (s.eraserSize > 20 ? 4 : 2));
+        else if (s.activeTool === 'liquify') s.setLiquifySize(s.liquifySize - 10);
+        else s.setBrushSize(s.brushSize - (s.brushSize > 20 ? 4 : 2));
         return;
       }
 
-      switch (e.key.toLowerCase()) {
-        case 'v':
-        case 'k': setTool('select'); break;
-        case 'a': setTool('contour'); break;
-        case 'q': setTool(e.shiftKey ? 'polylasso' : 'lasso'); break;
-        case 'm': activateSelectionGroup(e.shiftKey); break;
-        case 'b': setTool('brush'); break;
-        case 'c': setCropMode(!cropMode); break;
-        case 'p': setTool('pencil'); break;
-        case 'e': setTool('eraser'); break;
-        case 'g': setTool(e.altKey ? 'polylassofill' : e.shiftKey ? 'lassofill' : 'paint'); break;
-        case 'l': setTool('line'); break;
-        case 'u': activateShapeGroup(e.shiftKey); break;
-        case 'o': setTool('ellipse'); break;
-        case 'i': setTool('eyedropper'); break;
-        case 'x': swapColors(); break;
-        case 'h': setTool('hand'); break;
-        case 'z': setTool('zoom'); break;
+      const lower = e.key.toLowerCase();
+      // Special Alt+G shortcut for Polygonal Lasso Fill; ignore other Alt+key combos so menu/Alt-picker never triggers tools!
+      if (e.altKey) {
+        if (lower === 'g') {
+          e.preventDefault();
+          s.setTool('polylassofill');
+        }
+        return;
+      }
+
+      switch (lower) {
+        case 'q': s.setTool(e.shiftKey ? 'polylasso' : 'lasso'); break;
+        case 'm': s.activateSelectionGroup(e.shiftKey); break;
+        case 'w': s.setTool('magicwand'); break;
+        case 'j': s.setTool('liquify'); break;
+        case 't': s.setTool('text'); break;
+        case 'b': s.setTool('brush'); break;
+        case 'c':
+          if (!e.repeat) s.setCropMode(!s.cropMode);
+          break;
+        case 'p': s.setTool('pencil'); break;
+        case 'e': s.setTool('eraser'); break;
+        case 'g': s.setTool(e.shiftKey ? 'lassofill' : 'paint'); break;
+        case 'l': s.setTool('line'); break;
+        case 'u': s.activateShapeGroup(e.shiftKey); break;
+        case 'o': s.setTool('ellipse'); break;
+        case 'i': s.setTool('eyedropper'); break;
+        case 'x':
+          if (!e.repeat) s.swapColors();
+          break;
+        case 'h': s.setTool('hand'); break;
+        case 'z': s.setTool('zoom'); break;
         case '5':
           e.preventDefault();
-          resetView();
+          s.resetView();
           break;
         case ' ':
-          if (e.shiftKey) {
+          if (e.shiftKey && !e.repeat) {
             e.preventDefault();
-            togglePlay();
+            s.togglePlay();
           }
           break;
         case 'f1':
-          e.preventDefault();
-          toggleFlipX();
+          if (!e.repeat) {
+            e.preventDefault();
+            s.toggleFlipX();
+          }
           break;
         case '.':
-          nextFrame();
+          s.nextFrame();
           break;
         case ',':
-          prevFrame();
+          s.prevFrame();
           break;
         case 'f5':
           e.preventDefault();
-          if (e.shiftKey) reduceExposureShiftF5();
-          else extendExposureF5();
+          if (e.shiftKey) s.reduceExposureShiftF5();
+          else s.extendExposureF5();
           break;
         case 'f6':
           e.preventDefault();
-          duplicateFrameToNext();
+          s.duplicateFrameToNext();
           break;
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [
-    setTool,
-    activateSelectionGroup,
-    activateShapeGroup,
-    setBrushSize,
-    brushSize,
-    undo,
-    redo,
-    togglePlay,
-    toggleFlipX,
-    toggleGrayscaleMode,
-    setHsvModalOpen,
-    setCropMode,
-    cropMode,
-    nextFrame,
-    prevFrame,
-    duplicateFrameToNext,
-    exportProjectData,
-    setProjectMeta,
-    projectName,
-    projectPath
-  ]);
+  }, []);
 
   const activeLayer = layers.find((l) => l.id === activeLayerId);
 
+  const recoveryBanner = recoveryOffer ? (
+    <div
+      style={{
+        position: 'fixed',
+        bottom: 28,
+        right: 18,
+        zIndex: 9999,
+        background: '#1e293b',
+        border: '1px solid #3b82f6',
+        borderRadius: 8,
+        padding: '10px 14px',
+        boxShadow: '0 10px 28px rgba(0,0,0,0.7)',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 8,
+        maxWidth: 340
+      }}
+    >
+      <div style={{ fontSize: 12, fontWeight: 700, color: '#e0f2fe' }}>
+        Backup de Auto-Save encontrado!
+      </div>
+      <div style={{ fontSize: 11, color: '#94a3b8' }}>
+        Encontramos uma cena salva automaticamente em {new Date(recoveryOffer.mtimeMs).toLocaleString('pt-BR')}. Deseja restaurar?
+      </div>
+      <div style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
+        <button
+          className="icon-btn"
+          onClick={() => {
+            window.harmonyAPI?.clearRecovery?.();
+            setRecoveryOffer(null);
+          }}
+          style={{ padding: '4px 10px', fontSize: 11 }}
+        >
+          Descartar
+        </button>
+        <button
+          className="icon-btn active"
+          onClick={() => {
+            try {
+              const parsed = JSON.parse(recoveryOffer.content);
+              useHarmonyStore.getState().loadProjectData(parsed, null);
+              useHarmonyStore.setState({ isDirty: true });
+              window.harmonyAPI?.clearRecovery?.();
+              setRecoveryOffer(null);
+            } catch (err) {
+              console.error('Failed to parse recovery:', err);
+              alert('Não foi possível restaurar o backup de recuperação (arquivo corrompido).');
+            }
+          }}
+          style={{ padding: '4px 12px', fontSize: 11, fontWeight: 600 }}
+        >
+          Restaurar Cena
+        </button>
+      </div>
+    </div>
+  ) : null;
+
   if (showWelcome) {
-    return <WelcomeScreen />;
+    return (
+      <>
+        <WelcomeScreen />
+        {recoveryBanner}
+        <UnsavedCloseModal open={closeConfirmOpen} onClose={() => setCloseConfirmOpen(false)} />
+      </>
+    );
   }
 
   return (
@@ -258,6 +518,7 @@ export const App: React.FC = () => {
           <div className="panel-tabs" style={{ overflowX: 'auto' }}>
             {openScenes.map((scene) => {
               const isActive = scene.id === activeSceneId;
+              const tabDirty = isActive ? isDirty : scene.isDirty;
               return (
                 <div
                   key={scene.id}
@@ -266,11 +527,17 @@ export const App: React.FC = () => {
                   style={{ gap: 8, paddingRight: 6 }}
                 >
                   <span>
-                    {scene.name}.celsketch{isActive && isDirty ? ' *' : ''}
+                    {scene.name}.celsketch{tabDirty ? ' *' : ''}
                   </span>
                   <button
                     onClick={(e) => {
                       e.stopPropagation();
+                      if (tabDirty) {
+                        const ok = window.confirm(
+                          `A cena "${scene.name}" tem alterações não salvas. Deseja fechar mesmo assim?`
+                        );
+                        if (!ok) return;
+                      }
                       closeSceneTab(scene.id);
                     }}
                     title="Fechar cena"
@@ -291,7 +558,7 @@ export const App: React.FC = () => {
             })}
             <button
               onClick={addBlankSceneTab}
-              title="Nova cena em nova aba"
+              title="Nova cena em nova aba (Ctrl+N)"
               style={{
                 background: 'transparent',
                 border: 'none',
@@ -300,7 +567,8 @@ export const App: React.FC = () => {
                 display: 'flex',
                 alignItems: 'center',
                 padding: '0 8px',
-                height: 23
+                height: 23,
+                flexShrink: 0
               }}
             >
               <Plus size={13} />
@@ -335,7 +603,13 @@ export const App: React.FC = () => {
         <TimelinePanel />
       </DockablePanel>
       <HsvModal />
+      <LevelsModal />
+      <BlurModal />
+      <PostProcessModal />
       <ExportModal />
+      <ReferenceWindow />
+      <UnsavedCloseModal open={closeConfirmOpen} onClose={() => setCloseConfirmOpen(false)} />
+      {recoveryBanner}
 
       <div className="status-bar">
         <span>
