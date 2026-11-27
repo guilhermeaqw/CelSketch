@@ -269,6 +269,18 @@ export const LauncherApp: React.FC = () => {
     }
 
     setDownloadedPath(res.filePath);
+
+    // Automatically apply the downloaded update & restart in 1 seamless click (no extra "Instalar" prompt!)
+    if (window.harmonyAPI?.installUpdate) {
+      setPhase('installing');
+      const installRes = await window.harmonyAPI.installUpdate(res.filePath, installMode);
+      if (!installRes.ok) {
+        setErrorMsg(installRes.error || 'Não foi possível aplicar a atualização.');
+        setPhase(installRes.needsSave ? 'ready' : 'error');
+      }
+      return;
+    }
+
     setPhase('ready');
   };
 

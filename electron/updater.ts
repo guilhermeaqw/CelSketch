@@ -184,6 +184,15 @@ function pickBestAsset(assets: GithubAsset[], installMode: InstallMode): GithubA
   if (!Array.isArray(assets) || assets.length === 0) return null;
 
   if (process.platform === 'win32') {
+    // Prefer ultra-fast 1.4MB hot app.asar update for installed/unpacked apps (ZERO setup wizard, ~1s update!)
+    if (installMode === 'installed' || installMode === 'unpacked') {
+      const localAsar = path.join(path.dirname(process.execPath), 'resources', 'app.asar');
+      if (fs.existsSync(localAsar)) {
+        const asarAsset = assets.find((a) => /\.asar$/i.test(a.name) && a.browser_download_url);
+        if (asarAsset) return asarAsset;
+      }
+    }
+
     const exeAssets = assets.filter((a) => /\.exe$/i.test(a.name) && a.browser_download_url);
     if (exeAssets.length === 0) return null;
     const setupAsset = exeAssets.find((a) => /setup/i.test(a.name));
@@ -519,6 +528,72 @@ export async function installDownloadedUpdate(
   const scriptPath = path.join(updatesDir, `apply_update_${Date.now()}.ps1`);
   const pid = process.pid;
 
+  // 1. Ultra-fast hot app.asar swap (1.4MB, ZERO setup wizard, ~1s relaunch — only asks UAC if in Program Files!)
+  if (/\.asar$/i.test(path.basename(downloadedFilePath))) {
+    const currentExe = process.execPath;
+    const resourcesDir = path.join(path.dirname(currentExe), 'resources');
+    const targetAsar = path.join(resourcesDir, 'app.asar');
+
+    const psScript = `
+$ErrorActionPreference = 'SilentlyContinue'
+$parentPid = ${pid}
+$exePath = '${escapePsSingleQuote(currentExe)}'
+$resourcesDir = '${escapePsSingleQuote(resourcesDir)}'
+$srcAsar = '${escapePsSingleQuote(downloadedFilePath)}'
+$dstAsar = '${escapePsSingleQuote(targetAsar)}'
+
+# Wait for main process + all sibling Electron child processes from this exe to exit
+for ($i = 0; $i -lt 50; $i++) {
+  $aliveMain = Get-Process -Id $parentPid -ErrorAction SilentlyContinue
+  $aliveSame = Get-Process -Name 'CelSketch' -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exePath }
+  if (-not $aliveMain -and -not $aliveSame) { break }
+  if ($i -eq 15) {
+    $aliveSame | Stop-Process -Force -ErrorAction SilentlyContinue
+  }
+  Start-Sleep -Milliseconds 150
+}
+Start-Sleep -Milliseconds 200
+
+# Check if resources folder is writable without UAC
+$needsAdmin = $false
+try {
+  $probe = Join-Path $resourcesDir ('.cs_write_test_' + [guid]::NewGuid().ToString('N'))
+  [System.IO.File]::WriteAllText($probe, 'ok')
+  Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+} catch {
+  $needsAdmin = $true
+}
+
+if ($needsAdmin) {
+  $copyCmd = "Copy-Item -LiteralPath '$srcAsar' -Destination '$dstAsar' -Force"
+  Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-WindowStyle','Hidden','-Command',$copyCmd) -Verb RunAs -Wait
+} else {
+  for ($i = 0; $i -lt 30; $i++) {
+    try {
+      Copy-Item -LiteralPath $srcAsar -Destination $dstAsar -Force -ErrorAction Stop
+      break
+    } catch {
+      Start-Sleep -Milliseconds 250
+    }
+  }
+}
+
+Remove-Item -LiteralPath $srcAsar -Force -ErrorAction SilentlyContinue
+if (Test-Path -LiteralPath $exePath) {
+  Start-Process -FilePath $exePath
+}
+Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue
+`;
+    await fsp.writeFile(scriptPath, psScript, 'utf-8');
+    const child = spawn(
+      'powershell.exe',
+      ['-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', scriptPath],
+      { detached: true, stdio: 'ignore', windowsHide: true }
+    );
+    child.unref();
+    return { ok: true };
+  }
+
   if (installMode === 'portable' && process.env.PORTABLE_EXECUTABLE_FILE) {
     const targetExe = process.env.PORTABLE_EXECUTABLE_FILE;
     const psScript = `
@@ -611,7 +686,7 @@ if ($needsAdmin) {
   $proc = Start-Process -FilePath $installer -ArgumentList $nsArgs -Verb RunAs -Wait -PassThru
 } else {
   $proc = Start-Process -FilePath $installer -ArgumentList $nsArgs -Wait -PassThru
-  if (-not $proc -or $proc.ExitCode -ne 0) {
+  if ($proc -and $null -ne $proc.ExitCode -and $proc.ExitCode -ne 0) {
     $proc = Start-Process -FilePath $installer -ArgumentList $nsArgs -Verb RunAs -Wait -PassThru
   }
 }
