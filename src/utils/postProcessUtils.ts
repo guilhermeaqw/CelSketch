@@ -1,4 +1,5 @@
 import { PostProcessSettings } from '../types/harmony';
+import { applyPostProcessWebGL } from './webglPostProcess';
 
 export const DEFAULT_POST_PROCESS: PostProcessSettings = {
   enabled: false,
@@ -162,6 +163,12 @@ export function applyPostProcessToCanvas(
   const w = canvas.width;
   const h = canvas.height;
   if (w <= 0 || h <= 0) return;
+
+  // GPU Fast-Path (WebGL2 multi-pass shaders: < 1ms at 1080p!). Seamlessly falls back to Canvas 2D if unavailable.
+  if (applyPostProcessWebGL(canvas, pp)) {
+    return;
+  }
+
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
   if (!ctx) return;
 

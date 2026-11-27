@@ -1,6 +1,6 @@
 {
   "name": "celsketch",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "CelSketch - Professional 2D Animation & Drawing Software",
   "main": "dist-electron/main.js",
   "author": "Guinogue",
@@ -10,6 +10,7 @@
     "build:renderer": "tsc -p tsconfig.json && vite build",
     "build:electron": "tsc -p tsconfig.electron.json",
     "build": "npm run build:renderer && npm run build:electron",
+    "test": "node scripts/run-tests.cjs",
     "dist:win": "npm run build && electron-builder --win",
     "dist:dir": "npm run build && electron-builder --win --dir"
   },

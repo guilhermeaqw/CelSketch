@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { Suspense, lazy, useEffect, useState } from 'react';
 import { Plus, X } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { TitleBar, saveProjectThumbnail } from './components/TitleBar';
@@ -7,71 +7,78 @@ import { CanvasStage } from './components/CanvasStage';
 import { RightPanel } from './components/RightPanel';
 import { TimelinePanel } from './components/TimelinePanel';
 import { DockablePanel } from './components/DockablePanel';
-import { WelcomeScreen } from './components/WelcomeScreen';
-import { HsvModal } from './components/HsvModal';
-import { LevelsModal } from './components/LevelsModal';
-import { BlurModal } from './components/BlurModal';
-import { PostProcessModal } from './components/PostProcessModal';
-import { SettingsModal } from './components/SettingsModal';
-import { ExportModal } from './components/ExportModal';
-import { ReferenceWindow } from './components/ReferenceWindow';
-import { UnsavedCloseModal } from './components/UnsavedCloseModal';
 import { useHarmonyStore } from './store/useHarmonyStore';
 import { matchesShortcutCombo } from './utils/shortcuts';
+import { isTextEditingTarget, decodeAudioBufferTrack } from './utils/appUtils';
 
-const TEXT_INPUT_TYPES = new Set(['text', 'search', 'number', 'email', 'password', 'url', 'tel']);
+export { isTextEditingTarget, decodeAudioBufferTrack };
 
-export function isTextEditingTarget(target: EventTarget | null): boolean {
-  if (!(target instanceof HTMLElement)) return false;
-  if (target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement) return true;
-  if (target.isContentEditable) return true;
-  if (target instanceof HTMLInputElement) {
-    return TEXT_INPUT_TYPES.has((target.type || 'text').toLowerCase());
-  }
-  return false;
-}
+// Lazy-load modals & overlays on demand so Editor startup is lean and instant!
+const WelcomeScreen = lazy(() =>
+  import('./components/WelcomeScreen').then((m) => ({ default: m.WelcomeScreen }))
+);
+const HsvModal = lazy(() =>
+  import('./components/HsvModal').then((m) => ({ default: m.HsvModal }))
+);
+const LevelsModal = lazy(() =>
+  import('./components/LevelsModal').then((m) => ({ default: m.LevelsModal }))
+);
+const BlurModal = lazy(() =>
+  import('./components/BlurModal').then((m) => ({ default: m.BlurModal }))
+);
+const PostProcessModal = lazy(() =>
+  import('./components/PostProcessModal').then((m) => ({ default: m.PostProcessModal }))
+);
+const SettingsModal = lazy(() =>
+  import('./components/SettingsModal').then((m) => ({ default: m.SettingsModal }))
+);
+const ExportModal = lazy(() =>
+  import('./components/ExportModal').then((m) => ({ default: m.ExportModal }))
+);
+const ReferenceWindow = lazy(() =>
+  import('./components/ReferenceWindow').then((m) => ({ default: m.ReferenceWindow }))
+);
+const UnsavedCloseModal = lazy(() =>
+  import('./components/UnsavedCloseModal').then((m) => ({ default: m.UnsavedCloseModal }))
+);
 
-export async function decodeAudioBufferTrack(
-  bytes: Uint8Array,
-  name: string,
-  filePath?: string
-): Promise<{ name: string; filePath?: string; objectUrl: string; peaks: number[]; duration: number } | null> {
-  const ext = (name.split('.').pop() || '').toLowerCase();
-  const mimeMap: Record<string, string> = {
-    mp3: 'audio/mpeg',
-    wav: 'audio/wav',
-    ogg: 'audio/ogg',
-    m4a: 'audio/mp4'
-  };
-  const copy = new Uint8Array(bytes);
-  const blob = new Blob([copy.buffer], { type: mimeMap[ext] || 'audio/mpeg' });
-  const objectUrl = URL.createObjectURL(blob);
-  const audioCtx = new AudioContext();
-  try {
-    const ab = copy.buffer.slice(0);
-    const decoded = await audioCtx.decodeAudioData(ab);
-    const raw = decoded.getChannelData(0);
-    const numBars = 220;
-    const blockSize = Math.max(1, Math.floor(raw.length / numBars));
-    const peaks: number[] = [];
-    for (let i = 0; i < numBars; i++) {
-      let max = 0;
-      const start = i * blockSize;
-      for (let j = 0; j < blockSize && start + j < raw.length; j += 8) {
-        const v = Math.abs(raw[start + j]);
-        if (v > max) max = v;
-      }
-      peaks.push(max);
-    }
-    return { name, filePath, objectUrl, peaks, duration: decoded.duration };
-  } catch (err) {
-    URL.revokeObjectURL(objectUrl);
-    console.error('Failed to decode audio:', err);
-    return null;
-  } finally {
-    await audioCtx.close().catch(() => {});
-  }
-}
+const LazyModalHost: React.FC<{ closeConfirmOpen: boolean; onCloseConfirm: () => void }> = ({
+  closeConfirmOpen,
+  onCloseConfirm
+}) => {
+  const {
+    hsvModalOpen,
+    levelsModalOpen,
+    blurModalOpen,
+    postProcessModalOpen,
+    settingsModalOpen,
+    exportModalOpen,
+    referenceWindowOpen
+  } = useHarmonyStore(
+    useShallow((s) => ({
+      hsvModalOpen: s.hsvModalOpen,
+      levelsModalOpen: s.levelsModalOpen,
+      blurModalOpen: s.blurModalOpen,
+      postProcessModalOpen: s.postProcessModalOpen,
+      settingsModalOpen: s.settingsModalOpen,
+      exportModalOpen: s.exportModalOpen,
+      referenceWindowOpen: s.referenceWindowOpen
+    }))
+  );
+
+  return (
+    <>
+      {hsvModalOpen && <HsvModal />}
+      {levelsModalOpen && <LevelsModal />}
+      {blurModalOpen && <BlurModal />}
+      {postProcessModalOpen && <PostProcessModal />}
+      {settingsModalOpen && <SettingsModal />}
+      {exportModalOpen && <ExportModal />}
+      {referenceWindowOpen && <ReferenceWindow />}
+      {closeConfirmOpen && <UnsavedCloseModal open={closeConfirmOpen} onClose={onCloseConfirm} />}
+    </>
+  );
+};
 
 const StatusBarFrame: React.FC = () => {
   const { fps, currentFrame } = useHarmonyStore(
@@ -536,11 +543,13 @@ export const App: React.FC = () => {
 
   if (showWelcome) {
     return (
-      <>
+      <Suspense fallback={<div style={{ width: '100vw', height: '100vh', background: '#171920' }} />}>
         <WelcomeScreen />
         {recoveryBanner}
-        <UnsavedCloseModal open={closeConfirmOpen} onClose={() => setCloseConfirmOpen(false)} />
-      </>
+        {closeConfirmOpen && (
+          <UnsavedCloseModal open={closeConfirmOpen} onClose={() => setCloseConfirmOpen(false)} />
+        )}
+      </Suspense>
     );
   }
 
@@ -649,14 +658,9 @@ export const App: React.FC = () => {
       >
         <TimelinePanel />
       </DockablePanel>
-      <HsvModal />
-      <LevelsModal />
-      <BlurModal />
-      <PostProcessModal />
-      <SettingsModal />
-      <ExportModal />
-      <ReferenceWindow />
-      <UnsavedCloseModal open={closeConfirmOpen} onClose={() => setCloseConfirmOpen(false)} />
+      <Suspense fallback={null}>
+        <LazyModalHost closeConfirmOpen={closeConfirmOpen} onCloseConfirm={() => setCloseConfirmOpen(false)} />
+      </Suspense>
       {recoveryBanner}
 
       <div className="status-bar">

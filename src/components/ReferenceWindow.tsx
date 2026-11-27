@@ -1,577 +1,20 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import {
-  ImagePlus,
-  Pipette,
-  Trash2,
-  X,
-  FlipHorizontal2,
-  Type,
-  ExternalLink,
-  Pin,
-  PinOff,
-  Group,
-  Ungroup,
-  LayoutGrid,
-  Maximize2,
-  Contrast,
-  Play,
-  Pause,
-  ChevronLeft,
-  ChevronRight,
-  Volume2,
-  VolumeX,
-  Minus,
-  Square
-} from 'lucide-react';
+import { ImagePlus } from 'lucide-react';
 import { useHarmonyStore } from '../store/useHarmonyStore';
-import { isTextEditingTarget } from '../App';
-import { decodeAnimatedGif, dataUrlToArrayBuffer, type DecodedGif } from '../utils/gifDecoder';
+import { isTextEditingTarget } from '../utils/appUtils';
+import {
+  GROUP_COLORS,
+  REF_BOARD_STORAGE_KEY,
+  getNoteStyle,
+  type PersistedBoardState,
+  type RefGroup,
+  type RefItem
+} from './reference/types';
+import { RefGifCard } from './reference/RefGifCard';
+import { RefVideoCard } from './reference/RefVideoCard';
+import { RefToolbar } from './reference/RefToolbar';
+import { RefGroupFrame } from './reference/RefGroupFrame';
 
-const REF_BOARD_STORAGE_KEY = 'celsketch_ref_board_v2';
-
-type RefItemKind = 'image' | 'gif' | 'video' | 'text';
-
-interface RefGroup {
-  id: string;
-  name: string;
-  color: string;
-}
-
-interface RefItem {
-  id: string;
-  kind: RefItemKind;
-  src?: string; // data URL or blob URL
-  name?: string;
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-  flipX?: boolean;
-  groupId?: string | null;
-  // Text sticky note fields
-  text?: string;
-  noteColor?: string;
-  fontSize?: number;
-}
-
-interface PersistedBoardState {
-  items: RefItem[];
-  groups: RefGroup[];
-  grayscale?: boolean;
-}
-
-const NOTE_PALETTE = [
-  { id: 'slate', bg: '#252933', border: '#3e4556', text: '#eef2f7', label: 'Neutro' },
-  { id: 'blue', bg: '#1c2b45', border: '#3a86ff', text: '#e0f2fe', label: 'Azul' },
-  { id: 'amber', bg: '#3b3018', border: '#d97706', text: '#fef3c7', label: 'Amarelo' },
-  { id: 'green', bg: '#183428', border: '#10b981', text: '#d1fae5', label: 'Verde' },
-  { id: 'rose', bg: '#3b1d2a', border: '#ec4899', text: '#fce7f3', label: 'Rosa' }
-];
-
-const GROUP_COLORS = ['#3a86ff', '#10b981', '#f59e0b', '#a855f7', '#06b6d4', '#ec4899'];
-
-function getNoteStyle(noteColor?: string) {
-  return NOTE_PALETTE.find((p) => p.id === noteColor) || NOTE_PALETTE[0];
-}
-
-// =========================================================================
-// Animated GIF Frame-by-Frame Analyzer Card
-// =========================================================================
-interface GifCardProps {
-  item: RefItem;
-  isSelected: boolean;
-  dropperMode: boolean;
-  onSampleColor: (hex: string) => void;
-  stepSignal: { id: string; delta: number; seq: number } | null;
-  togglePlaySignal: { id: string; seq: number } | null;
-}
-
-const RefGifCard: React.FC<GifCardProps> = ({
-  item,
-  isSelected,
-  dropperMode,
-  onSampleColor,
-  stepSignal,
-  togglePlaySignal
-}) => {
-  const [decoded, setDecoded] = useState<DecodedGif | null>(null);
-  const [frameIdx, setFrameIdx] = useState(0);
-  const [playing, setPlaying] = useState(true);
-  const [speed, setSpeed] = useState<number>(1);
-  const [hovered, setHovered] = useState(false);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    if (!item.src) return;
-    (async () => {
-      try {
-        const buf = await dataUrlToArrayBuffer(item.src!);
-        const res = await decodeAnimatedGif(buf);
-        if (!cancelled) {
-          setDecoded(res);
-          setFrameIdx(0);
-        }
-      } catch {
-        if (!cancelled) setDecoded(null);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [item.src]);
-
-  // Playback timer respecting each GIF frame's native duration & chosen speed
-  useEffect(() => {
-    if (!decoded || decoded.frames.length <= 1 || !playing) return;
-    const dur = Math.max(16, Math.round((decoded.durationsMs[frameIdx] || 80) / speed));
-    const t = window.setTimeout(() => {
-      setFrameIdx((prev) => (prev + 1) % decoded.frames.length);
-    }, dur);
-    return () => window.clearTimeout(t);
-  }, [decoded, frameIdx, playing, speed]);
-
-  // Paint active GIF frame to card canvas
-  useEffect(() => {
-    if (!decoded || !canvasRef.current) return;
-    const frameCanvas = decoded.frames[frameIdx];
-    if (!frameCanvas) return;
-    const dst = canvasRef.current;
-    if (dst.width !== frameCanvas.width || dst.height !== frameCanvas.height) {
-      dst.width = frameCanvas.width;
-      dst.height = frameCanvas.height;
-    }
-    const ctx = dst.getContext('2d');
-    if (!ctx) return;
-    ctx.clearRect(0, 0, dst.width, dst.height);
-    ctx.drawImage(frameCanvas, 0, 0);
-  }, [decoded, frameIdx]);
-
-  // Respond to external keyboard step (, / .) & play/pause (Space)
-  useEffect(() => {
-    if (!stepSignal || stepSignal.id !== item.id || !decoded) return;
-    setPlaying(false);
-    setFrameIdx((prev) => (prev + stepSignal.delta + decoded.frames.length) % decoded.frames.length);
-  }, [stepSignal, item.id, decoded]);
-
-  useEffect(() => {
-    if (!togglePlaySignal || togglePlaySignal.id !== item.id || !decoded) return;
-    setPlaying((p) => !p);
-  }, [togglePlaySignal, item.id, decoded]);
-
-  const sampleCanvasPixel = (e: React.PointerEvent) => {
-    const c = canvasRef.current;
-    if (!c || !c.width || !c.height) return;
-    const rect = c.getBoundingClientRect();
-    const u = (e.clientX - rect.left) / Math.max(1, rect.width);
-    const v = (e.clientY - rect.top) / Math.max(1, rect.height);
-    if (u < 0 || u > 1 || v < 0 || v > 1) return;
-    const px = Math.max(0, Math.min(c.width - 1, Math.floor((item.flipX ? 1 - u : u) * c.width)));
-    const py = Math.max(0, Math.min(c.height - 1, Math.floor(v * c.height)));
-    const ctx = c.getContext('2d');
-    if (!ctx) return;
-    const d = ctx.getImageData(px, py, 1, 1).data;
-    if (d[3] < 10) return;
-    const toHex = (n: number) => n.toString(16).padStart(2, '0');
-    onSampleColor(`#${toHex(d[0])}${toHex(d[1])}${toHex(d[2])}`);
-  };
-
-  if (!decoded) {
-    return (
-      <img
-        src={item.src}
-        draggable={false}
-        style={{
-          width: '100%',
-          height: '100%',
-          display: 'block',
-          objectFit: 'contain',
-          transform: item.flipX ? 'scaleX(-1)' : 'none',
-          pointerEvents: 'none'
-        }}
-      />
-    );
-  }
-
-  const total = decoded.frames.length;
-  const showControls = (hovered || isSelected) && !dropperMode;
-
-  return (
-    <div
-      style={{ position: 'relative', width: '100%', height: '100%' }}
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
-      onPointerDown={(e) => {
-        if (dropperMode || e.altKey) {
-          e.stopPropagation();
-          sampleCanvasPixel(e);
-        }
-      }}
-    >
-      <canvas
-        ref={canvasRef}
-        style={{
-          width: '100%',
-          height: '100%',
-          display: 'block',
-          objectFit: 'contain',
-          transform: item.flipX ? 'scaleX(-1)' : 'none',
-          pointerEvents: 'none'
-        }}
-      />
-
-      {/* Tiny GIF Badge */}
-      <div
-        style={{
-          position: 'absolute',
-          top: 5,
-          left: 5,
-          background: 'rgba(16,18,24,0.78)',
-          border: '1px solid rgba(255,255,255,0.14)',
-          borderRadius: 4,
-          padding: '1px 5px',
-          fontSize: 9.5,
-          fontWeight: 700,
-          color: '#93c5fd',
-          pointerEvents: 'none'
-        }}
-      >
-        GIF • Q{frameIdx + 1}/{total}
-      </div>
-
-      {/* Frame-by-Frame Animator Transport Bar */}
-      {showControls && (
-        <div
-          onPointerDown={(e) => e.stopPropagation()}
-          style={{
-            position: 'absolute',
-            left: 4,
-            right: 4,
-            bottom: 4,
-            background: 'rgba(16, 18, 24, 0.9)',
-            border: '1px solid rgba(255,255,255,0.14)',
-            borderRadius: 6,
-            padding: '4px 6px',
-            display: 'flex',
-            flexDirection: 'column',
-            gap: 3,
-            backdropFilter: 'blur(4px)'
-          }}
-        >
-          <input
-            type="range"
-            min={0}
-            max={Math.max(0, total - 1)}
-            value={frameIdx}
-            onChange={(e) => {
-              setPlaying(false);
-              setFrameIdx(Number(e.target.value));
-            }}
-            style={{ width: '100%', height: 10, accentColor: '#3a86ff', cursor: 'pointer', margin: 0 }}
-          />
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 4 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
-              <button
-                className="icon-btn"
-                onClick={() => setPlaying((p) => !p)}
-                title={playing ? 'Pausar (Espaço)' : 'Reproduzir (Espaço)'}
-                style={{ height: 20, minWidth: 20, padding: '0 4px' }}
-              >
-                {playing ? <Pause size={11} /> : <Play size={11} />}
-              </button>
-              <button
-                className="icon-btn"
-                onClick={() => {
-                  setPlaying(false);
-                  setFrameIdx((prev) => (prev - 1 + total) % total);
-                }}
-                title="Quadro anterior (,)"
-                style={{ height: 20, minWidth: 20, padding: '0 3px' }}
-              >
-                <ChevronLeft size={12} />
-              </button>
-              <button
-                className="icon-btn"
-                onClick={() => {
-                  setPlaying(false);
-                  setFrameIdx((prev) => (prev + 1) % total);
-                }}
-                title="Próximo quadro (.)"
-                style={{ height: 20, minWidth: 20, padding: '0 3px' }}
-              >
-                <ChevronRight size={12} />
-              </button>
-            </div>
-            <span style={{ fontSize: 10, fontFamily: 'monospace', color: '#cbd5e1' }}>
-              {frameIdx + 1}/{total}
-            </span>
-            <button
-              className="icon-btn"
-              onClick={() => setSpeed((s) => (s === 1 ? 0.5 : s === 0.5 ? 0.25 : 1))}
-              title="Velocidade de reprodução"
-              style={{ height: 19, padding: '0 5px', fontSize: 9.5, fontFamily: 'monospace' }}
-            >
-              {speed}×
-            </button>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-};
-
-// =========================================================================
-// MP4 / WebM Video Frame-by-Frame Analyzer Card
-// =========================================================================
-interface VideoCardProps {
-  item: RefItem;
-  isSelected: boolean;
-  dropperMode: boolean;
-  onSampleColor: (hex: string) => void;
-  stepSignal: { id: string; delta: number; seq: number } | null;
-  togglePlaySignal: { id: string; seq: number } | null;
-}
-
-const RefVideoCard: React.FC<VideoCardProps> = ({
-  item,
-  isSelected,
-  dropperMode,
-  onSampleColor,
-  stepSignal,
-  togglePlaySignal
-}) => {
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const [playing, setPlaying] = useState(false);
-  const [muted, setMuted] = useState(true);
-  const [speed, setSpeed] = useState<number>(1);
-  const [curTime, setCurTime] = useState(0);
-  const [duration, setDuration] = useState(0);
-  const [hovered, setHovered] = useState(false);
-
-  const stepFps = 24;
-  const currentFrameNum = Math.max(1, Math.round(curTime * stepFps) + 1);
-  const totalFrameNum = Math.max(1, Math.round(duration * stepFps));
-
-  const togglePlay = useCallback(() => {
-    const v = videoRef.current;
-    if (!v) return;
-    if (v.paused) {
-      v.play().catch(() => {});
-      setPlaying(true);
-    } else {
-      v.pause();
-      setPlaying(false);
-    }
-  }, []);
-
-  const stepByFrames = useCallback((deltaFrames: number) => {
-    const v = videoRef.current;
-    if (!v || !Number.isFinite(v.duration) || v.duration <= 0) return;
-    v.pause();
-    setPlaying(false);
-    const next = Math.max(0, Math.min(v.duration, v.currentTime + deltaFrames / stepFps));
-    v.currentTime = next;
-    setCurTime(next);
-  }, []);
-
-  useEffect(() => {
-    if (videoRef.current) {
-      videoRef.current.playbackRate = speed;
-    }
-  }, [speed]);
-
-  useEffect(() => {
-    if (!stepSignal || stepSignal.id !== item.id) return;
-    stepByFrames(stepSignal.delta);
-  }, [stepSignal, item.id, stepByFrames]);
-
-  useEffect(() => {
-    if (!togglePlaySignal || togglePlaySignal.id !== item.id) return;
-    togglePlay();
-  }, [togglePlaySignal, item.id, togglePlay]);
-
-  const sampleVideoPixel = (e: React.PointerEvent) => {
-    const v = videoRef.current;
-    if (!v || !v.videoWidth || !v.videoHeight) return;
-    const rect = v.getBoundingClientRect();
-    const natAspect = v.videoWidth / v.videoHeight;
-    const boxAspect = rect.width / Math.max(1, rect.height);
-    let drawW = rect.width;
-    let drawH = rect.height;
-    let drawLeft = rect.left;
-    let drawTop = rect.top;
-    if (natAspect > boxAspect) {
-      drawH = rect.width / natAspect;
-      drawTop = rect.top + (rect.height - drawH) / 2;
-    } else {
-      drawW = rect.height * natAspect;
-      drawLeft = rect.left + (rect.width - drawW) / 2;
-    }
-    const u = (e.clientX - drawLeft) / Math.max(1, drawW);
-    const vCoord = (e.clientY - drawTop) / Math.max(1, drawH);
-    if (u < 0 || u > 1 || vCoord < 0 || vCoord > 1) return;
-    const px = Math.max(0, Math.min(v.videoWidth - 1, Math.floor((item.flipX ? 1 - u : u) * v.videoWidth)));
-    const py = Math.max(0, Math.min(v.videoHeight - 1, Math.floor(vCoord * v.videoHeight)));
-    const off = document.createElement('canvas');
-    off.width = 1;
-    off.height = 1;
-    const ctx = off.getContext('2d');
-    if (!ctx) return;
-    ctx.drawImage(v, px, py, 1, 1, 0, 0, 1, 1);
-    const d = ctx.getImageData(0, 0, 1, 1).data;
-    const toHex = (n: number) => n.toString(16).padStart(2, '0');
-    onSampleColor(`#${toHex(d[0])}${toHex(d[1])}${toHex(d[2])}`);
-  };
-
-  const showControls = (hovered || isSelected) && !dropperMode;
-
-  return (
-    <div
-      style={{ position: 'relative', width: '100%', height: '100%', background: '#0e1015' }}
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
-      onPointerDown={(e) => {
-        if (dropperMode || e.altKey) {
-          e.stopPropagation();
-          sampleVideoPixel(e);
-        }
-      }}
-    >
-      <video
-        ref={videoRef}
-        src={item.src}
-        muted={muted}
-        loop
-        playsInline
-        preload="auto"
-        onLoadedMetadata={(e) => {
-          const v = e.currentTarget;
-          setDuration(v.duration || 0);
-        }}
-        onTimeUpdate={(e) => setCurTime(e.currentTarget.currentTime)}
-        onPlay={() => setPlaying(true)}
-        onPause={() => setPlaying(false)}
-        style={{
-          width: '100%',
-          height: '100%',
-          display: 'block',
-          objectFit: 'contain',
-          transform: item.flipX ? 'scaleX(-1)' : 'none',
-          pointerEvents: 'none'
-        }}
-      />
-
-      {/* Video Frame Badge */}
-      <div
-        style={{
-          position: 'absolute',
-          top: 5,
-          left: 5,
-          background: 'rgba(16,18,24,0.78)',
-          border: '1px solid rgba(255,255,255,0.14)',
-          borderRadius: 4,
-          padding: '1px 5px',
-          fontSize: 9.5,
-          fontWeight: 700,
-          color: '#6ee7b7',
-          pointerEvents: 'none'
-        }}
-      >
-        MP4 • Q{currentFrameNum}/{totalFrameNum}
-      </div>
-
-      {/* Frame-by-Frame Animator Transport Bar */}
-      {showControls && (
-        <div
-          onPointerDown={(e) => e.stopPropagation()}
-          style={{
-            position: 'absolute',
-            left: 4,
-            right: 4,
-            bottom: 4,
-            background: 'rgba(16, 18, 24, 0.92)',
-            border: '1px solid rgba(255,255,255,0.14)',
-            borderRadius: 6,
-            padding: '4px 6px',
-            display: 'flex',
-            flexDirection: 'column',
-            gap: 3,
-            backdropFilter: 'blur(4px)'
-          }}
-        >
-          <input
-            type="range"
-            min={0}
-            max={Math.max(0.01, duration)}
-            step={1 / stepFps}
-            value={Math.min(curTime, duration || 0)}
-            onChange={(e) => {
-              const t = Number(e.target.value);
-              if (videoRef.current) {
-                videoRef.current.pause();
-                videoRef.current.currentTime = t;
-              }
-              setPlaying(false);
-              setCurTime(t);
-            }}
-            style={{ width: '100%', height: 10, accentColor: '#3a86ff', cursor: 'pointer', margin: 0 }}
-          />
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 3 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
-              <button
-                className="icon-btn"
-                onClick={togglePlay}
-                title={playing ? 'Pausar (Espaço)' : 'Reproduzir (Espaço)'}
-                style={{ height: 20, minWidth: 20, padding: '0 4px' }}
-              >
-                {playing ? <Pause size={11} /> : <Play size={11} />}
-              </button>
-              <button
-                className="icon-btn"
-                onClick={() => stepByFrames(-1)}
-                title="Voltar 1 frame (,)"
-                style={{ height: 20, minWidth: 20, padding: '0 3px' }}
-              >
-                <ChevronLeft size={12} />
-              </button>
-              <button
-                className="icon-btn"
-                onClick={() => stepByFrames(1)}
-                title="Avançar 1 frame (.)"
-                style={{ height: 20, minWidth: 20, padding: '0 3px' }}
-              >
-                <ChevronRight size={12} />
-              </button>
-              <button
-                className="icon-btn"
-                onClick={() => setMuted((m) => !m)}
-                title={muted ? 'Ativar áudio' : 'Silenciar áudio'}
-                style={{ height: 20, minWidth: 20, padding: '0 3px' }}
-              >
-                {muted ? <VolumeX size={11} /> : <Volume2 size={11} />}
-              </button>
-            </div>
-            <span style={{ fontSize: 9.5, fontFamily: 'monospace', color: '#cbd5e1' }}>
-              {curTime.toFixed(2)}s
-            </span>
-            <button
-              className="icon-btn"
-              onClick={() => setSpeed((s) => (s === 1 ? 0.5 : s === 0.5 ? 0.25 : 1))}
-              title="Velocidade de reprodução"
-              style={{ height: 19, padding: '0 5px', fontSize: 9.5, fontFamily: 'monospace' }}
-            >
-              {speed}×
-            </button>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-};
-
-// =========================================================================
-// Main PureRef-Style Reference Window (Docked OR Standalone Multi-Monitor!)
-// =========================================================================
 export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone = false }) => {
   const referenceWindowOpen = useHarmonyStore((s) => s.referenceWindowOpen);
   const toggleReferenceWindow = useHarmonyStore((s) => s.toggleReferenceWindow);
@@ -647,19 +90,14 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
     [standalone, setActiveColor, pushRecentColor]
   );
 
-  // Hydrate board state from Electron shared IPC or localStorage
   const hydrateBoard = useCallback(async () => {
     try {
       let raw = await window.harmonyAPI?.refGetBoardState?.();
-      if (!raw) {
-        raw = localStorage.getItem(REF_BOARD_STORAGE_KEY);
-      }
+      if (!raw) raw = localStorage.getItem(REF_BOARD_STORAGE_KEY);
       if (raw) {
         const parsed: PersistedBoardState = JSON.parse(raw);
         if (Array.isArray(parsed.items)) {
-          // Drop expired blob: URLs across different window contexts
-          const validItems = parsed.items.filter((it) => !it.src || !it.src.startsWith('blob:'));
-          setItems(validItems);
+          setItems(parsed.items.filter((it) => !it.src || !it.src.startsWith('blob:')));
         }
         if (Array.isArray(parsed.groups)) setGroups(parsed.groups);
         if (typeof parsed.grayscale === 'boolean') setGrayscaleBoard(parsed.grayscale);
@@ -672,12 +110,9 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
   }, []);
 
   useEffect(() => {
-    if (isVisible && !hydratedRef.current) {
-      hydrateBoard();
-    }
+    if (isVisible && !hydratedRef.current) hydrateBoard();
   }, [isVisible, hydrateBoard]);
 
-  // If standalone pop-out closes, refresh docked board state next time user opens it
   useEffect(() => {
     if (standalone) return;
     const unsub = window.harmonyAPI?.onRefPopoutClosed?.(() => {
@@ -688,29 +123,23 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
     };
   }, [standalone]);
 
-  // Persist board changes cleanly (debounced) to Electron IPC memory + localStorage (when within quota)
   useEffect(() => {
     if (!hydratedRef.current) return;
     const t = window.setTimeout(() => {
-      const payload: PersistedBoardState = {
-        items,
-        groups,
-        grayscale: grayscaleBoard
-      };
+      const payload: PersistedBoardState = { items, groups, grayscale: grayscaleBoard };
       const json = JSON.stringify(payload);
       window.harmonyAPI?.refSetBoardState?.(json).catch(() => {});
       if (json.length < 3_800_000) {
         try {
           localStorage.setItem(REF_BOARD_STORAGE_KEY, json);
         } catch {
-          // ignore localStorage quota overflow for large media
+          // ignore localStorage quota overflow
         }
       }
     }, 350);
     return () => window.clearTimeout(t);
   }, [items, groups, grayscaleBoard]);
 
-  // Blur docked ReferenceWindow when clicking outside so shortcuts don't stay trapped
   useEffect(() => {
     if (standalone || !isVisible || !isDomFocused) return;
     const onOutsidePointerDown = (e: PointerEvent) => {
@@ -736,7 +165,6 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
     };
   }, []);
 
-  // Native non-passive wheel zoom toward mouse cursor
   useEffect(() => {
     const board = boardRef.current;
     if (!board || !isVisible) return;
@@ -751,16 +179,12 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
       const ratio = nextZ / prevZ;
       boardZoomRef.current = nextZ;
       setBoardZoom(nextZ);
-      setBoardPan((p) => ({
-        x: mx - (mx - p.x) * ratio,
-        y: my - (my - p.y) * ratio
-      }));
+      setBoardPan((p) => ({ x: mx - (mx - p.x) * ratio, y: my - (my - p.y) * ratio }));
     };
     board.addEventListener('wheel', onWheel, { passive: false });
     return () => board.removeEventListener('wheel', onWheel);
   }, [isVisible]);
 
-  // Helper to get board center coordinates for newly created items
   const getSpawnPos = useCallback((offsetIdx = 0) => {
     const rect = boardRef.current?.getBoundingClientRect();
     const z = boardZoomRef.current || 1;
@@ -827,9 +251,7 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
           return [...prev, item];
         });
       };
-      v.onerror = () => {
-        showToast('Formato de vídeo não suportado');
-      };
+      v.onerror = () => showToast('Formato de vídeo não suportado');
       v.src = src;
     },
     [getSpawnPos, showToast]
@@ -872,7 +294,6 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
         const isImage = file.type.startsWith('image/');
 
         if (isVideo) {
-          // Small videos (<= 14 MB) encoded as data URL so they survive popping out to another monitor!
           if (file.size <= 14 * 1024 * 1024) {
             const reader = new FileReader();
             reader.onload = () => {
@@ -880,8 +301,7 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
             };
             reader.readAsDataURL(file);
           } else {
-            const url = URL.createObjectURL(file);
-            addVideoSrc(url, file.name);
+            addVideoSrc(URL.createObjectURL(file), file.name);
           }
         } else if (isGif) {
           const reader = new FileReader();
@@ -901,7 +321,6 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
     [addMediaDataUrl, addVideoSrc]
   );
 
-  // Group / Ungroup (PureRef Ctrl+G / Ctrl+Shift+G)
   const groupSelected = useCallback(() => {
     const sel = selectedIdsRef.current;
     if (sel.length === 0) return;
@@ -926,7 +345,6 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
     showToast('Itens desagrupados');
   }, [showToast]);
 
-  // Copy / Paste internal board items (Ctrl+C / Ctrl+V)
   const copySelectedItems = useCallback(() => {
     const selSet = new Set(selectedIdsRef.current);
     const chosen = itemsRef.current.filter((it) => selSet.has(it.id));
@@ -956,7 +374,6 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
       y: Math.round(it.y + 26),
       groupId: it.groupId ? groupIdMap.get(it.groupId) || null : null
     }));
-    // Advance clipboard offset so multiple Ctrl+V cascade nicely
     internalClipboardRef.current = {
       items: clonedItems.map((it) => ({ ...it })),
       groups: clonedGroups.map((g) => ({ ...g }))
@@ -968,7 +385,6 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
     return true;
   }, [showToast]);
 
-  // Fit All items cleanly into view (F)
   const fitAllItems = useCallback(() => {
     const cur = itemsRef.current;
     const board = boardRef.current;
@@ -992,14 +408,14 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
     const bw = Math.max(1, maxX - minX);
     const bh = Math.max(1, maxY - minY);
     const nextZ = Math.max(0.18, Math.min(2.5, Math.min((rect.width - pad * 2) / bw, (rect.height - pad * 2) / bh)));
-    const nextPanX = (rect.width - bw * nextZ) / 2 - minX * nextZ;
-    const nextPanY = (rect.height - bh * nextZ) / 2 - minY * nextZ;
     boardZoomRef.current = nextZ;
     setBoardZoom(nextZ);
-    setBoardPan({ x: nextPanX, y: nextPanY });
+    setBoardPan({
+      x: (rect.width - bw * nextZ) / 2 - minX * nextZ,
+      y: (rect.height - bh * nextZ) / 2 - minY * nextZ
+    });
   }, []);
 
-  // Auto-Pack items neatly in a PureRef-style grid
   const autoPackGrid = useCallback(() => {
     const cur = itemsRef.current;
     if (cur.length === 0) return;
@@ -1034,13 +450,11 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
     showToast('Referências organizadas em grade');
   }, [showToast]);
 
-  // OS Clipboard Paste (images / GIFs / videos / text sticky note) + internal Ctrl+V fallback
   useEffect(() => {
     if (!isVisible) return;
     const onPaste = (e: ClipboardEvent) => {
       if (isTextEditingTarget(e.target)) return;
       if (!standalone && !isFocused && itemsRef.current.length > 0) return;
-
       const cbItems = e.clipboardData?.items;
       const mediaFiles: File[] = [];
       if (cbItems) {
@@ -1057,14 +471,12 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
         readFiles(mediaFiles);
         return;
       }
-
       if (isFocused && internalClipboardRef.current && internalClipboardRef.current.items.length > 0) {
         e.preventDefault();
         e.stopPropagation();
         pasteInternalItems();
         return;
       }
-
       const plainText = e.clipboardData?.getData('text/plain')?.trim();
       if (plainText && (standalone || isDomFocused)) {
         e.preventDefault();
@@ -1076,7 +488,6 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
     return () => window.removeEventListener('paste', onPaste, { capture: true });
   }, [isVisible, standalone, isFocused, isDomFocused, readFiles, pasteInternalItems, addTextNote]);
 
-  // Keyboard shortcuts inside Reference Window (Ctrl+C, Ctrl+V, Ctrl+G, Ctrl+Shift+G, Ctrl+A, Delete, H, F, Space, , / .)
   useEffect(() => {
     if (!isVisible || (!standalone && !isDomFocused)) return;
     const onKeyDown = (e: KeyboardEvent) => {
@@ -1084,12 +495,10 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
       const ctrl = e.ctrlKey || e.metaKey;
       const key = e.key.toLowerCase();
 
-      if (ctrl && key === 'c') {
-        if (selectedIdsRef.current.length > 0) {
-          e.preventDefault();
-          e.stopPropagation();
-          copySelectedItems();
-        }
+      if (ctrl && key === 'c' && selectedIdsRef.current.length > 0) {
+        e.preventDefault();
+        e.stopPropagation();
+        copySelectedItems();
         return;
       }
       if (ctrl && key === 'g') {
@@ -1105,17 +514,15 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
         setSelectedIds(itemsRef.current.map((it) => it.id));
         return;
       }
-      if (e.key === 'Delete' || e.key === 'Backspace') {
-        if (selectedIdsRef.current.length > 0) {
-          e.preventDefault();
-          e.stopPropagation();
-          const delSet = new Set(selectedIdsRef.current);
-          const nextItems = itemsRef.current.filter((it) => !delSet.has(it.id));
-          const remainingGroupIds = new Set(nextItems.map((it) => it.groupId).filter(Boolean));
-          setItems(nextItems);
-          setGroups((prev) => prev.filter((g) => remainingGroupIds.has(g.id)));
-          setSelectedIds([]);
-        }
+      if ((e.key === 'Delete' || e.key === 'Backspace') && selectedIdsRef.current.length > 0) {
+        e.preventDefault();
+        e.stopPropagation();
+        const delSet = new Set(selectedIdsRef.current);
+        const nextItems = itemsRef.current.filter((it) => !delSet.has(it.id));
+        const remGroups = new Set(nextItems.map((it) => it.groupId).filter(Boolean));
+        setItems(nextItems);
+        setGroups((prev) => prev.filter((g) => remGroups.has(g.id)));
+        setSelectedIds([]);
         return;
       }
       if (!ctrl && key === 'h' && selectedIdsRef.current.length > 0) {
@@ -1136,11 +543,8 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
         if (active && (active.kind === 'gif' || active.kind === 'video')) {
           e.preventDefault();
           e.stopPropagation();
-          if (e.key === ' ') {
-            setTogglePlaySignal({ id: active.id, seq: Date.now() });
-          } else {
-            setStepSignal({ id: active.id, delta: e.key === ',' ? -1 : 1, seq: Date.now() });
-          }
+          if (e.key === ' ') setTogglePlaySignal({ id: active.id, seq: Date.now() });
+          else setStepSignal({ id: active.id, delta: e.key === ',' ? -1 : 1, seq: Date.now() });
         }
       }
     };
@@ -1148,16 +552,15 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
     return () => window.removeEventListener('keydown', onKeyDown, { capture: true });
   }, [isVisible, standalone, isDomFocused, copySelectedItems, groupSelected, ungroupSelected, fitAllItems]);
 
-  // Sample pixel color from standard image
   const sampleFromRefImage = (item: RefItem, imgEl: HTMLImageElement, clientX: number, clientY: number) => {
     if (!imgEl.naturalWidth || !imgEl.naturalHeight) return;
     const rect = imgEl.getBoundingClientRect();
     const natAspect = imgEl.naturalWidth / imgEl.naturalHeight;
     const boxAspect = rect.width / Math.max(1, rect.height);
-    let drawW = rect.width;
-    let drawH = rect.height;
-    let drawLeft = rect.left;
-    let drawTop = rect.top;
+    let drawW = rect.width,
+      drawH = rect.height,
+      drawLeft = rect.left,
+      drawTop = rect.top;
     if (natAspect > boxAspect) {
       drawH = rect.width / natAspect;
       drawTop = rect.top + (rect.height - drawH) / 2;
@@ -1182,14 +585,8 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
     emitPickedColor(`#${toHex(d[0])}${toHex(d[1])}${toHex(d[2])}`);
   };
 
-  // Pop out docked window into native multi-monitor OS window
   const handlePopOutToMonitor = async () => {
-    const payload: PersistedBoardState = {
-      items,
-      groups,
-      grayscale: grayscaleBoard
-    };
-    const json = JSON.stringify(payload);
+    const json = JSON.stringify({ items, groups, grayscale: grayscaleBoard } satisfies PersistedBoardState);
     await window.harmonyAPI?.refSetBoardState?.(json);
     try {
       if (json.length < 3_800_000) localStorage.setItem(REF_BOARD_STORAGE_KEY, json);
@@ -1197,17 +594,14 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
       // ignore
     }
     await window.harmonyAPI?.refOpenPopout?.();
-    if (!standalone && referenceWindowOpen) {
-      toggleReferenceWindow();
-    }
+    if (!standalone && referenceWindowOpen) toggleReferenceWindow();
   };
 
-  // Drag docked overlay window (pulling pointer outside CelSketch edge automatically pops out to a free multi-monitor window!)
   const startWindowDrag = (e: React.PointerEvent) => {
     if (standalone || e.button !== 0) return;
     e.preventDefault();
-    const startX = e.clientX;
-    const startY = e.clientY;
+    const startX = e.clientX,
+      startY = e.clientY;
     const orig = { ...winPos };
     let poppedOut = false;
     const onMove = (ev: PointerEvent) => {
@@ -1242,13 +636,12 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
     window.addEventListener('pointercancel', onUp);
   };
 
-  // Resize docked overlay window
   const startWindowResize = (e: React.PointerEvent) => {
     if (standalone || e.button !== 0) return;
     e.stopPropagation();
     e.preventDefault();
-    const startX = e.clientX;
-    const startY = e.clientY;
+    const startX = e.clientX,
+      startY = e.clientY;
     const orig = { ...winSize };
     const onMove = (ev: PointerEvent) => {
       setWinSize({
@@ -1269,7 +662,6 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
     window.addEventListener('pointercancel', onUp);
   };
 
-  // Board pointer down: Right/Middle = Pan, Left on empty = Marquee Multi-Select!
   const handleBoardPointerDown = (e: React.PointerEvent) => {
     const refHost = (e.currentTarget as HTMLElement).closest('[data-ref-window]') as HTMLElement | null;
     refHost?.focus();
@@ -1278,12 +670,11 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
 
     if (e.button === 1 || e.button === 2) {
       e.preventDefault();
-      const startX = e.clientX;
-      const startY = e.clientY;
+      const startX = e.clientX,
+        startY = e.clientY;
       const orig = { ...boardPanRef.current };
-      const onMove = (ev: PointerEvent) => {
+      const onMove = (ev: PointerEvent) =>
         setBoardPan({ x: orig.x + (ev.clientX - startX), y: orig.y + (ev.clientY - startY) });
-      };
       const onUp = () => {
         window.removeEventListener('pointermove', onMove);
         window.removeEventListener('pointerup', onUp);
@@ -1309,21 +700,18 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
       const onMove = (ev: PointerEvent) => {
         const curX = ev.clientX - rect.left;
         const curY = ev.clientY - rect.top;
-        const rx = Math.min(startClientX, curX);
-        const ry = Math.min(startClientY, curY);
-        const rw = Math.abs(curX - startClientX);
-        const rh = Math.abs(curY - startClientY);
+        const rx = Math.min(startClientX, curX),
+          ry = Math.min(startClientY, curY);
+        const rw = Math.abs(curX - startClientX),
+          rh = Math.abs(curY - startClientY);
         if (rw < 4 && rh < 4) return;
         setMarqueeBox({ x: rx, y: ry, w: rw, h: rh });
-
-        // Convert marquee screen box to board coordinates
         const z = boardZoomRef.current || 1;
         const p = boardPanRef.current;
-        const bx1 = (rx - p.x) / z;
-        const by1 = (ry - p.y) / z;
-        const bx2 = (rx + rw - p.x) / z;
-        const by2 = (ry + rh - p.y) / z;
-
+        const bx1 = (rx - p.x) / z,
+          by1 = (ry - p.y) / z;
+        const bx2 = (rx + rw - p.x) / z,
+          by2 = (ry + rh - p.y) / z;
         const hits = itemsRef.current
           .filter((it) => it.x < bx2 && it.x + it.w > bx1 && it.y < by2 && it.y + it.h > by1)
           .map((it) => it.id);
@@ -1344,22 +732,19 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
     }
   };
 
-  // Drag single item, multi-selection, or entire group smoothly together!
   const startItemsDrag = (targetIds: string[], e: React.PointerEvent) => {
     if (e.button !== 0) return;
     e.stopPropagation();
     e.preventDefault();
     const refHost = (e.currentTarget as HTMLElement).closest('[data-ref-window]') as HTMLElement | null;
     refHost?.focus();
-
-    const startX = e.clientX;
-    const startY = e.clientY;
+    const startX = e.clientX,
+      startY = e.clientY;
     const dragSet = new Set(targetIds);
     const origMap = new Map<string, { x: number; y: number }>();
     for (const it of itemsRef.current) {
       if (dragSet.has(it.id)) origMap.set(it.id, { x: it.x, y: it.y });
     }
-
     const onMove = (ev: PointerEvent) => {
       const z = boardZoomRef.current || 1;
       const dx = (ev.clientX - startX) / z;
@@ -1384,15 +769,14 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
     window.addEventListener('pointercancel', onUp);
   };
 
-  // Resize an item (proportional for media, free W/H for text notes)
   const startItemResize = (item: RefItem, e: React.PointerEvent) => {
     if (e.button !== 0) return;
     e.stopPropagation();
     e.preventDefault();
-    const startX = e.clientX;
-    const startY = e.clientY;
-    const origW = item.w;
-    const origH = item.h;
+    const startX = e.clientX,
+      startY = e.clientY;
+    const origW = item.w,
+      origH = item.h;
     const ratio = origH / Math.max(1, origW);
 
     const onMove = (ev: PointerEvent) => {
@@ -1402,7 +786,9 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
       if (item.kind === 'text') {
         setItems((prev) =>
           prev.map((it) =>
-            it.id === item.id ? { ...it, w: Math.max(120, Math.round(origW + dx)), h: Math.max(54, Math.round(origH + dy)) } : it
+            it.id === item.id
+              ? { ...it, w: Math.max(120, Math.round(origW + dx)), h: Math.max(54, Math.round(origH + dy)) }
+              : it
           )
         );
       } else {
@@ -1481,300 +867,55 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
       onDrop={(e) => {
         e.preventDefault();
         setIsDragOver(false);
-        if (e.dataTransfer.files?.length) {
-          readFiles(e.dataTransfer.files);
-        }
+        if (e.dataTransfer.files?.length) readFiles(e.dataTransfer.files);
       }}
     >
-      {/* PureRef-style Slim Header (Native OS Drag Region when standalone!) */}
-      <div
-        className={standalone ? 'drag-region' : undefined}
-        onPointerDown={startWindowDrag}
-        style={{
-          height: 30,
-          background: '#1e212a',
-          borderBottom: '1px solid #2d3240',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-          padding: '0 6px',
-          cursor: standalone ? 'default' : 'grab',
-          touchAction: 'none',
-          userSelect: 'none',
-          gap: 4,
-          flexShrink: 0
+      <RefToolbar
+        standalone={standalone}
+        selectedCount={selectedIds.length}
+        selectedHasGrouped={selectedHasGrouped}
+        singleSelectedText={singleSelectedText}
+        dropperMode={dropperMode}
+        grayscaleBoard={grayscaleBoard}
+        winOpacity={winOpacity}
+        alwaysOnTop={alwaysOnTop}
+        fileInputRef={fileInputRef}
+        onStartWindowDrag={startWindowDrag}
+        onReadFiles={readFiles}
+        onAddTextNote={() => addTextNote()}
+        onToggleDropper={() => setDropperMode((d) => !d)}
+        onToggleGrayscale={() => setGrayscaleBoard((g) => !g)}
+        onGroupSelected={groupSelected}
+        onUngroupSelected={ungroupSelected}
+        onFlipSelected={() => {
+          const sel = new Set(selectedIds);
+          setItems((prev) => prev.map((it) => (sel.has(it.id) ? { ...it, flipX: !it.flipX } : it)));
         }}
-      >
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6, paddingLeft: 3 }}>
-          <span style={{ fontSize: 11.5, fontWeight: 700, color: '#e5e7eb' }}>Referência</span>
-          {selectedIds.length > 1 && (
-            <span style={{ fontSize: 10, color: '#93c5fd', background: 'rgba(58,134,255,0.18)', padding: '0 5px', borderRadius: 99 }}>
-              {selectedIds.length} sel.
-            </span>
-          )}
-        </div>
-
-        <div
-          className={standalone ? 'no-drag' : undefined}
-          style={{ display: 'flex', alignItems: 'center', gap: 2 }}
-          onPointerDown={(e) => e.stopPropagation()}
-        >
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="image/*,video/mp4,video/webm,video/quicktime,.gif,.mp4,.webm,.mov"
-            multiple
-            style={{ display: 'none' }}
-            onChange={(e) => {
-              if (e.target.files) readFiles(e.target.files);
-              e.target.value = '';
-            }}
-          />
-          <button
-            className="icon-btn"
-            onClick={() => fileInputRef.current?.click()}
-            title="Adicionar Imagem, GIF ou Vídeo MP4 (ou arraste / Ctrl+V)"
-            style={{ height: 22, padding: '0 5px' }}
-          >
-            <ImagePlus size={12.5} />
-          </button>
-          <button
-            className="icon-btn"
-            onClick={() => addTextNote()}
-            title="Adicionar Nota de Texto"
-            style={{ height: 22, padding: '0 5px' }}
-          >
-            <Type size={12.5} />
-          </button>
-          <button
-            className={`icon-btn ${dropperMode ? 'active' : ''}`}
-            onClick={() => setDropperMode((d) => !d)}
-            title="Conta-gotas (ou Alt+Clique em qualquer Imagem, GIF ou Vídeo)"
-            style={{ height: 22, padding: '0 5px' }}
-          >
-            <Pipette size={12.5} />
-          </button>
-          <button
-            className={`icon-btn ${grayscaleBoard ? 'active' : ''}`}
-            onClick={() => setGrayscaleBoard((g) => !g)}
-            title="Modo Preto & Branco (estudo de valores)"
-            style={{ height: 22, padding: '0 5px' }}
-          >
-            <Contrast size={12.5} />
-          </button>
-
-          {selectedIds.length > 0 && (
-            <>
-              <div style={{ width: 1, height: 14, background: '#383e4f', margin: '0 2px' }} />
-              <button
-                className="icon-btn"
-                onClick={groupSelected}
-                title="Agrupar selecionados (Ctrl+G)"
-                style={{ height: 22, padding: '0 5px' }}
-              >
-                <Group size={12.5} />
-              </button>
-              {selectedHasGrouped && (
-                <button
-                  className="icon-btn"
-                  onClick={ungroupSelected}
-                  title="Desagrupar (Ctrl+Shift+G)"
-                  style={{ height: 22, padding: '0 5px' }}
-                >
-                  <Ungroup size={12.5} />
-                </button>
-              )}
-              <button
-                className="icon-btn"
-                onClick={() => {
-                  const sel = new Set(selectedIds);
-                  setItems((prev) => prev.map((it) => (sel.has(it.id) ? { ...it, flipX: !it.flipX } : it)));
-                }}
-                title="Espelhar selecionados (H)"
-                style={{ height: 22, padding: '0 5px' }}
-              >
-                <FlipHorizontal2 size={12.5} />
-              </button>
-              <button
-                className="icon-btn"
-                onClick={() => {
-                  const del = new Set(selectedIds);
-                  const next = items.filter((it) => !del.has(it.id));
-                  const remGroups = new Set(next.map((it) => it.groupId).filter(Boolean));
-                  setItems(next);
-                  setGroups((prev) => prev.filter((g) => remGroups.has(g.id)));
-                  setSelectedIds([]);
-                }}
-                title="Remover selecionados (Delete)"
-                style={{ height: 22, padding: '0 5px' }}
-              >
-                <Trash2 size={12.5} />
-              </button>
-            </>
-          )}
-
-          <div style={{ width: 1, height: 14, background: '#383e4f', margin: '0 2px' }} />
-
-          <button
-            className="icon-btn"
-            onClick={autoPackGrid}
-            title="Organizar referências em grade"
-            style={{ height: 22, padding: '0 5px' }}
-          >
-            <LayoutGrid size={12} />
-          </button>
-          <button
-            className="icon-btn"
-            onClick={fitAllItems}
-            title="Enquadrar tudo (F)"
-            style={{ height: 22, padding: '0 5px' }}
-          >
-            <Maximize2 size={11.5} />
-          </button>
-
-          <input
-            type="range"
-            min={25}
-            max={100}
-            value={Math.round(winOpacity * 100)}
-            onChange={(e) => {
-              const v = Number(e.target.value) / 100;
-              setWinOpacity(v);
-              if (standalone) window.harmonyAPI?.refSetWindowOpacity?.(v);
-            }}
-            title={`Opacidade da Janela: ${Math.round(winOpacity * 100)}%`}
-            style={{ width: 42, accentColor: '#3a86ff' }}
-          />
-
-          {standalone ? (
-            <>
-              <button
-                className={`icon-btn ${alwaysOnTop ? 'active' : ''}`}
-                onClick={() => {
-                  const next = !alwaysOnTop;
-                  setAlwaysOnTop(next);
-                  window.harmonyAPI?.refSetAlwaysOnTop?.(next);
-                }}
-                title={alwaysOnTop ? 'Sempre no topo: ATIVO' : 'Sempre no topo: OFF'}
-                style={{ height: 22, padding: '0 5px' }}
-              >
-                {alwaysOnTop ? <Pin size={12} /> : <PinOff size={12} />}
-              </button>
-              <button
-                className="icon-btn"
-                onClick={() => window.harmonyAPI?.minimize()}
-                title="Minimizar"
-                style={{ height: 22, padding: '0 4px' }}
-              >
-                <Minus size={12} />
-              </button>
-              <button
-                className="icon-btn"
-                onClick={() => window.harmonyAPI?.maximize()}
-                title="Maximizar"
-                style={{ height: 22, padding: '0 4px' }}
-              >
-                <Square size={10} />
-              </button>
-              <button
-                className="icon-btn"
-                onClick={() => window.harmonyAPI?.close()}
-                title="Fechar janela de referência"
-                style={{ height: 22, padding: '0 4px' }}
-              >
-                <X size={13} />
-              </button>
-            </>
-          ) : (
-            <>
-              <button
-                className="icon-btn"
-                onClick={handlePopOutToMonitor}
-                title="Destacar para janela livre (arraste até para outro monitor!)"
-                style={{ height: 22, padding: '0 5px', color: '#93c5fd' }}
-              >
-                <ExternalLink size={12} />
-              </button>
-              <button
-                className="icon-btn"
-                onClick={toggleReferenceWindow}
-                title="Fechar Janela de Referência"
-                style={{ height: 22, padding: '0 4px' }}
-              >
-                <X size={13} />
-              </button>
-            </>
-          )}
-        </div>
-      </div>
-
-      {/* Contextual Text Note Mini-Bar when a sticky note is selected */}
-      {singleSelectedText && (
-        <div
-          style={{
-            height: 28,
-            background: '#1a1d25',
-            borderBottom: '1px solid #2b303c',
-            display: 'flex',
-            alignItems: 'center',
-            gap: 6,
-            padding: '0 8px',
-            fontSize: 10.5,
-            color: '#9ca3af',
-            flexShrink: 0
-          }}
-        >
-          <span>Nota:</span>
-          {NOTE_PALETTE.map((p) => (
-            <button
-              key={p.id}
-              onClick={() =>
-                setItems((prev) =>
-                  prev.map((it) => (it.id === singleSelectedText.id ? { ...it, noteColor: p.id } : it))
-                )
-              }
-              title={p.label}
-              style={{
-                width: 14,
-                height: 14,
-                borderRadius: '50%',
-                background: p.bg,
-                border: `2px solid ${singleSelectedText.noteColor === p.id ? '#fff' : p.border}`,
-                cursor: 'pointer',
-                padding: 0
-              }}
-            />
-          ))}
-          <div style={{ width: 1, height: 12, background: '#333a4a', margin: '0 2px' }} />
-          <button
-            className="icon-btn"
-            onClick={() =>
-              setItems((prev) =>
-                prev.map((it) =>
-                  it.id === singleSelectedText.id ? { ...it, fontSize: Math.max(10, (it.fontSize || 13) - 2) } : it
-                )
-              )
-            }
-            style={{ height: 20, padding: '0 5px', fontSize: 10.5 }}
-          >
-            A-
-          </button>
-          <span style={{ fontFamily: 'monospace', color: '#d1d5db' }}>{singleSelectedText.fontSize || 13}px</span>
-          <button
-            className="icon-btn"
-            onClick={() =>
-              setItems((prev) =>
-                prev.map((it) =>
-                  it.id === singleSelectedText.id ? { ...it, fontSize: Math.min(36, (it.fontSize || 13) + 2) } : it
-                )
-              )
-            }
-            style={{ height: 20, padding: '0 5px', fontSize: 10.5 }}
-          >
-            A+
-          </button>
-        </div>
-      )}
+        onDeleteSelected={() => {
+          const del = new Set(selectedIds);
+          const next = items.filter((it) => !del.has(it.id));
+          const remGroups = new Set(next.map((it) => it.groupId).filter(Boolean));
+          setItems(next);
+          setGroups((prev) => prev.filter((g) => remGroups.has(g.id)));
+          setSelectedIds([]);
+        }}
+        onAutoPackGrid={autoPackGrid}
+        onFitAll={fitAllItems}
+        onChangeOpacity={(v) => {
+          setWinOpacity(v);
+          if (standalone) window.harmonyAPI?.refSetWindowOpacity?.(v);
+        }}
+        onToggleAlwaysOnTop={() => {
+          const next = !alwaysOnTop;
+          setAlwaysOnTop(next);
+          window.harmonyAPI?.refSetAlwaysOnTop?.(next);
+        }}
+        onPopOut={handlePopOutToMonitor}
+        onCloseDocked={toggleReferenceWindow}
+        onUpdateTextNote={(id, patch) =>
+          setItems((prev) => prev.map((it) => (it.id === id ? { ...it, ...patch } : it)))
+        }
+      />
 
       {/* PureRef Infinite Canvas Board */}
       <div
@@ -1821,7 +962,6 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
           </div>
         )}
 
-        {/* Zoomable / Pannable World Layer */}
         <div
           style={{
             position: 'absolute',
@@ -1831,103 +971,27 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
             filter: grayscaleBoard ? 'grayscale(100%)' : 'none'
           }}
         >
-          {/* Group Bounding Frames (rendered underneath items) */}
           {groups.map((grp) => {
             const members = items.filter((it) => it.groupId === grp.id);
-            if (members.length === 0) return null;
-            const pad = 12;
-            const headerH = 22;
-            const minX = Math.min(...members.map((m) => m.x)) - pad;
-            const minY = Math.min(...members.map((m) => m.y)) - pad - headerH;
-            const maxX = Math.max(...members.map((m) => m.x + m.w)) + pad;
-            const maxY = Math.max(...members.map((m) => m.y + m.h)) + pad;
-            const memberIds = members.map((m) => m.id);
-            const allSelected = memberIds.every((id) => selectedSet.has(id));
-
+            const allSelected = members.length > 0 && members.every((m) => selectedSet.has(m.id));
             return (
-              <div
+              <RefGroupFrame
                 key={grp.id}
-                style={{
-                  position: 'absolute',
-                  left: minX,
-                  top: minY,
-                  width: maxX - minX,
-                  height: maxY - minY,
-                  background: `${grp.color}12`,
-                  border: `1.5px dashed ${allSelected ? '#ffffff' : grp.color}`,
-                  borderRadius: 8,
-                  pointerEvents: 'none'
-                }}
-              >
-                {/* Draggable Group Header Tab */}
-                <div
-                  onPointerDown={(e) => {
-                    e.stopPropagation();
-                    if (e.shiftKey) {
-                      setSelectedIds((prev) => Array.from(new Set([...prev, ...memberIds])));
-                    } else {
-                      setSelectedIds(memberIds);
-                    }
-                    startItemsDrag(memberIds, e);
-                  }}
-                  onDoubleClick={(e) => {
-                    e.stopPropagation();
-                    setEditingGroupId(grp.id);
-                  }}
-                  style={{
-                    position: 'absolute',
-                    left: 0,
-                    top: 0,
-                    right: 0,
-                    height: headerH,
-                    background: `${grp.color}33`,
-                    borderBottom: `1px solid ${grp.color}55`,
-                    borderTopLeftRadius: 6,
-                    borderTopRightRadius: 6,
-                    padding: '0 8px',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'space-between',
-                    cursor: 'move',
-                    pointerEvents: 'auto',
-                    userSelect: 'none'
-                  }}
-                >
-                  {editingGroupId === grp.id ? (
-                    <input
-                      autoFocus
-                      value={grp.name}
-                      onChange={(e) =>
-                        setGroups((prev) => prev.map((g) => (g.id === grp.id ? { ...g, name: e.target.value } : g)))
-                      }
-                      onBlur={() => setEditingGroupId(null)}
-                      onKeyDown={(e) => {
-                        e.stopPropagation();
-                        if (e.key === 'Enter' || e.key === 'Escape') setEditingGroupId(null);
-                      }}
-                      onPointerDown={(e) => e.stopPropagation()}
-                      style={{
-                        background: 'rgba(0,0,0,0.55)',
-                        color: '#fff',
-                        border: '1px solid #fff',
-                        borderRadius: 3,
-                        fontSize: 10.5,
-                        padding: '0 4px',
-                        width: 140,
-                        outline: 'none'
-                      }}
-                    />
-                  ) : (
-                    <span style={{ fontSize: 10.5, fontWeight: 700, color: '#f3f4f6' }}>
-                      {grp.name} ({members.length})
-                    </span>
-                  )}
-                </div>
-              </div>
+                group={grp}
+                members={members}
+                allSelected={allSelected}
+                isEditing={editingGroupId === grp.id}
+                onStartDrag={startItemsDrag}
+                onSelectMembers={(memberIds, additive) =>
+                  setSelectedIds(additive ? Array.from(new Set([...selectedIds, ...memberIds])) : memberIds)
+                }
+                onStartEdit={() => setEditingGroupId(grp.id)}
+                onRename={(name) => setGroups((prev) => prev.map((g) => (g.id === grp.id ? { ...g, name } : g)))}
+                onFinishEdit={() => setEditingGroupId(null)}
+              />
             );
           })}
 
-          {/* Board Items (Images, Animated GIFs, MP4 Videos, Text Notes) */}
           {items.map((item) => {
             const isSel = selectedSet.has(item.id);
             const isEditingText = editingNoteId === item.id;
@@ -1943,30 +1007,23 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
                     if (imgEl) sampleFromRefImage(item, imgEl, e.clientX, e.clientY);
                     return;
                   }
-                  if ((item.kind === 'gif' || item.kind === 'video') && (dropperMode || e.altKey)) {
-                    // Handled by inner GIF/Video card pixel sampler
-                    return;
-                  }
+                  if ((item.kind === 'gif' || item.kind === 'video') && (dropperMode || e.altKey)) return;
                   if (isEditingText) {
                     e.stopPropagation();
                     return;
                   }
 
-                  // Selection logic (respects Shift+Click multi-select & group drag!)
                   let nextDragIds: string[];
                   if (e.shiftKey) {
                     if (selectedSet.has(item.id)) {
-                      const removed = selectedIds.filter((id) => id !== item.id);
-                      setSelectedIds(removed);
+                      setSelectedIds(selectedIds.filter((id) => id !== item.id));
                       return;
-                    } else {
-                      nextDragIds = [...selectedIds, item.id];
-                      setSelectedIds(nextDragIds);
                     }
+                    nextDragIds = [...selectedIds, item.id];
+                    setSelectedIds(nextDragIds);
                   } else if (selectedSet.has(item.id)) {
                     nextDragIds = selectedIds;
                   } else if (item.groupId) {
-                    // Clicking any member of a group selects & moves the whole group (PureRef style!)
                     nextDragIds = items.filter((it) => it.groupId === item.groupId).map((it) => it.id);
                     setSelectedIds(nextDragIds);
                   } else {
@@ -2010,7 +1067,6 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
                     }}
                   />
                 )}
-
                 {item.kind === 'gif' && (
                   <RefGifCard
                     item={item}
@@ -2021,7 +1077,6 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
                     togglePlaySignal={togglePlaySignal}
                   />
                 )}
-
                 {item.kind === 'video' && (
                   <RefVideoCard
                     item={item}
@@ -2032,7 +1087,6 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
                     togglePlaySignal={togglePlaySignal}
                   />
                 )}
-
                 {item.kind === 'text' && (
                   <div
                     style={{
@@ -2081,7 +1135,6 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
                   </div>
                 )}
 
-                {/* Corner Resize Handle */}
                 {isSel && !dropperMode && !isEditingText && (
                   <div
                     onPointerDown={(e) => startItemResize(item, e)}
@@ -2106,7 +1159,6 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
           })}
         </div>
 
-        {/* Marquee Multi-Selection Box */}
         {marqueeBox && (
           <div
             style={{
@@ -2124,7 +1176,6 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
           />
         )}
 
-        {/* Picked Color Toast */}
         {pickedHex && (
           <div
             style={{
@@ -2158,7 +1209,6 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
           </div>
         )}
 
-        {/* Subtle Action Toast */}
         {statusToast && (
           <div
             style={{
@@ -2179,7 +1229,6 @@ export const ReferenceWindow: React.FC<{ standalone?: boolean }> = ({ standalone
           </div>
         )}
 
-        {/* Docked Window Resize Grip */}
         {!standalone && (
           <div
             onPointerDown={startWindowResize}

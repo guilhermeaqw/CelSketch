@@ -1,5 +1,4 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { createPortal } from 'react-dom';
 import {
   Minus,
   Square,
@@ -17,10 +16,9 @@ import {
   Camera,
   Sparkles,
   ChevronDown,
-  Settings,
-  Trash2,
-  Video
+  Settings
 } from 'lucide-react';
+import { TitleBarPopovers } from './TitleBarPopovers';
 import { useShallow } from 'zustand/react/shallow';
 import { useHarmonyStore } from '../store/useHarmonyStore';
 import { hasActivePostProcess } from '../utils/postProcessUtils';
@@ -982,157 +980,24 @@ export const TitleBar: React.FC = () => {
         </button>
       </div>
 
-      {/* Portal Popovers for Toolbar (Guias & REC) so overflow-x never clips them */}
-      {openPopover &&
-        createPortal(
-          <div
-            data-tb-popover="true"
-            style={{
-              position: 'fixed',
-              left: openPopover.left,
-              top: openPopover.top,
-              width: openPopover.kind === 'rec' ? 250 : 215,
-              background: '#252830',
-              border: '1px solid #3f4452',
-              borderRadius: 8,
-              padding: 6,
-              boxShadow: '0 10px 28px rgba(0,0,0,0.55)',
-              zIndex: 9999,
-              display: 'flex',
-              flexDirection: 'column',
-              gap: 3
-            }}
-          >
-            {openPopover.kind === 'guides' && (
-              <>
-                <div style={{ padding: '3px 8px', fontSize: 10, color: '#8e96a8', textTransform: 'uppercase', letterSpacing: 0.5 }}>
-                  Guias de Desenho
-                </div>
-                <button className="dropdown-item" onClick={() => toggleGrid()}>
-                  <span>Grade 12-Field</span>
-                  <span style={{ color: '#60a5fa' }}>{showGrid ? '✓' : ''}</span>
-                </button>
-                <button className="dropdown-item" onClick={() => toggleSymmetry()}>
-                  <span>Simetria Vertical</span>
-                  <span style={{ color: '#60a5fa' }}>{symmetryMode === 'vertical' ? '✓' : ''}</span>
-                </button>
-                <div className="dropdown-sep" />
-                <div style={{ padding: '3px 8px', fontSize: 10, color: '#8e96a8', textTransform: 'uppercase', letterSpacing: 0.5 }}>
-                  Régua de Perspectiva
-                </div>
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 4, padding: '2px 6px 4px' }}>
-                  {([
-                    { v: 0, l: 'Off' },
-                    { v: 1, l: '1P' },
-                    { v: 2, l: '2P' },
-                    { v: 3, l: '3P' },
-                    { v: 4, l: 'Eye' }
-                  ] as const).map((opt) => (
-                    <button
-                      key={opt.v}
-                      onClick={() => setPerspectiveMode(opt.v)}
-                      style={{
-                        padding: '4px 0',
-                        borderRadius: 4,
-                        border: perspectiveMode === opt.v ? '1px solid #3a86ff' : '1px solid #3d4250',
-                        background: perspectiveMode === opt.v ? 'rgba(58,134,255,0.22)' : '#1d2027',
-                        color: perspectiveMode === opt.v ? '#dbeafe' : '#bbb',
-                        fontSize: 10.5,
-                        cursor: 'pointer'
-                      }}
-                    >
-                      {opt.l}
-                    </button>
-                  ))}
-                </div>
-              </>
-            )}
-
-            {openPopover.kind === 'rec' && (
-              <>
-                <div style={{ padding: '3px 8px', fontSize: 10, color: '#8e96a8', textTransform: 'uppercase', letterSpacing: 0.5 }}>
-                  Gravação / Timelapse
-                </div>
-                <button
-                  className="dropdown-item"
-                  onClick={async () => {
-                    if (!timelapseRecording) {
-                      if (!timelapseRootDir && window.harmonyAPI?.pickDirectory) {
-                        const res = await window.harmonyAPI.pickDirectory('Escolha a pasta onde gravar os processos (Auto-Rec)');
-                        if (res.canceled || !res.dirPath) return;
-                        setTimelapseRootDir(res.dirPath);
-                      }
-                      toggleTimelapseRecording();
-                    } else {
-                      toggleTimelapseRecording();
-                    }
-                    setOpenPopover(null);
-                  }}
-                  style={{ color: timelapseRecording ? '#fca5a5' : '#e5e7eb', fontWeight: 600 }}
-                >
-                  <span>{timelapseRecording ? '■ Parar Gravação (Auto-Rec)' : '● Iniciar Gravação (Auto-Rec)'}</span>
-                </button>
-                <button
-                  className="dropdown-item"
-                  onClick={async () => {
-                    const res = await window.harmonyAPI?.pickDirectory('Escolha a pasta onde gravar os processos (Auto-Rec)');
-                    if (res && !res.canceled && res.dirPath) {
-                      setTimelapseRootDir(res.dirPath);
-                    }
-                  }}
-                >
-                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                    <FolderOpen size={12} /> {timelapseRootDir ? 'Trocar Pasta do Auto-Rec...' : 'Escolher Pasta...'}
-                  </span>
-                </button>
-                {timelapseRootDir && (
-                  <button
-                    className="dropdown-item"
-                    onClick={() => {
-                      window.harmonyAPI?.openPath(timelapseRootDir);
-                      setOpenPopover(null);
-                    }}
-                    title={timelapseRootDir}
-                  >
-                    <span style={{ fontSize: 10.5, color: '#9ca3af', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                      Abrir: {timelapseRootDir}
-                    </span>
-                  </button>
-                )}
-                <div className="dropdown-sep" />
-                <button
-                  className="dropdown-item"
-                  disabled={timelapseCount === 0 || timelapseBusy}
-                  style={{ opacity: timelapseCount === 0 || timelapseBusy ? 0.45 : 1 }}
-                  onClick={() => {
-                    setOpenPopover(null);
-                    handleExportTimelapse();
-                  }}
-                >
-                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                    <Video size={12} /> {timelapseBusy ? 'Exportando...' : `Exportar Timelapse (${timelapseCount})`}
-                  </span>
-                </button>
-                {timelapseCount > 0 && (
-                  <button
-                    className="dropdown-item"
-                    disabled={timelapseBusy}
-                    onClick={() => {
-                      clearTimelapse();
-                      setOpenPopover(null);
-                    }}
-                    style={{ color: '#f87171' }}
-                  >
-                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                      <Trash2 size={12} /> Limpar Frames Gravados
-                    </span>
-                  </button>
-                )}
-              </>
-            )}
-          </div>,
-          document.body
-        )}
+      <TitleBarPopovers
+        openPopover={openPopover}
+        onClose={() => setOpenPopover(null)}
+        showGrid={showGrid}
+        symmetryMode={symmetryMode}
+        perspectiveMode={perspectiveMode}
+        onToggleGrid={toggleGrid}
+        onToggleSymmetry={toggleSymmetry}
+        onSetPerspectiveMode={setPerspectiveMode}
+        timelapseRecording={timelapseRecording}
+        timelapseRootDir={timelapseRootDir}
+        timelapseCount={timelapseCount}
+        timelapseBusy={timelapseBusy}
+        onToggleRecording={toggleTimelapseRecording}
+        onSetTimelapseRootDir={setTimelapseRootDir}
+        onExportTimelapse={handleExportTimelapse}
+        onClearTimelapse={clearTimelapse}
+      />
     </>
   );
 };
