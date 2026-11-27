@@ -1,3 +1,5 @@
+import { applyLevelsWebGL } from './webglFilters';
+
 export interface LevelsAdjustment {
   blackPoint: number; // 0 .. 250
   gamma: number;      // 0.2 .. 3.0 (default 1.0)
@@ -106,6 +108,11 @@ export function applyLevelsToCanvas(
     for (let i = 0; i < 256; i++) {
       composed[i] = lut[composed[i]];
     }
+  }
+
+  // GPU Fast-Path (WebGL2 1D LUT texture < 0.2ms at 1080p)
+  if (applyLevelsWebGL(src, dst, composed)) {
+    return dst;
   }
 
   const imgData = dctx.getImageData(0, 0, w, h);

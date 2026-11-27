@@ -3,6 +3,7 @@ import { AlertTriangle, Save, LogOut, X } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { useHarmonyStore } from '../store/useHarmonyStore';
 import { saveProjectThumbnail } from './TitleBar';
+import { packProjectToZip } from '../utils/projectCodec';
 
 interface UnsavedCloseModalProps {
   open: boolean;
@@ -51,7 +52,7 @@ export const UnsavedCloseModal: React.FC<UnsavedCloseModalProps> = ({ open, onCl
     try {
       const s = useHarmonyStore.getState();
       if (s.isDirty) {
-        const data = JSON.stringify(s.exportProjectData(), null, 2);
+        const data = await packProjectToZip(s.exportProjectData());
         const res = await window.harmonyAPI.saveProject(data, projectPath, projectName);
         if (res.canceled || !res.filePath) {
           setSaving(false);

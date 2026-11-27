@@ -143,6 +143,12 @@ export const CanvasStage: React.FC = () => {
   const [viewportTick, setViewportTick] = useState(0);
 
   const [isDrawing, setIsDrawing] = useState(false);
+  useEffect(() => {
+    (window as any).__celsketchDrawing = isDrawing;
+    return () => {
+      (window as any).__celsketchDrawing = false;
+    };
+  }, [isDrawing]);
   const [isPanning, setIsPanning] = useState(false);
   const [spaceHeld, setSpaceHeld] = useState(false);
   const [rHeld, setRHeld] = useState(false);
@@ -3406,6 +3412,121 @@ export const CanvasStage: React.FC = () => {
       zoom *
       activeCamZoomForCursor
   );
+
+  // Background Idle Playback Lookahead: silently pre-warms next 6 frames into RAM while idle so the 1st Play loop is butter-smooth!
+  useEffect(() => {
+    if (
+      isPlaying ||
+      isDrawing ||
+      transformActive ||
+      Boolean(hsvPreview) ||
+      Boolean(levelsPreview) ||
+      Boolean(blurPreview) ||
+      performanceMode === 'eco' ||
+      totalFrames <= 1
+    ) {
+      return;
+    }
+
+    let cancelled = false;
+    let idleId: number | null = null;
+    const startTimer = window.setTimeout(() => {
+      if (cancelled) return;
+      const meta = playbackCacheMetaRef.current;
+      const metaValid =
+        meta &&
+        meta.layersRef === layers &&
+        meta.postProcessRef === postProcess &&
+        meta.cameraViewMode === cameraViewMode &&
+        meta.width === canvasWidth &&
+        meta.height === canvasHeight &&
+        meta.imageTick === imageTick &&
+        meta.lightTable === lightTable &&
+        (!lightTable || meta.activeLayerId === activeLayerId);
+
+      if (!metaValid) {
+        clearPlaybackCache();
+        playbackCacheMetaRef.current = {
+          layersRef: layers,
+          postProcessRef: postProcess,
+          cameraViewMode,
+          width: canvasWidth,
+          height: canvasHeight,
+          imageTick,
+          lightTable,
+          activeLayerId
+        };
+      }
+
+      const maxWarmFrames = Math.min(6, Math.max(0, totalFrames - 1));
+      let stepIdx = 1;
+      const warmNext = () => {
+        if (cancelled || stepIdx > maxWarmFrames) return;
+        const targetF = ((currentFrame - 1 + stepIdx) % totalFrames) + 1;
+        stepIdx += 1;
+        if (!playbackFrameCacheRef.current.has(targetF) && playbackFrameCacheRef.current.size < 48) {
+          const cached = document.createElement('canvas');
+          cached.width = canvasWidth;
+          cached.height = canvasHeight;
+          renderFrameToCanvas(
+            cached,
+            layers,
+            targetF,
+            canvasWidth,
+            canvasHeight,
+            '#ffffff',
+            cameraViewMode,
+            hasActivePostProcess(postProcess) ? postProcess : null
+          );
+          playbackFrameCacheRef.current.set(targetF, cached);
+        }
+        if (stepIdx <= maxWarmFrames && !cancelled) {
+          const ric = (window as any).requestIdleCallback;
+          if (typeof ric === 'function') {
+            idleId = ric(warmNext, { timeout: 600 });
+          } else {
+            idleId = window.setTimeout(warmNext, 40);
+          }
+        }
+      };
+
+      const ric = (window as any).requestIdleCallback;
+      if (typeof ric === 'function') {
+        idleId = ric(warmNext, { timeout: 600 });
+      } else {
+        idleId = window.setTimeout(warmNext, 40);
+      }
+    }, 500);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(startTimer);
+      if (idleId !== null) {
+        const cic = (window as any).cancelIdleCallback;
+        if (typeof cic === 'function') cic(idleId);
+        else window.clearTimeout(idleId);
+      }
+    };
+  }, [
+    isPlaying,
+    isDrawing,
+    transformActive,
+    hsvPreview,
+    levelsPreview,
+    blurPreview,
+    performanceMode,
+    layers,
+    postProcess,
+    cameraViewMode,
+    canvasWidth,
+    canvasHeight,
+    imageTick,
+    lightTable,
+    activeLayerId,
+    currentFrame,
+    totalFrames,
+    clearPlaybackCache
+  ]);
 
   // Keep live brush cursor ring concentrically centered when resizing via [ / ] without moving pointer
   useEffect(() => {

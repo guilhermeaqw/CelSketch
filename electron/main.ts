@@ -513,10 +513,21 @@ ipcMain.handle('file:getLaunchFile', () => {
   return f;
 });
 
-// Save Project (.celsketch) — Atomic write
+function isZipBuffer(buf: Buffer): boolean {
+  return buf.length >= 4 && buf[0] === 0x50 && buf[1] === 0x4b && buf[2] === 0x03 && buf[3] === 0x04;
+}
+
+function toWritableBuffer(content: string | Uint8Array): string | Buffer {
+  return typeof content === 'string' ? content : Buffer.from(content);
+}
+
+// Save Project (.celsketch) — Atomic write (supports binary ZIP v2 or legacy JSON string)
 ipcMain.handle(
   'file:saveProject',
-  async (_event, { content, currentPath, defaultName }: { content: string; currentPath?: string | null; defaultName?: string }) => {
+  async (
+    _event,
+    { content, currentPath, defaultName }: { content: string | Uint8Array; currentPath?: string | null; defaultName?: string }
+  ) => {
     try {
       let filePath = currentPath;
       if (!filePath) {
@@ -531,8 +542,7 @@ ipcMain.handle(
         if (result.canceled || !result.filePath) return { canceled: true };
         filePath = result.filePath;
       }
-      await writeFileAtomic(filePath, content);
-      // Clear recovery backup after successful manual save
+      await writeFileAtomic(filePath, toWritableBuffer(content));
       fsp.unlink(getRecoveryPath()).catch(() => {});
       return { canceled: false, filePath };
     } catch (err: any) {
@@ -544,7 +554,7 @@ ipcMain.handle(
 // Save Project As (.celsketch) — Atomic write
 ipcMain.handle(
   'file:saveProjectAs',
-  async (_event, { content, defaultName }: { content: string; defaultName?: string }) => {
+  async (_event, { content, defaultName }: { content: string | Uint8Array; defaultName?: string }) => {
     try {
       if (!mainWindow) return { canceled: true, error: 'Window unavailable' };
       const base = sanitizeFilename(defaultName || 'Untitled', 'Untitled');
@@ -555,7 +565,7 @@ ipcMain.handle(
         filters: [{ name: 'CelSketch Project', extensions: ['celsketch'] }]
       });
       if (result.canceled || !result.filePath) return { canceled: true };
-      await writeFileAtomic(result.filePath, content);
+      await writeFileAtomic(result.filePath, toWritableBuffer(content));
       fsp.unlink(getRecoveryPath()).catch(() => {});
       return { canceled: false, filePath: result.filePath };
     } catch (err: any) {
@@ -565,23 +575,26 @@ ipcMain.handle(
 );
 
 // Auto-Save (always writes atomically to recovery backup in userData; never silently overwrites user's real file)
-ipcMain.handle('file:autoSave', async (_event, { content }: { content: string; currentPath?: string | null }) => {
+ipcMain.handle('file:autoSave', async (_event, { content }: { content: string | Uint8Array; currentPath?: string | null }) => {
   try {
     const targetPath = getRecoveryPath();
-    await writeFileAtomic(targetPath, content);
+    await writeFileAtomic(targetPath, toWritableBuffer(content));
     return { ok: true, filePath: targetPath };
   } catch (err: any) {
     return { ok: false, error: err?.message || 'Auto-save failed' };
   }
 });
 
-// Check / read / clear crash-recovery backup
+// Check / read / clear crash-recovery backup (supports both ZIP v2 and legacy UTF-8 JSON)
 ipcMain.handle('file:checkRecovery', async () => {
   try {
     const recoveryPath = getRecoveryPath();
     const stat = await fsp.stat(recoveryPath);
-    const content = await fsp.readFile(recoveryPath, 'utf-8');
-    return { exists: true, mtimeMs: stat.mtimeMs, content, filePath: recoveryPath };
+    const buf = await fsp.readFile(recoveryPath);
+    if (isZipBuffer(buf)) {
+      return { exists: true, mtimeMs: stat.mtimeMs, bytes: new Uint8Array(buf), filePath: recoveryPath };
+    }
+    return { exists: true, mtimeMs: stat.mtimeMs, content: buf.toString('utf-8'), filePath: recoveryPath };
   } catch {
     return { exists: false };
   }
@@ -607,8 +620,11 @@ ipcMain.handle('file:openProject', async () => {
     });
     if (result.canceled || result.filePaths.length === 0) return { canceled: true };
     const filePath = result.filePaths[0];
-    const content = await fsp.readFile(filePath, 'utf-8');
-    return { canceled: false, filePath, content };
+    const buf = await fsp.readFile(filePath);
+    if (isZipBuffer(buf)) {
+      return { canceled: false, filePath, bytes: new Uint8Array(buf) };
+    }
+    return { canceled: false, filePath, content: buf.toString('utf-8') };
   } catch (err: any) {
     return { canceled: true, error: err?.message || 'Erro ao abrir projeto' };
   }
@@ -618,8 +634,11 @@ ipcMain.handle('file:openProject', async () => {
 ipcMain.handle('file:openProjectByPath', async (_event, { filePath }: { filePath: string }) => {
   try {
     if (!filePath) return { canceled: true, error: 'Caminho inválido' };
-    const content = await fsp.readFile(filePath, 'utf-8');
-    return { canceled: false, filePath, content };
+    const buf = await fsp.readFile(filePath);
+    if (isZipBuffer(buf)) {
+      return { canceled: false, filePath, bytes: new Uint8Array(buf) };
+    }
+    return { canceled: false, filePath, content: buf.toString('utf-8') };
   } catch (err: any) {
     return { canceled: true, error: err?.code === 'ENOENT' ? 'Arquivo não encontrado' : (err?.message || 'Erro ao ler arquivo') };
   }

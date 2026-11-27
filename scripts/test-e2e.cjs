@@ -22,6 +22,11 @@ ipcMain.handle('updater:getLastCheck', () => null);
 ipcMain.handle('window:setDirty', () => {});
 ipcMain.handle('system:listFonts', () => ['Segoe UI', 'Arial']);
 let sharedBoard = null;
+let lastSavedPayload = null;
+ipcMain.handle('file:saveProject', (_e, { content }) => {
+  lastSavedPayload = content;
+  return { canceled: false, filePath: 'C:\\Temp\\test_scene.celsketch' };
+});
 ipcMain.handle('ref:getBoardState', () => sharedBoard);
 ipcMain.handle('ref:setBoardState', (_e, j) => {
   sharedBoard = j;
@@ -96,7 +101,7 @@ app.whenReady().then(async () => {
         const menuTexts = Array.from(document.querySelectorAll('.menu-btn')).map(b => (b.textContent || '').trim());
         const toolbarTexts = Array.from(document.querySelectorAll('.top-toolbar button')).map(b => (b.textContent || '').trim()).filter(Boolean);
 
-        // Test Filtros -> Lazy PostProcessModal
+        // Test Filtros -> Lazy PostProcessModal (GPU WebGL2)
         const filtrosBtn = Array.from(document.querySelectorAll('.menu-btn')).find(b => b.textContent.trim() === 'Filtros');
         filtrosBtn && filtrosBtn.click();
         await sleep(120);
@@ -104,10 +109,30 @@ app.whenReady().then(async () => {
         ppItem && ppItem.click();
         await sleep(300);
         const postProcessOpened = document.body.innerText.includes('Acabamento visual ao vivo e no vídeo');
-        // Click first preset (Anime Bloom) so live WebGL2 post-processing runs on real stage canvas!
         const presetBtn = Array.from(document.querySelectorAll('button')).find(b => /Anime Bloom/i.test(b.textContent || ''));
         presetBtn && presetBtn.click();
         await sleep(200);
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+        await sleep(100);
+
+        // Test Lazy BlurModal (Ctrl+Shift+B -> GPU Motion/Radial Blur)
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: 'b', ctrlKey: true, shiftKey: true, bubbles: true }));
+        await sleep(300);
+        const blurModalOpened = /Desfoque/i.test(document.body.innerText);
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+        await sleep(100);
+
+        // Test Lazy HsvModal (Ctrl+U -> GPU HSL)
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: 'u', ctrlKey: true, bubbles: true }));
+        await sleep(300);
+        const hsvModalOpened = /Matiz|Hue/i.test(document.body.innerText);
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+        await sleep(100);
+
+        // Test Lazy LevelsModal (Ctrl+L -> GPU LUT Levels)
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: 'l', ctrlKey: true, bubbles: true }));
+        await sleep(300);
+        const levelsModalOpened = /Níveis|Brilho/i.test(document.body.innerText);
         window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
         await sleep(100);
 
@@ -144,14 +169,38 @@ app.whenReady().then(async () => {
         await sleep(150);
         const brushHudVisible = /\\d+\\s*px/.test(document.body.innerText) && (document.body.innerText.includes('Pincel') || document.body.innerText.includes('Lápis'));
 
+        // Test Ctrl+S -> Binary ZIP .celsketch v2 codec
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true, bubbles: true }));
+        await sleep(300);
+
+        // Test Horizontal Timeline Virtualization with 600 frames!
+        const numInputs = Array.from(document.querySelectorAll('.timeline-num-input'));
+        // Total frames input is the 4th numeric input (FPS, In, Out, Total)
+        const totalInput = numInputs[3];
+        if (totalInput) {
+          const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+          totalInput.focus();
+          nativeSetter.call(totalInput, '600');
+          totalInput.dispatchEvent(new Event('input', { bubbles: true }));
+          totalInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+          totalInput.blur();
+          await sleep(250);
+        }
+        const renderedRulerFrames = document.querySelectorAll('[title^="Frame "]').length;
+
         return {
           menuTexts,
           toolbarTexts,
           postProcessOpened,
+          blurModalOpened,
+          hsvModalOpened,
+          levelsModalOpened,
           settingsOpened,
           recPopoverOpen,
           guiasPopoverOpen,
-          brushHudVisible
+          brushHudVisible,
+          renderedRulerFramesFor600: renderedRulerFrames,
+          timelineVirtualized: renderedRulerFrames > 10 && renderedRulerFrames < 140
         };
       })()
     `);
@@ -239,15 +288,34 @@ app.whenReady().then(async () => {
     `);
     refWin.destroy();
 
+    const savedBytes = lastSavedPayload instanceof Uint8Array ? lastSavedPayload : null;
+    report.zipCodec = {
+      savedAsBinary: Boolean(savedBytes),
+      isValidZipHeader: Boolean(
+        savedBytes &&
+          savedBytes.length > 40 &&
+          savedBytes[0] === 0x50 &&
+          savedBytes[1] === 0x4b &&
+          savedBytes[2] === 0x03 &&
+          savedBytes[3] === 0x04
+      ),
+      byteLength: savedBytes ? savedBytes.length : 0
+    };
+
     report.ok =
       report.errors.length === 0 &&
       report.launcher.hasTitle &&
       report.launcher.hasOpenBtn &&
       report.editor.postProcessOpened &&
+      report.editor.blurModalOpened &&
+      report.editor.hsvModalOpened &&
+      report.editor.levelsModalOpened &&
       report.editor.settingsOpened &&
       report.editor.recPopoverOpen &&
       report.editor.guiasPopoverOpen &&
       report.editor.brushHudVisible &&
+      report.editor.timelineVirtualized &&
+      report.zipCodec.isValidZipHeader &&
       report.webglBenchmark.hasWebGL2 &&
       report.reference.rendered &&
       report.reference.decodedGifFrames === 2 &&

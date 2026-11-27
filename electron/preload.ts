@@ -18,11 +18,11 @@ contextBridge.exposeInMainWorld('harmonyAPI', {
     ipcRenderer.on('file:openExternalPath', listener);
     return () => ipcRenderer.removeListener('file:openExternalPath', listener);
   },
-  saveProject: (content: string, currentPath?: string | null, defaultName?: string) =>
+  saveProject: (content: string | Uint8Array, currentPath?: string | null, defaultName?: string) =>
     ipcRenderer.invoke('file:saveProject', { content, currentPath, defaultName }),
-  saveProjectAs: (content: string, defaultName?: string) =>
+  saveProjectAs: (content: string | Uint8Array, defaultName?: string) =>
     ipcRenderer.invoke('file:saveProjectAs', { content, defaultName }),
-  autoSave: (content: string, currentPath?: string | null) =>
+  autoSave: (content: string | Uint8Array, currentPath?: string | null) =>
     ipcRenderer.invoke('file:autoSave', { content, currentPath }),
   checkRecovery: () => ipcRenderer.invoke('file:checkRecovery'),
   clearRecovery: () => ipcRenderer.invoke('file:clearRecovery'),

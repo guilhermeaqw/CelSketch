@@ -236,19 +236,42 @@ declare global {
       getLaunchFile: () => Promise<string | null>;
       onOpenExternalFile: (callback: (filePath: string) => void) => () => void;
       saveProject: (
-        content: string,
+        content: string | Uint8Array,
         currentPath?: string | null,
         defaultName?: string
       ) => Promise<{ canceled: boolean; filePath?: string; error?: string }>;
       saveProjectAs: (
-        content: string,
+        content: string | Uint8Array,
         defaultName?: string
       ) => Promise<{ canceled: boolean; filePath?: string; error?: string }>;
-      autoSave: (content: string, currentPath?: string | null) => Promise<{ ok: boolean; filePath?: string; error?: string }>;
-      checkRecovery: () => Promise<{ exists: boolean; mtimeMs?: number; content?: string; filePath?: string }>;
+      autoSave: (
+        content: string | Uint8Array,
+        currentPath?: string | null
+      ) => Promise<{ ok: boolean; filePath?: string; error?: string }>;
+      checkRecovery: () => Promise<{
+        exists: boolean;
+        mtimeMs?: number;
+        content?: string;
+        bytes?: Uint8Array;
+        filePath?: string;
+      }>;
       clearRecovery: () => Promise<{ ok: boolean }>;
-      openProject: () => Promise<{ canceled: boolean; filePath?: string; content?: string; error?: string }>;
-      openProjectByPath: (filePath: string) => Promise<{ canceled: boolean; filePath?: string; content?: string; error?: string }>;
+      openProject: () => Promise<{
+        canceled: boolean;
+        filePath?: string;
+        content?: string;
+        bytes?: Uint8Array;
+        error?: string;
+      }>;
+      openProjectByPath: (
+        filePath: string
+      ) => Promise<{
+        canceled: boolean;
+        filePath?: string;
+        content?: string;
+        bytes?: Uint8Array;
+        error?: string;
+      }>;
       importExternal: () => Promise<{ canceled: boolean; filePath?: string; ext?: string; bytes?: Uint8Array; error?: string }>;
       importAudio: () => Promise<{ canceled: boolean; filePath?: string; name?: string; bytes?: Uint8Array; error?: string }>;
       readAudioByPath: (filePath: string) => Promise<{ canceled: boolean; filePath?: string; name?: string; bytes?: Uint8Array; error?: string }>;

@@ -25,7 +25,8 @@ import { hasActivePostProcess } from '../utils/postProcessUtils';
 import { parseExternalArtwork } from '../utils/importer';
 import { preloadFrameImages, renderFrameToCanvas } from '../utils/canvasRenderer';
 import { pickSupportedVideoCodec } from '../utils/exporter';
-import { decodeAudioBufferTrack } from '../App';
+import { decodeAudioBufferTrack } from '../utils/appUtils';
+import { packProjectToZip, unpackProjectPayload } from '../utils/projectCodec';
 
 const RECENT_KEY = 'celsketch_recent_projects';
 const THUMBS_KEY = 'celsketch_recent_thumbs';
@@ -340,9 +341,9 @@ export const TitleBar: React.FC = () => {
 
   const handleSave = async () => {
     setOpenMenu(null);
-    const data = JSON.stringify(exportProjectData(), null, 2);
     if (window.harmonyAPI) {
       try {
+        const data = await packProjectToZip(exportProjectData());
         const res = await window.harmonyAPI.saveProject(data, projectPath, projectName);
         if (res.error) {
           window.alert(`Erro ao salvar projeto: ${res.error}`);
@@ -363,9 +364,9 @@ export const TitleBar: React.FC = () => {
 
   const handleSaveAs = async () => {
     setOpenMenu(null);
-    const data = JSON.stringify(exportProjectData(), null, 2);
     if (window.harmonyAPI) {
       try {
+        const data = await packProjectToZip(exportProjectData());
         const res = await window.harmonyAPI.saveProjectAs(data, projectName);
         if (res.error) {
           window.alert(`Erro ao salvar projeto: ${res.error}`);
@@ -404,9 +405,9 @@ export const TitleBar: React.FC = () => {
         window.alert(`Erro ao abrir projeto: ${res.error}`);
         return;
       }
-      if (!res.canceled && res.content) {
+      if (!res.canceled && (res.content || res.bytes)) {
         try {
-          const parsed = JSON.parse(res.content);
+          const parsed = await unpackProjectPayload(res);
           loadProjectData(parsed, res.filePath || null);
           if (res.filePath) setRecentProjects(saveRecentPath(res.filePath));
           await restoreProjectAudio(parsed.audioTrackPath);
@@ -426,9 +427,9 @@ export const TitleBar: React.FC = () => {
       window.alert(`Não foi possível abrir o arquivo:\n${res.error}`);
       return;
     }
-    if (!res.canceled && res.content) {
+    if (!res.canceled && (res.content || res.bytes)) {
       try {
-        const parsed = JSON.parse(res.content);
+        const parsed = await unpackProjectPayload(res);
         loadProjectData(parsed, filePath);
         setRecentProjects(saveRecentPath(filePath));
         await restoreProjectAudio(parsed.audioTrackPath);

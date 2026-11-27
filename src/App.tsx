@@ -10,6 +10,7 @@ import { DockablePanel } from './components/DockablePanel';
 import { useHarmonyStore } from './store/useHarmonyStore';
 import { matchesShortcutCombo } from './utils/shortcuts';
 import { isTextEditingTarget, decodeAudioBufferTrack } from './utils/appUtils';
+import { packProjectToZip, unpackProjectPayload } from './utils/projectCodec';
 
 export { isTextEditingTarget, decodeAudioBufferTrack };
 
@@ -92,8 +93,9 @@ const StatusBarFrame: React.FC = () => {
 };
 
 export const App: React.FC = () => {
-  const [recoveryOffer, setRecoveryOffer] = useState<{ content: string; mtimeMs: number } | null>(null);
+  const [recoveryOffer, setRecoveryOffer] = useState<{ content?: string; bytes?: Uint8Array; mtimeMs: number } | null>(null);
   const [closeConfirmOpen, setCloseConfirmOpen] = useState(false);
+  const lastAutoSavedRef = React.useRef<{ layers: unknown; swatches: unknown; postProcess: unknown } | null>(null);
 
   useEffect(() => {
     const unsub = window.harmonyAPI?.onRequestClose?.(() => {
@@ -150,8 +152,8 @@ export const App: React.FC = () => {
     if (!window.harmonyAPI) return;
     try {
       const res = await window.harmonyAPI.openProjectByPath(filePath);
-      if (res.canceled || !res.content || !res.filePath) return;
-      const parsed = JSON.parse(res.content);
+      if (res.canceled || (!res.content && !res.bytes) || !res.filePath) return;
+      const parsed = await unpackProjectPayload(res);
       const st = useHarmonyStore.getState();
       st.loadProjectData(parsed, res.filePath);
       if (parsed.audioTrackPath && window.harmonyAPI.readAudioByPath) {
@@ -194,8 +196,8 @@ export const App: React.FC = () => {
     });
 
     api.checkRecovery?.().then((rec) => {
-      if (active && rec?.exists && rec.content) {
-        setRecoveryOffer({ content: rec.content, mtimeMs: rec.mtimeMs || Date.now() });
+      if (active && rec?.exists && (rec.content || rec.bytes)) {
+        setRecoveryOffer({ content: rec.content, bytes: rec.bytes, mtimeMs: rec.mtimeMs || Date.now() });
       }
     });
 
@@ -205,28 +207,67 @@ export const App: React.FC = () => {
     };
   }, []);
 
-  // Auto-Save timer: ONLY saves when user is inside a scene AND has unsaved edits (never overwrites backup on WelcomeScreen!)
+  // Smart Non-Blocking Auto-Save: skips during drawing/playback/unchanged state, packs compact ZIP on idle!
   useEffect(() => {
     if (!autoSaveEnabled) return;
     const ms = Math.max(5, autoSaveIntervalSec) * 1000;
-    const id = window.setInterval(async () => {
-      if (!window.harmonyAPI) return;
+    let busy = false;
+    const runIdleSave = () => {
+      if (busy || !window.harmonyAPI) return;
       const state = useHarmonyStore.getState();
-      if (state.showWelcome || !state.isDirty) return;
-      try {
-        const data = JSON.stringify(state.exportProjectData());
-        const res = await window.harmonyAPI.autoSave(data, state.projectPath);
-        if (res?.ok) {
-          const now = new Date();
-          const hh = String(now.getHours()).padStart(2, '0');
-          const mm = String(now.getMinutes()).padStart(2, '0');
-          const ss = String(now.getSeconds()).padStart(2, '0');
-          setLastAutoSaveTime(`${hh}:${mm}:${ss}`);
-        }
-      } catch (err) {
-        console.error('Auto-save error:', err);
+      if (state.showWelcome || !state.isDirty || state.isPlaying) return;
+      if ((window as any).__celsketchDrawing) return;
+      const last = lastAutoSavedRef.current;
+      if (
+        last &&
+        last.layers === state.layers &&
+        last.swatches === state.swatches &&
+        last.postProcess === state.postProcess
+      ) {
+        return;
       }
-    }, ms);
+
+      const execute = async () => {
+        if (busy) return;
+        const fresh = useHarmonyStore.getState();
+        if (fresh.showWelcome || !fresh.isDirty || fresh.isPlaying || (window as any).__celsketchDrawing) return;
+        busy = true;
+        try {
+          const snapshotLayers = fresh.layers;
+          const snapshotSwatches = fresh.swatches;
+          const snapshotPost = fresh.postProcess;
+          const packed = await packProjectToZip(fresh.exportProjectData());
+          const res = await window.harmonyAPI!.autoSave(packed, fresh.projectPath);
+          if (res?.ok) {
+            lastAutoSavedRef.current = {
+              layers: snapshotLayers,
+              swatches: snapshotSwatches,
+              postProcess: snapshotPost
+            };
+            const now = new Date();
+            const hh = String(now.getHours()).padStart(2, '0');
+            const mm = String(now.getMinutes()).padStart(2, '0');
+            const ss = String(now.getSeconds()).padStart(2, '0');
+            setLastAutoSaveTime(`${hh}:${mm}:${ss}`);
+          }
+        } catch (err) {
+          console.error('Auto-save error:', err);
+        } finally {
+          busy = false;
+        }
+      };
+
+      const ric = (window as any).requestIdleCallback;
+      if (typeof ric === 'function') {
+        ric(() => {
+          execute();
+        }, { timeout: 2000 });
+      } else {
+        execute();
+      }
+    };
+
+    const id = window.setInterval(runIdleSave, ms);
     return () => window.clearInterval(id);
   }, [autoSaveEnabled, autoSaveIntervalSec, setLastAutoSaveTime]);
 
@@ -277,8 +318,8 @@ export const App: React.FC = () => {
           if (!window.harmonyAPI) return;
           try {
             const res = await window.harmonyAPI.openProject();
-            if (!res.canceled && res.content && res.filePath) {
-              const parsed = JSON.parse(res.content);
+            if (!res.canceled && (res.content || res.bytes) && res.filePath) {
+              const parsed = await unpackProjectPayload(res);
               useHarmonyStore.getState().loadProjectData(parsed, res.filePath);
               try {
                 const raw = localStorage.getItem('celsketch_recent_projects');
@@ -327,7 +368,7 @@ export const App: React.FC = () => {
           e.preventDefault();
           if (!window.harmonyAPI) return;
           try {
-            const data = JSON.stringify(s.exportProjectData(), null, 2);
+            const data = await packProjectToZip(s.exportProjectData());
             const res = e.shiftKey
               ? await window.harmonyAPI.saveProjectAs(data, s.projectName)
               : await window.harmonyAPI.saveProject(data, s.projectPath, s.projectName);
@@ -521,9 +562,9 @@ export const App: React.FC = () => {
         </button>
         <button
           className="icon-btn active"
-          onClick={() => {
+          onClick={async () => {
             try {
-              const parsed = JSON.parse(recoveryOffer.content);
+              const parsed = await unpackProjectPayload(recoveryOffer);
               useHarmonyStore.getState().loadProjectData(parsed, null);
               useHarmonyStore.setState({ isDirty: true });
               window.harmonyAPI?.clearRecovery?.();

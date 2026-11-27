@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 import { useHarmonyStore } from '../store/useHarmonyStore';
 import { preloadFrameImages, renderFrameToCanvas } from '../utils/canvasRenderer';
+import { unpackProjectPayload } from '../utils/projectCodec';
 import { decodeAudioBufferTrack } from '../App';
 
 const RECENT_KEY = 'celsketch_recent_projects';
@@ -90,8 +91,8 @@ export const WelcomeScreen: React.FC = () => {
         if (cancelled) return;
         try {
           const res = await window.harmonyAPI.openProjectByPath(fp);
-          if (!res.canceled && res.content) {
-            const parsed = JSON.parse(res.content);
+          if (!res.canceled && (res.content || res.bytes)) {
+            const parsed = await unpackProjectPayload(res);
             if (parsed.layers && parsed.width && parsed.height) {
               let previewFrame = 1;
               let earliest = Infinity;
@@ -144,8 +145,8 @@ export const WelcomeScreen: React.FC = () => {
     (async () => {
       try {
         const res = await window.harmonyAPI!.openProjectByPath(fp);
-        if (cancelled || res.canceled || !res.content) return;
-        const parsed = JSON.parse(res.content);
+        if (cancelled || res.canceled || (!res.content && !res.bytes)) return;
+        const parsed = await unpackProjectPayload(res);
         if (!parsed.layers || !parsed.width || !parsed.height) return;
 
         const projectFps = Math.max(1, Math.min(60, Number(parsed.fps) || 24));
@@ -305,9 +306,9 @@ export const WelcomeScreen: React.FC = () => {
       window.alert(`Erro ao abrir projeto: ${res.error}`);
       return;
     }
-    if (!res.canceled && res.content) {
+    if (!res.canceled && (res.content || res.bytes)) {
       try {
-        const parsed = JSON.parse(res.content);
+        const parsed = await unpackProjectPayload(res);
         loadProjectData(parsed, res.filePath || null);
         if (res.filePath) setRecentProjects(saveRecentPath(res.filePath));
         setShowWelcome(false);
@@ -327,9 +328,9 @@ export const WelcomeScreen: React.FC = () => {
       window.alert(`Não foi possível abrir este projeto:\n${res.error}`);
       return;
     }
-    if (!res.canceled && res.content) {
+    if (!res.canceled && (res.content || res.bytes)) {
       try {
-        const parsed = JSON.parse(res.content);
+        const parsed = await unpackProjectPayload(res);
         loadProjectData(parsed, filePath);
         // Preserve the user's manual ordering of recent projects!
         setShowWelcome(false);
