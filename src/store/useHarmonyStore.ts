@@ -813,7 +813,10 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
   setLiquifyStrength: (liquifyStrength) => set({ liquifyStrength: Math.max(10, Math.min(100, Math.round(liquifyStrength))) }),
   toggleReferenceWindow: () => set((s) => ({ referenceWindowOpen: !s.referenceWindowOpen })),
 
-  setZoom: (zoom) => set({ zoom: Math.max(0.1, Math.min(8, zoom)) }),
+  setZoom: (zoom) =>
+    set((s) => ({
+      zoom: Number.isFinite(zoom) ? Math.max(0.1, Math.min(8, zoom)) : s.zoom
+    })),
   setShowWelcome: (showWelcome) => set({ showWelcome }),
   createNewScene: (name, width, height, fps) =>
     set((s) => {
@@ -873,6 +876,16 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
         undoStack: [],
         redoStack: [],
         timelapseFrames: [],
+        zoom: 0.55,
+        panX: 0,
+        panY: 0,
+        rotation: 0,
+        flipX: false,
+        cameraViewMode: false,
+        postProcess: { ...DEFAULT_POST_PROCESS },
+        hsvPreview: null,
+        levelsPreview: null,
+        blurPreview: null,
         showWelcome: false
       };
     }),
@@ -928,6 +941,16 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
         undoStack: [],
         redoStack: [],
         timelapseFrames: [],
+        zoom: 0.55,
+        panX: 0,
+        panY: 0,
+        rotation: 0,
+        flipX: false,
+        cameraViewMode: false,
+        postProcess: { ...DEFAULT_POST_PROCESS },
+        hsvPreview: null,
+        levelsPreview: null,
+        blurPreview: null,
         showWelcome: false
       };
     }),
@@ -1030,8 +1053,15 @@ export const useHarmonyStore = create<HarmonyState>((set, get) => ({
     const s = get();
     s.createNewScene(`Cena_${s.openScenes.length + 1}`, s.canvasWidth, s.canvasHeight, s.fps);
   },
-  setPan: (panX, panY) => set({ panX, panY }),
-  setRotation: (rotation) => set({ rotation: ((rotation % 360) + 360) % 360 }),
+  setPan: (panX, panY) =>
+    set((s) => ({
+      panX: Number.isFinite(panX) ? Math.max(-20000, Math.min(20000, panX)) : s.panX,
+      panY: Number.isFinite(panY) ? Math.max(-20000, Math.min(20000, panY)) : s.panY
+    })),
+  setRotation: (rotation) =>
+    set((s) => ({
+      rotation: Number.isFinite(rotation) ? ((rotation % 360) + 360) % 360 : s.rotation
+    })),
   resetRotation: () => set({ rotation: 0 }),
   toggleFlipX: () => set((s) => ({ flipX: !s.flipX })),
   toggleGrayscaleMode: () => set((s) => ({ grayscaleMode: !s.grayscaleMode })),

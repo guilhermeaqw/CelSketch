@@ -14,9 +14,8 @@ import {
 
 const fsp = fs.promises;
 
-// Hardware acceleration flags (maximizes GPU PCs; Chromium safely falls back to software on no-GPU PCs)
+// Stable GPU acceleration (avoid enable-zero-copy which causes 2D canvas context loss/blanking on Windows Electron 33)
 app.commandLine.appendSwitch('enable-gpu-rasterization');
-app.commandLine.appendSwitch('enable-zero-copy');
 app.commandLine.appendSwitch('enable-accelerated-2d-canvas');
 app.commandLine.appendSwitch('disable-renderer-backgrounding');
 

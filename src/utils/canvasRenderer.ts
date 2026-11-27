@@ -112,15 +112,18 @@ let blurScratchA: HTMLCanvasElement | null = null;
 let blurScratchB: HTMLCanvasElement | null = null;
 
 function getReusableCanvas(slot: 'A' | 'B', w: number, h: number): { canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D } | null {
+  if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return null;
+  const cw = Math.min(3072, Math.max(1, Math.ceil(w)));
+  const ch = Math.min(3072, Math.max(1, Math.ceil(h)));
   let c = slot === 'A' ? blurScratchA : blurScratchB;
   if (!c) {
     c = document.createElement('canvas');
     if (slot === 'A') blurScratchA = c;
     else blurScratchB = c;
   }
-  if (c.width !== w || c.height !== h) {
-    c.width = w;
-    c.height = h;
+  if (c.width !== cw || c.height !== ch) {
+    c.width = cw;
+    c.height = ch;
   }
   const ctx = c.getContext('2d');
   if (!ctx) return null;
@@ -128,22 +131,28 @@ function getReusableCanvas(slot: 'A' | 'B', w: number, h: number): { canvas: HTM
   ctx.globalAlpha = 1;
   ctx.globalCompositeOperation = 'source-over';
   ctx.filter = 'none';
-  ctx.clearRect(0, 0, w, h);
+  ctx.clearRect(0, 0, cw, ch);
   return { canvas: c, ctx };
 }
 
 function getSketchScratch(w: number, h: number): { canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D; pattern: CanvasPattern | null } {
+  const cw = Math.min(3072, Math.max(256, Math.ceil(Number.isFinite(w) ? w : 256)));
+  const ch = Math.min(3072, Math.max(256, Math.ceil(Number.isFinite(h) ? h : 256)));
   if (!sketchScratchCanvas) {
     sketchScratchCanvas = document.createElement('canvas');
-    sketchScratchCanvas.width = Math.max(256, w);
-    sketchScratchCanvas.height = Math.max(256, h);
+    sketchScratchCanvas.width = cw;
+    sketchScratchCanvas.height = ch;
     sketchScratchCtx = sketchScratchCanvas.getContext('2d')!;
-  } else if (sketchScratchCanvas.width < w || sketchScratchCanvas.height < h) {
-    sketchScratchCanvas.width = Math.max(sketchScratchCanvas.width, w);
-    sketchScratchCanvas.height = Math.max(sketchScratchCanvas.height, h);
+  } else if (sketchScratchCanvas.width < cw || sketchScratchCanvas.height < ch) {
+    sketchScratchCanvas.width = Math.min(3072, Math.max(sketchScratchCanvas.width, cw));
+    sketchScratchCanvas.height = Math.min(3072, Math.max(sketchScratchCanvas.height, ch));
     sketchPaperPattern = null; // re-create pattern after resize
   }
   const ctx = sketchScratchCtx!;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.filter = 'none';
   if (!sketchPaperPattern && sketchPaperImg.complete && sketchPaperImg.naturalWidth > 0) {
     sketchPaperPattern = ctx.createPattern(sketchPaperImg, 'repeat');
   }
@@ -354,7 +363,7 @@ export function getEffectiveFrameStrokes(layer: DrawingLayer, frame: number): St
  * Zero-phase bidirectional Gaussian smoothing (Clip Studio / SAI style — eliminates hand tremor & digitizer waves
  * while preserving exact start/end points and zero lag/skew!)
  */
-function smoothPoints(pts: Point[], strength: number): Point[] {
+function smoothPoints(pts: Point[], strength: number, maxPassesOverride?: number): Point[] {
   if (pts.length < 3 || strength <= 0) return pts;
 
   // Normalize point spacing first so 240Hz tablets and 60Hz mice smooth identically!
@@ -374,8 +383,9 @@ function smoothPoints(pts: Point[], strength: number): Point[] {
   }
   if (spaced.length < 3) return spaced;
 
-  // Symmetric [0.25, 0.5, 0.25] zero-phase passes (scales smoothly from 1 to 28 passes with stabilizer 0..100%)
-  const passes = Math.max(1, Math.round(Math.pow(strength / 100, 1.35) * 28));
+  // Symmetric [0.25, 0.5, 0.25] zero-phase passes (capped cleanly in live preview for 60-120fps responsiveness)
+  const rawPasses = Math.max(1, Math.round(Math.pow(strength / 100, 1.35) * 28));
+  const passes = maxPassesOverride !== undefined ? Math.min(rawPasses, maxPassesOverride) : rawPasses;
   let cur = spaced.map((p) => ({ x: p.x, y: p.y, pressure: p.pressure ?? 1 }));
   let next = cur.map((p) => ({ ...p }));
 
@@ -705,15 +715,193 @@ function renderVariableWidthRibbon(
   ctx.fill();
 }
 
+/**
+ * Returns true if this stroke can be rendered in O(1) incremental segments onto a live stroke canvas
+ * during pointermove, avoiding O(N^2) full-stroke re-rendering every animation frame.
+ */
+export function canRenderLiveIncremental(stroke: Stroke): boolean {
+  if (stroke.tool !== 'brush' && stroke.tool !== 'pencil' && stroke.tool !== 'eraser') return false;
+  const p = stroke.preset || 'sai_pen';
+  // blur_soft, blur_smudge, sai_opacity_pen, and csp_sketch (world-space paper cutout) use full-stroke fast preview
+  if (p === 'blur_soft' || p === 'blur_smudge' || p === 'sai_opacity_pen' || p === 'csp_sketch') return false;
+  return true;
+}
+
+/**
+ * O(1) incremental live segment renderer for butter-smooth 60-144fps painting!
+ * Stamps ONLY points[fromIdx .. toIdx] onto a dedicated live stroke canvas (composited once at stroke.opacity).
+ * On pointerup, the final full-quality smoothed stroke is committed cleanly.
+ */
+export function renderLiveStrokeSegment(
+  ctx: CanvasRenderingContext2D,
+  stroke: Stroke,
+  fromIdx: number,
+  toIdx: number
+): void {
+  const pts = stroke.points;
+  if (pts.length === 0 || toIdx < 0) return;
+  const clampedTo = Math.min(pts.length - 1, toIdx);
+  const startIdx = Math.max(0, fromIdx);
+  if (startIdx > clampedTo) return;
+
+  // Include 1 preceding point so segments join continuously with zero gaps
+  const sliceStart = Math.max(0, startIdx - 1);
+  const segPts = pts.slice(sliceStart, clampedTo + 1);
+  if (segPts.length === 0) return;
+
+  ctx.save();
+  try {
+    if (stroke.clipPolys && stroke.clipPolys.length > 0) {
+      const cw = ctx.canvas?.width || 10000;
+      const ch = ctx.canvas?.height || 10000;
+      traceSelectionPath(ctx, stroke.clipPolys, Boolean(stroke.clipInverted), cw, ch);
+      ctx.clip('evenodd');
+    }
+
+    const isEraser = stroke.tool === 'eraser';
+    const activeColor = isEraser ? '#000000' : stroke.color;
+    const preset = stroke.preset || 'sai_pen';
+    const minRatio = stroke.minSizeRatio ?? 0.05;
+    const ecoMult = globalEcoMode ? 1.55 : 1;
+
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.strokeStyle = activeColor;
+    ctx.fillStyle = activeColor;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.globalAlpha = 1;
+
+    const calcRadius = (pressure: number) => {
+      if (minRatio >= 0.99) return Math.max(0.4, stroke.size / 2);
+      const p = Math.max(0.02, Math.min(1, pressure));
+      const curveExp = preset === 'sai_inkpen' ? 1.72 : preset === 'sai_pen' ? 1.35 : 1.25;
+      const width = stroke.size * (minRatio + (1 - minRatio) * Math.pow(p, curveExp));
+      return Math.max(0.4, width / 2);
+    };
+
+    if (preset === 'sai_pen' || preset === 'sai_inkpen' || isEraser) {
+      const curvePts = segPts.length >= 3 ? subdivideCurve(segPts) : segPts;
+      renderVariableWidthRibbon(ctx, curvePts, (p) => calcRadius(p));
+    } else if (preset === 'csp_line') {
+      const tip = getTintedSutTip('line', activeColor);
+      if (tip) {
+        const spacing = Math.max(1.8, stroke.size * 0.2) * ecoMult;
+        const dabs = resampleByDistance(segPts, spacing);
+        const aspect = tip.height / Math.max(1, tip.width);
+        for (let i = 0; i < dabs.length; i++) {
+          const pt = dabs[i];
+          const p = minRatio >= 0.99 ? 1 : Math.max(0.03, Math.min(1, pt.pressure ?? 1));
+          const diam =
+            minRatio >= 0.99
+              ? Math.max(1.2, stroke.size)
+              : Math.max(1.2, stroke.size * (minRatio + (1 - minRatio) * Math.pow(p, 1.38)));
+          const w = diam * 0.85;
+          const h = Math.max(w * 1.15, Math.min(diam * 2.2, w * aspect * 0.45));
+          ctx.save();
+          ctx.translate(pt.x, pt.y);
+          ctx.rotate(pt.angle + Math.PI / 2);
+          ctx.drawImage(tip, -w / 2, -h / 2, w, h);
+          ctx.restore();
+        }
+      } else {
+        renderVariableWidthRibbon(ctx, segPts, (p) => calcRadius(p));
+      }
+    } else if (preset === 'sai_airbrush') {
+      const tip = getProceduralTip('soft', activeColor);
+      const spacing = Math.max(2.2, stroke.size * 0.24) * ecoMult;
+      const dabs = resampleByDistance(segPts, spacing);
+      for (let i = 0; i < dabs.length; i++) {
+        const pt = dabs[i];
+        const p = minRatio >= 0.99 ? 1 : Math.max(0.05, Math.min(1, pt.pressure ?? 1));
+        const r = Math.max(2.5, calcRadius(p) * 1.45);
+        ctx.globalAlpha = Math.min(1, 0.11 * (0.35 + 0.65 * p));
+        ctx.drawImage(tip, pt.x - r, pt.y - r, r * 2, r * 2);
+      }
+    } else if (preset === 'sai_water') {
+      const tip = getProceduralTip('water', activeColor);
+      const spacing = Math.max(1.8, stroke.size * 0.18) * ecoMult;
+      const dabs = resampleByDistance(segPts, spacing);
+      for (let i = 0; i < dabs.length; i++) {
+        const pt = dabs[i];
+        const p = minRatio >= 0.99 ? 1 : Math.max(0.08, Math.min(1, pt.pressure ?? 1));
+        const r = Math.max(2, calcRadius(p) * 1.15);
+        ctx.globalAlpha = Math.min(0.85, 0.22 * (0.4 + 0.6 * p));
+        ctx.drawImage(tip, pt.x - r, pt.y - r, r * 2, r * 2);
+      }
+    } else if (preset === 'sai_brush') {
+      const tip = getProceduralTip('bristle', activeColor);
+      const spacing = Math.max(1.5, stroke.size * 0.13) * ecoMult;
+      const dabs = resampleByDistance(segPts, spacing);
+      for (let i = 0; i < dabs.length; i++) {
+        const pt = dabs[i];
+        const p = minRatio >= 0.99 ? 1 : Math.max(0.08, Math.min(1, pt.pressure ?? 1));
+        const r = Math.max(1.8, calcRadius(p) * 1.12);
+        ctx.save();
+        ctx.translate(pt.x, pt.y);
+        ctx.rotate(pt.angle);
+        ctx.globalAlpha = Math.min(1, 0.28 + 0.55 * p);
+        ctx.drawImage(tip, -r, -r, r * 2, r * 2);
+        ctx.restore();
+      }
+    } else if (preset === 'sai_marker') {
+      const spacing = Math.max(1.2, stroke.size * 0.1) * ecoMult;
+      const dabs = resampleByDistance(segPts, spacing);
+      ctx.globalAlpha = 0.35;
+      for (let i = 0; i < dabs.length; i++) {
+        const pt = dabs[i];
+        const p = minRatio >= 0.99 ? 1 : Math.max(0.2, Math.min(1, pt.pressure ?? 1));
+        const r = Math.max(1.5, calcRadius(p));
+        ctx.save();
+        ctx.translate(pt.x, pt.y);
+        ctx.rotate(-Math.PI / 4);
+        ctx.beginPath();
+        ctx.ellipse(0, 0, r * 1.25, r * 0.36, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+    } else if (preset === 'sai_binary') {
+      const sz = Math.max(1, Math.round(stroke.size));
+      const dabs = resampleByDistance(segPts, Math.max(1, sz * 0.35));
+      ctx.imageSmoothingEnabled = false;
+      for (const pt of dabs) {
+        ctx.fillRect(Math.round(pt.x - sz / 2), Math.round(pt.y - sz / 2), sz, sz);
+      }
+    } else if (preset === 'sketch_graphite' || preset === 'sai_pencil') {
+      const isGraphite = preset === 'sketch_graphite';
+      const tip = getProceduralTip(isGraphite ? 'graphite' : 'pencil', activeColor);
+      const spacing = Math.max(1.3, stroke.size * (isGraphite ? 0.16 : 0.14)) * ecoMult;
+      const dabs = resampleByDistance(segPts, spacing);
+      for (let i = 0; i < dabs.length; i++) {
+        const pt = dabs[i];
+        const p = minRatio >= 0.99 ? 1 : Math.max(0.05, Math.min(1, pt.pressure ?? 1));
+        const r = Math.max(1.2, calcRadius(p) * (isGraphite ? 1.18 : 1.05));
+        const rot = hash2d(startIdx + i, Math.round(pt.x)) * Math.PI * 2;
+        ctx.save();
+        ctx.translate(pt.x, pt.y);
+        ctx.rotate(rot);
+        ctx.globalAlpha = Math.min(1, isGraphite ? 0.22 + 0.72 * p : 0.3 + 0.68 * p);
+        ctx.drawImage(tip, -r, -r, r * 2, r * 2);
+        ctx.restore();
+      }
+    } else {
+      renderVariableWidthRibbon(ctx, segPts, (p) => calcRadius(p));
+    }
+  } finally {
+    ctx.restore();
+  }
+}
+
 export function renderStroke(
   ctx: CanvasRenderingContext2D,
   stroke: Stroke,
   tintColor?: string,
-  opacityMultiplier = 1
+  opacityMultiplier = 1,
+  isLiveDraft = false
 ) {
   if (stroke.points.length === 0 && stroke.tool !== 'image') return;
 
   ctx.save();
+  try {
   // Clip stroke strictly inside active selection polygon(s) if drawn while a selection was active!
   if (stroke.clipPolys && stroke.clipPolys.length > 0) {
     const cw = ctx.canvas?.width || 10000;
@@ -744,8 +932,8 @@ export function renderStroke(
   if (stroke.tool === 'brush' || stroke.tool === 'pencil' || stroke.tool === 'eraser') {
     const minRatio = stroke.minSizeRatio ?? 0.05;
     const preset = stroke.preset || 'sai_pen';
-    const smoothed = smoothPoints(pts, stroke.smoothing ?? 35);
-    const curvePts = subdivideCurve(smoothed);
+    const smoothed = smoothPoints(pts, stroke.smoothing ?? 35, isLiveDraft ? 3 : undefined);
+    const curvePts = isLiveDraft && smoothed.length > 60 ? smoothed : subdivideCurve(smoothed);
 
     const calcRadius = (pressure: number, idx: number, total: number) => {
       // Uniform single size when pen pressure is disabled (minRatio >= 0.99)
@@ -770,7 +958,7 @@ export function renderStroke(
       return Math.max(0.4, width / 2);
     };
 
-    const ecoMult = globalEcoMode ? 1.55 : 1;
+    const ecoMult = (globalEcoMode ? 1.55 : 1) * (isLiveDraft ? 1.45 : 1);
     const tipColor = stroke.tool === 'eraser' ? '#000000' : activeColor;
 
     if (preset === 'csp_line') {
@@ -1098,7 +1286,7 @@ export function renderStroke(
         const by = Math.floor(minY - sz);
         const bw = Math.max(1, Math.ceil(maxX - bx + sz + 1));
         const bh = Math.max(1, Math.ceil(maxY - by + sz + 1));
-        const scratch = getSketchScratch(bw, bh);
+        const scratch = bw <= 3072 && bh <= 3072 ? getSketchScratch(bw, bh) : null;
         if (scratch) {
           const { canvas: sc, ctx: sctx } = scratch;
           sctx.clearRect(0, 0, bw, bh);
@@ -1452,7 +1640,9 @@ export function renderStroke(
     ctx.fill();
   }
 
-  ctx.restore();
+  } finally {
+    ctx.restore();
+  }
 }
 
 export function renderFrameToCanvas(

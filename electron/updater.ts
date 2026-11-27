@@ -557,35 +557,70 @@ Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction Silent
     return { ok: true };
   }
 
-  if (installMode === 'installed' && /setup/i.test(path.basename(downloadedFilePath))) {
+  if (/setup/i.test(path.basename(downloadedFilePath))) {
     const currentExe = process.execPath;
+    const installDir = path.dirname(currentExe);
     const defaultInstalledExe = path.join(
       process.env.LOCALAPPDATA || '',
       'Programs',
       'celsketch',
       'CelSketch.exe'
     );
+    // For dev mode (electron.exe in node_modules), install to default per-user dir silently
+    const targetDir = installMode === 'dev' ? path.dirname(defaultInstalledExe) : installDir;
+    const targetExe = installMode === 'dev' ? defaultInstalledExe : currentExe;
+
+    // Wait for ALL CelSketch Electron processes (main + GPU/renderer children) to exit cleanly,
+    // then run NSIS 100% silently (/S /D=<dir>) — NEVER showing the setup wizard!
+    // Only triggers a single UAC prompt (-Verb RunAs) if the target folder requires admin rights.
     const psScript = `
 $ErrorActionPreference = 'SilentlyContinue'
 $parentPid = ${pid}
-for ($i = 0; $i -lt 60; $i++) {
-  if (-not (Get-Process -Id $parentPid -ErrorAction SilentlyContinue)) { break }
-  Start-Sleep -Milliseconds 300
-}
+$exePath = '${escapePsSingleQuote(targetExe)}'
+$targetDir = '${escapePsSingleQuote(targetDir)}'
 $installer = '${escapePsSingleQuote(downloadedFilePath)}'
-$exePath = '${escapePsSingleQuote(currentExe)}'
 $fallbackExe = '${escapePsSingleQuote(defaultInstalledExe)}'
-$proc = Start-Process -FilePath $installer -ArgumentList '/S' -Wait -PassThru
-if ($proc -and $proc.ExitCode -eq 0) {
-  Start-Sleep -Milliseconds 500
-  if (Test-Path -LiteralPath $exePath) {
-    Start-Process -FilePath $exePath
-  } elseif (Test-Path -LiteralPath $fallbackExe) {
-    Start-Process -FilePath $fallbackExe
+
+# 1. Wait for main process + all sibling Electron child processes from this exe to exit
+for ($i = 0; $i -lt 50; $i++) {
+  $aliveMain = Get-Process -Id $parentPid -ErrorAction SilentlyContinue
+  $aliveSame = Get-Process -Name 'CelSketch' -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exePath }
+  if (-not $aliveMain -and -not $aliveSame) { break }
+  if ($i -eq 15) {
+    $aliveSame | Stop-Process -Force -ErrorAction SilentlyContinue
   }
+  Start-Sleep -Milliseconds 200
+}
+Start-Sleep -Milliseconds 300
+
+# 2. Check if target directory is writable without admin; if not, request UAC once with /S (still 100% silent!)
+$needsAdmin = $false
+try {
+  if (Test-Path -LiteralPath $targetDir) {
+    $probe = Join-Path $targetDir ('.cs_write_test_' + [guid]::NewGuid().ToString('N'))
+    [System.IO.File]::WriteAllText($probe, 'ok')
+    Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+  }
+} catch {
+  $needsAdmin = $true
+}
+
+# NSIS spec: /D=<dir> must be the LAST argument with NO quotes around the path
+$nsArgs = "/S /D=$targetDir"
+if ($needsAdmin) {
+  $proc = Start-Process -FilePath $installer -ArgumentList $nsArgs -Verb RunAs -Wait -PassThru
 } else {
-  # Fallback to interactive wizard if silent install needed elevation or failed
-  Start-Process -FilePath $installer
+  $proc = Start-Process -FilePath $installer -ArgumentList $nsArgs -Wait -PassThru
+  if (-not $proc -or $proc.ExitCode -ne 0) {
+    $proc = Start-Process -FilePath $installer -ArgumentList $nsArgs -Verb RunAs -Wait -PassThru
+  }
+}
+
+Start-Sleep -Milliseconds 500
+if (Test-Path -LiteralPath $exePath) {
+  Start-Process -FilePath $exePath
+} elseif (Test-Path -LiteralPath $fallbackExe) {
+  Start-Process -FilePath $fallbackExe
 }
 Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue
 `;
@@ -599,7 +634,7 @@ Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction Silent
     return { ok: true };
   }
 
-  // Unpacked / dev mode: run the Setup.exe wizard directly so the user installs cleanly without touching dev files
+  // Fallback for non-setup single executable
   const child = spawn(downloadedFilePath, [], {
     detached: true,
     stdio: 'ignore'

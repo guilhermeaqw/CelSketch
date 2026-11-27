@@ -4,6 +4,8 @@ import { useHarmonyStore } from '../store/useHarmonyStore';
 import { ArtLayerId, Point, Stroke } from '../types/harmony';
 import {
   renderStroke,
+  canRenderLiveIncremental,
+  renderLiveStrokeSegment,
   getEffectiveFrameStrokes,
   isLayerEffectivelyVisible,
   getLayerEffectiveOpacity,
@@ -76,13 +78,30 @@ function isPointInPolygon(pt: Point, polygon: Point[]): boolean {
 
 export const CanvasStage: React.FC = () => {
   const containerRef = useRef<HTMLDivElement>(null);
+  const containerRectRef = useRef<DOMRect | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [canvasRecoveryKey, setCanvasRecoveryKey] = useState(0);
   const brushRingRef = useRef<HTMLDivElement>(null);
   const eyedropperSwatchRef = useRef<HTMLDivElement>(null);
+  const penHudSpanRef = useRef<HTMLSpanElement>(null);
   const penHudTimerRef = useRef<number>(0);
   const layerBufferRef = useRef<HTMLCanvasElement | null>(null);
+  const liveStrokeCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const liveStrokeIdRef = useRef<string | null>(null);
+  const liveStrokeRenderedCountRef = useRef<number>(0);
   const layerBitmapCacheRef = useRef<
-    Map<string, { strokesRef: Stroke[]; width: number; height: number; imgTick: number; canvas: HTMLCanvasElement }>
+    Map<
+      string,
+      {
+        strokesRef: Stroke[];
+        count: number;
+        lastStrokeId: string | null;
+        width: number;
+        height: number;
+        imgTick: number;
+        canvas: HTMLCanvasElement;
+      }
+    >
   >(new Map());
   const liquifyModifiedRef = useRef<boolean>(false);
   const transformSavedLassoRef = useRef<Point[][] | null>(null);
@@ -121,8 +140,21 @@ export const CanvasStage: React.FC = () => {
     return () => {
       if (liveRafRef.current !== null) window.cancelAnimationFrame(liveRafRef.current);
       if (pickedToastTimerRef.current !== null) window.clearTimeout(pickedToastTimerRef.current);
+      for (const entry of layerBitmapCacheRef.current.values()) {
+        entry.canvas.width = 0;
+        entry.canvas.height = 0;
+      }
       layerBitmapCacheRef.current.clear();
-      layerBufferRef.current = null;
+      if (layerBufferRef.current) {
+        layerBufferRef.current.width = 0;
+        layerBufferRef.current.height = 0;
+        layerBufferRef.current = null;
+      }
+      if (liveStrokeCanvasRef.current) {
+        liveStrokeCanvasRef.current.width = 0;
+        liveStrokeCanvasRef.current.height = 0;
+        liveStrokeCanvasRef.current = null;
+      }
       hsvPreviewCanvasRef.current = null;
       clipGroupCanvasRef.current = null;
       postProcessCanvasRef.current = null;
@@ -353,20 +385,74 @@ export const CanvasStage: React.FC = () => {
     setCameraViewMode
   } = useHarmonyStore.getState();
 
-  // Clear per-layer bitmap cache when switching scenes to avoid retaining old scene bitmaps in GPU/RAM
+  // Clear per-layer bitmap cache & transient states when switching scenes to prevent VRAM buildup or stuck blank canvas
   useEffect(() => {
+    for (const entry of layerBitmapCacheRef.current.values()) {
+      entry.canvas.width = 0;
+      entry.canvas.height = 0;
+    }
     layerBitmapCacheRef.current.clear();
+    draftStrokeRef.current = null;
+    stabilizerCursorRef.current = null;
+    liveStrokeIdRef.current = null;
+    liveStrokeRenderedCountRef.current = 0;
+    setIsDrawing(false);
+    setSelectionPolys([]);
+    setLassoPoints([]);
+    setLassoClosed(false);
+    setLassoInverted(false);
+    setTransformActive(false);
+    setTransformQuad(null);
+    setLiquifyPreview(null);
+    setTextDraft(null);
+    setViewportTick((t) => t + 1);
   }, [activeSceneId]);
 
-  // Repaint stage cleanly whenever window or DockablePanel splitters resize the container
+  // Recover automatically if Chromium GPU 2D canvas context is ever lost
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const onLost = (e: Event) => {
+      e.preventDefault();
+    };
+    const onRestored = () => {
+      for (const entry of layerBitmapCacheRef.current.values()) {
+        entry.canvas.width = 0;
+        entry.canvas.height = 0;
+      }
+      layerBitmapCacheRef.current.clear();
+      liveStrokeIdRef.current = null;
+      liveStrokeRenderedCountRef.current = 0;
+      setViewportTick((t) => t + 1);
+      scheduleLivePaint();
+    };
+    canvas.addEventListener('contextlost', onLost);
+    canvas.addEventListener('contextrestored', onRestored);
+    return () => {
+      canvas.removeEventListener('contextlost', onLost);
+      canvas.removeEventListener('contextrestored', onRestored);
+    };
+  }, [canvasRecoveryKey, scheduleLivePaint]);
+
+  // Cache container bounding rect & repaint cleanly whenever window or DockablePanel splitters resize
   useEffect(() => {
     const el = containerRef.current;
-    if (!el || typeof ResizeObserver === 'undefined') return;
-    const ro = new ResizeObserver(() => {
+    if (!el) return;
+    const updateRect = () => {
+      containerRectRef.current = el.getBoundingClientRect();
       setViewportTick((t) => t + 1);
-    });
-    ro.observe(el);
-    return () => ro.disconnect();
+    };
+    updateRect();
+    let ro: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== 'undefined') {
+      ro = new ResizeObserver(updateRect);
+      ro.observe(el);
+    }
+    window.addEventListener('resize', updateRect);
+    return () => {
+      ro?.disconnect();
+      window.removeEventListener('resize', updateRect);
+    };
   }, []);
 
   // Reset in-progress drawing states cleanly if the user switches tool mid-drag
@@ -1312,20 +1398,24 @@ export const CanvasStage: React.FC = () => {
     (clientX: number, clientY: number): Point => {
       const container = containerRef.current;
       if (!container) return { x: 0, y: 0 };
-      const rect = container.getBoundingClientRect();
-      const centerX = rect.left + rect.width / 2 + panX;
-      const centerY = rect.top + rect.height / 2 + panY;
+      const rect = containerRectRef.current || container.getBoundingClientRect();
+      const safeZoom = Number.isFinite(zoom) && zoom > 0.01 ? zoom : 0.55;
+      const safePanX = Number.isFinite(panX) ? panX : 0;
+      const safePanY = Number.isFinite(panY) ? panY : 0;
+      const safeRot = Number.isFinite(rotation) ? rotation : 0;
+      const centerX = rect.left + rect.width / 2 + safePanX;
+      const centerY = rect.top + rect.height / 2 + safePanY;
       const dx = clientX - centerX;
       const dy = clientY - centerY;
       // Inverse rotation
-      const rad = (-rotation * Math.PI) / 180;
+      const rad = (-safeRot * Math.PI) / 180;
       const cos = Math.cos(rad);
       const sin = Math.sin(rad);
       const rx = dx * cos - dy * sin;
       const ry = dx * sin + dy * cos;
 
-      let x = (rx / zoom) * (flipX ? -1 : 1) + canvasWidth / 2;
-      let y = ry / zoom + canvasHeight / 2;
+      let x = (rx / safeZoom) * (flipX ? -1 : 1) + canvasWidth / 2;
+      let y = ry / safeZoom + canvasHeight / 2;
 
       // When viewing through the 2D Camera, invert the camera lens transform so drawing/selecting lands exactly under the pen!
       if (cameraViewMode) {
@@ -1353,7 +1443,8 @@ export const CanvasStage: React.FC = () => {
     if (!canvas || !container) return;
 
     const dpr = isEcoMode ? 1 : Math.min(2, window.devicePixelRatio || 1);
-    const rect = container.getBoundingClientRect();
+    const rect = containerRectRef.current || container.getBoundingClientRect();
+    if (!rect || rect.width <= 0 || rect.height <= 0) return;
     const targetW = Math.floor(rect.width * dpr);
     const targetH = Math.floor(rect.height * dpr);
     if (canvas.width !== targetW || canvas.height !== targetH) {
@@ -1363,20 +1454,34 @@ export const CanvasStage: React.FC = () => {
       canvas.style.height = `${rect.height}px`;
     }
 
-    const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+    // Never use desynchronized: true on Windows Electron 33 — avoids silent 2D GPU surface loss / blanking!
+    const ctx = canvas.getContext('2d', { alpha: false });
     if (!ctx) return;
+    if (typeof (ctx as any).isContextLost === 'function' && (ctx as any).isContextLost()) {
+      setCanvasRecoveryKey((k) => k + 1);
+      return;
+    }
+
+    const safeZoom = Number.isFinite(zoom) && zoom > 0.01 ? zoom : 0.55;
+    const safePanX = Number.isFinite(panX) ? panX : 0;
+    const safePanY = Number.isFinite(panY) ? panY : 0;
+    const safeRot = Number.isFinite(rotation) ? rotation : 0;
 
     ctx.save();
+    try {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.filter = 'none';
 
     // Outer dark workspace backdrop
     ctx.fillStyle = '#1b1b1b';
     ctx.fillRect(0, 0, rect.width, rect.height);
 
     // Transform into camera stage space
-    ctx.translate(rect.width / 2 + panX, rect.height / 2 + panY);
-    ctx.rotate((rotation * Math.PI) / 180);
-    ctx.scale(flipX ? -zoom : zoom, zoom);
+    ctx.translate(rect.width / 2 + safePanX, rect.height / 2 + safePanY);
+    ctx.rotate((safeRot * Math.PI) / 180);
+    ctx.scale(flipX ? -safeZoom : safeZoom, safeZoom);
     ctx.translate(-canvasWidth / 2, -canvasHeight / 2);
 
     // Stage Paper / Camera Background (fast zero-shadowBlur drop-shadow — 10x faster on CPU/iGPU!)
@@ -1429,7 +1534,8 @@ export const CanvasStage: React.FC = () => {
     }
     const lctx = layerBuffer.getContext('2d');
 
-    // Helper: get or rasterize a cached static bitmap for (layer, frame, tint) — O(1) blit on subsequent frames!
+    // Helper: get or rasterize a cached static bitmap for (layer, frame, tint) —
+    // O(1) blit on cache hit AND O(1) incremental append when 1-2 new strokes are added on pen-up!
     const getCachedLayerBitmap = (
       cacheKey: string,
       strokes: Stroke[],
@@ -1450,15 +1556,45 @@ export const CanvasStage: React.FC = () => {
         return existing.canvas;
       }
 
+      // Fast O(1) incremental append: if strokes only had new stroke(s) pushed at the end,
+      // stamp ONLY the newly added stroke(s) instead of re-rendering 100+ older strokes!
+      if (
+        existing &&
+        existing.width === canvasWidth &&
+        existing.height === canvasHeight &&
+        existing.imgTick === imageTick &&
+        existing.count > 0 &&
+        strokes.length > existing.count &&
+        strokes[existing.count - 1]?.id === existing.lastStrokeId
+      ) {
+        const bctx = existing.canvas.getContext('2d')!;
+        for (let i = existing.count; i < strokes.length; i++) {
+          renderStroke(bctx, strokes[i], tint, 1);
+        }
+        existing.strokesRef = strokes;
+        existing.count = strokes.length;
+        existing.lastStrokeId = strokes[strokes.length - 1]?.id || null;
+        cache.delete(cacheKey);
+        cache.set(cacheKey, existing);
+        return existing.canvas;
+      }
+
       let bmpCanvas = existing?.canvas;
-      const maxCacheEntries = isEcoMode ? 12 : 28;
+      // Smart VRAM budget (~96 MB max GPU textures across cached layers)
+      const bytesPerCanvas = Math.max(1, canvasWidth * canvasHeight * 4);
+      const budgetEntries = Math.floor((96 * 1024 * 1024) / bytesPerCanvas);
+      const maxCacheEntries = Math.max(4, Math.min(isEcoMode ? 8 : 14, budgetEntries));
       if (!bmpCanvas) {
-        if (cache.size >= maxCacheEntries) {
+        while (cache.size >= maxCacheEntries) {
           const oldestKey = cache.keys().next().value;
-          if (oldestKey) {
-            const evicted = cache.get(oldestKey);
-            cache.delete(oldestKey);
-            bmpCanvas = evicted?.canvas;
+          if (!oldestKey) break;
+          const evicted = cache.get(oldestKey);
+          cache.delete(oldestKey);
+          if (!bmpCanvas && evicted) {
+            bmpCanvas = evicted.canvas;
+          } else if (evicted) {
+            evicted.canvas.width = 0;
+            evicted.canvas.height = 0;
           }
         }
         if (!bmpCanvas) bmpCanvas = document.createElement('canvas');
@@ -1474,6 +1610,8 @@ export const CanvasStage: React.FC = () => {
       }
       cache.set(cacheKey, {
         strokesRef: strokes,
+        count: strokes.length,
+        lastStrokeId: strokes.length > 0 ? strokes[strokes.length - 1].id : null,
         width: canvasWidth,
         height: canvasHeight,
         imgTick: imageTick,
@@ -1486,7 +1624,8 @@ export const CanvasStage: React.FC = () => {
     const activeCamLayer = getActiveCameraLayer(layers);
     const activeCamState = activeCamLayer ? getInterpolatedCamera(activeCamLayer, currentFrame) : null;
     const isThroughCamera = Boolean(cameraViewMode && activeCamLayer && activeCamState);
-    const useLivePostProcess = hasActivePostProcess(postProcess);
+    // Defer expensive CPU getImageData post-processing while actively dragging a brush stroke so painting stays 60-144fps!
+    const useLivePostProcess = hasActivePostProcess(postProcess) && !draftStroke;
 
     if (lctx) {
       let stageCtx: CanvasRenderingContext2D = ctx;
@@ -1554,23 +1693,87 @@ export const CanvasStage: React.FC = () => {
           }
           sourceCanvas = layerBuffer;
         } else if (isCurrent && draftStroke) {
-          lctx.clearRect(0, 0, canvasWidth, canvasHeight);
-          if (strokes.length > 0) {
-            const baseBmp = getCachedLayerBitmap(`${layer.id}:${currentFrame}:base`, strokes);
-            lctx.drawImage(baseBmp, 0, 0);
+          const canIncremental = canRenderLiveIncremental(draftStroke) && !shiftLineAxisRef.current;
+          if (canIncremental) {
+            // O(1) INCREMENTAL LIVE STROKE RENDERING: stamps ONLY the newly added 2-5 points per frame!
+            if (!liveStrokeCanvasRef.current) {
+              liveStrokeCanvasRef.current = document.createElement('canvas');
+            }
+            const lsCanvas = liveStrokeCanvasRef.current;
+            if (lsCanvas.width !== canvasWidth || lsCanvas.height !== canvasHeight) {
+              lsCanvas.width = canvasWidth;
+              lsCanvas.height = canvasHeight;
+              liveStrokeIdRef.current = null;
+              liveStrokeRenderedCountRef.current = 0;
+            }
+            const lsCtx = lsCanvas.getContext('2d');
+            if (lsCtx) {
+              if (
+                liveStrokeIdRef.current !== draftStroke.id ||
+                liveStrokeRenderedCountRef.current > draftStroke.points.length
+              ) {
+                lsCtx.clearRect(0, 0, canvasWidth, canvasHeight);
+                liveStrokeIdRef.current = draftStroke.id;
+                liveStrokeRenderedCountRef.current = 0;
+              }
+              if (draftStroke.points.length > liveStrokeRenderedCountRef.current) {
+                const fromIdx = liveStrokeRenderedCountRef.current;
+                const toIdx = draftStroke.points.length - 1;
+                renderLiveStrokeSegment(lsCtx, draftStroke, fromIdx, toIdx);
+                if (symmetryMode === 'vertical' && draftStroke.points.length > 0) {
+                  const mirroredStroke: Stroke = {
+                    ...draftStroke,
+                    points: draftStroke.points.map((p) => ({ ...p, x: canvasWidth - p.x }))
+                  };
+                  renderLiveStrokeSegment(lsCtx, mirroredStroke, fromIdx, toIdx);
+                }
+                liveStrokeRenderedCountRef.current = draftStroke.points.length;
+              }
+            }
+
+            lctx.clearRect(0, 0, canvasWidth, canvasHeight);
+            if (strokes.length > 0) {
+              const baseBmp = getCachedLayerBitmap(`${layer.id}:${currentFrame}:base`, strokes);
+              lctx.drawImage(baseBmp, 0, 0);
+            }
+            lctx.save();
+            lctx.globalAlpha = draftStroke.opacity;
+            if (draftStroke.tool === 'eraser') {
+              lctx.globalCompositeOperation = 'destination-out';
+            } else if (layer.alphaLock) {
+              lctx.globalCompositeOperation = 'source-atop';
+            } else {
+              lctx.globalCompositeOperation = 'source-over';
+            }
+            lctx.drawImage(lsCanvas, 0, 0);
+            lctx.restore();
+            sourceCanvas = layerBuffer;
+          } else {
+            // Fast live preview for shape tools, Shift-locked lines, blur/smudge, and paper-grain brushes
+            lctx.clearRect(0, 0, canvasWidth, canvasHeight);
+            if (strokes.length > 0) {
+              const baseBmp = getCachedLayerBitmap(`${layer.id}:${currentFrame}:base`, strokes);
+              lctx.drawImage(baseBmp, 0, 0);
+            }
+            const effectiveDraft =
+              layer.alphaLock && draftStroke.tool !== 'eraser' && draftStroke.tool !== 'erase_poly'
+                ? { ...draftStroke, alphaLock: true }
+                : draftStroke;
+            renderStroke(lctx, effectiveDraft, undefined, 1, true);
+            if (symmetryMode === 'vertical' && effectiveDraft.points.length > 0 && effectiveDraft.tool !== 'gradient') {
+              renderStroke(
+                lctx,
+                {
+                  ...effectiveDraft,
+                  points: effectiveDraft.points.map((p) => ({ ...p, x: canvasWidth - p.x }))
+                },
+                undefined,
+                1,
+                true
+              );
+            }
+            sourceCanvas = layerBuffer;
           }
-          const effectiveDraft =
-            layer.alphaLock && draftStroke.tool !== 'eraser' && draftStroke.tool !== 'erase_poly'
-              ? { ...draftStroke, alphaLock: true }
-              : draftStroke;
-          renderStroke(lctx, effectiveDraft);
-          if (symmetryMode === 'vertical' && effectiveDraft.points.length > 0) {
-            renderStroke(lctx, {
-              ...effectiveDraft,
-              points: effectiveDraft.points.map((p) => ({ ...p, x: canvasWidth - p.x }))
-            });
-          }
-          sourceCanvas = layerBuffer;
         } else {
           sourceCanvas = getCachedLayerBitmap(`${layer.id}:${currentFrame}:base`, strokes);
         }
@@ -2304,11 +2507,14 @@ export const CanvasStage: React.FC = () => {
       ctx.restore();
     }
 
-    ctx.restore();
+    } finally {
+      ctx.restore();
+    }
     };
     drawStageRef.current = paintStage;
     paintStage();
   }, [
+    canvasRecoveryKey,
     canvasWidth,
     canvasHeight,
     layers,
@@ -2906,8 +3112,8 @@ export const CanvasStage: React.FC = () => {
   };
 
   const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    // Move brush ring & eyedropper preview directly on GPU compositor (ZERO React re-renders on hover!)
-    const containerRect = containerRef.current?.getBoundingClientRect();
+    // Move brush ring & eyedropper preview directly on GPU compositor (ZERO forced layout reflows, ZERO React re-renders!)
+    const containerRect = containerRectRef.current || containerRef.current?.getBoundingClientRect() || null;
     if (containerRect) {
       const mx = e.clientX - containerRect.left;
       const my = e.clientY - containerRect.top;
@@ -2920,7 +3126,7 @@ export const CanvasStage: React.FC = () => {
       }
     }
 
-    // Live Eyedropper color preview while holding Alt or using Dropper tool (disabled during Selection/Transform/Crop/Zoom!)
+    // Ultra-fast early exit when simply hovering mouse/pen with brush/eraser/shapes (0.02ms, ZERO coordinate math!)
     const isAltBlockedTool =
       activeTool === 'lasso' ||
       activeTool === 'polylasso' ||
@@ -2929,7 +3135,24 @@ export const CanvasStage: React.FC = () => {
       activeTool === 'ellipseselect' ||
       activeTool === 'magicwand' ||
       activeTool === 'zoom';
-    if (!transformActive && !cropMode && ((altHeld && !isAltBlockedTool) || activeTool === 'eyedropper')) {
+    const eyedropperHover = !transformActive && !cropMode && ((altHeld && !isAltBlockedTool) || activeTool === 'eyedropper');
+    if (
+      !isDrawing &&
+      !eyedropperHover &&
+      !isRotating &&
+      !isPanning &&
+      !cameraDragRef.current &&
+      draggingVpIndex === null &&
+      !transformActive &&
+      !cropMode &&
+      !isDraggingSelection &&
+      !( (activeTool === 'polylasso' || activeTool === 'polylassofill') && lassoPoints.length > 0 )
+    ) {
+      return;
+    }
+
+    // Live Eyedropper color preview while holding Alt or using Dropper tool (disabled during Selection/Transform/Crop/Zoom!)
+    if (eyedropperHover) {
       const hex = readColorAtClient(e.clientX, e.clientY);
       if (hex) {
         setEyedropperPreviewHex(hex);
@@ -3269,9 +3492,14 @@ export const CanvasStage: React.FC = () => {
     const newPoints = eventsToProcess.map((ev) => getPointFromEvent(ev));
     const lastPt = newPoints[newPoints.length - 1];
     const now = performance.now();
-    if (now - penHudTimerRef.current > 180) {
+    // Update Pen HUD directly via DOM ref — ZERO React re-renders while painting!
+    if (now - penHudTimerRef.current > 120 && penHudSpanRef.current) {
       penHudTimerRef.current = now;
-      setPenStatus({ type: e.pointerType || 'mouse', pressure: lastPt.pressure ?? 1 });
+      const isPenType = e.pointerType === 'pen';
+      penHudSpanRef.current.textContent = isPenType
+        ? `Pen: ${Math.round((lastPt.pressure ?? 1) * 100)}%`
+        : 'Mouse';
+      penHudSpanRef.current.style.color = isPenType ? '#4ade80' : '#888';
     }
     if (brushSmoothing > 0) {
       stabilizerCursorRef.current = lastPt;
@@ -3470,6 +3698,8 @@ export const CanvasStage: React.FC = () => {
       captureTimelapseStep();
       draftStrokeRef.current = null;
       stabilizerCursorRef.current = null;
+      liveStrokeIdRef.current = null;
+      liveStrokeRenderedCountRef.current = 0;
       setIsDrawing(false);
     }
   };
@@ -3492,6 +3722,8 @@ export const CanvasStage: React.FC = () => {
     setSelectShapeStart(null);
     draftStrokeRef.current = null;
     stabilizerCursorRef.current = null;
+    liveStrokeIdRef.current = null;
+    liveStrokeRenderedCountRef.current = 0;
     setIsDrawing(false);
     scheduleLivePaint();
   };
@@ -3641,6 +3873,7 @@ export const CanvasStage: React.FC = () => {
       </svg>
 
       <canvas
+        key={canvasRecoveryKey}
         ref={canvasRef}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
@@ -4165,7 +4398,7 @@ export const CanvasStage: React.FC = () => {
         {dHeld && <span style={{ color: '#38bdf8', fontWeight: 700 }}>PEGAR LAYER (D + Clique)</span>}
         {flipX && <span style={{ color: '#f59e0b', fontWeight: 700 }}>FLIPPED (F1)</span>}
         {grayscaleMode && <span style={{ color: '#e5e5e5', fontWeight: 700 }}>GRAYSCALE (Ctrl+Y)</span>}
-        <span style={{ color: penStatus.type === 'pen' ? '#4ade80' : '#888' }}>
+        <span ref={penHudSpanRef} style={{ color: penStatus.type === 'pen' ? '#4ade80' : '#888' }}>
           {penStatus.type === 'pen'
             ? `Pen: ${Math.round(penStatus.pressure * 100)}%`
             : 'Mouse'}
